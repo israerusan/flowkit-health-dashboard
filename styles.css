@@ -1,0 +1,283 @@
+/* FlowKit Plugin Health Dashboard — uses Obsidian CSS variables so it adapts
+   to any theme, light or dark. */
+
+.flowkit-health {
+  padding: 0 12px 24px;
+  overflow-y: auto;
+}
+
+.flowkit-health-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  position: sticky;
+  top: 0;
+  background: var(--background-primary);
+  padding: 12px 0 8px;
+  z-index: 1;
+}
+
+.flowkit-health-header h2 {
+  margin: 0;
+  font-size: 1.1em;
+}
+
+.flowkit-health-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.flowkit-health-status {
+  font-size: 0.8em;
+  color: var(--text-muted);
+}
+.flowkit-health-status.is-online {
+  color: var(--text-success, var(--color-green));
+}
+.flowkit-health-status.is-offline {
+  color: var(--text-muted);
+}
+
+.flowkit-health-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  cursor: pointer;
+}
+
+/* Toolbar: search + filter --------------------------------------------- */
+.flowkit-health-toolbar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin: 0 0 12px;
+  flex-wrap: wrap;
+}
+.flowkit-search {
+  position: relative;
+  flex: 1 1 160px;
+  display: flex;
+  align-items: center;
+}
+.flowkit-search-icon {
+  position: absolute;
+  left: 8px;
+  display: inline-flex;
+  color: var(--text-muted);
+  pointer-events: none;
+}
+.flowkit-search input {
+  width: 100%;
+  padding-left: 28px;
+}
+.flowkit-filter {
+  flex: 0 0 auto;
+}
+
+/* Sortable headers ------------------------------------------------------ */
+.flowkit-health-table th.sortable {
+  cursor: pointer;
+  user-select: none;
+}
+.flowkit-health-table th.sortable:hover {
+  color: var(--text-normal);
+}
+.flowkit-sort-arrow {
+  font-size: 0.8em;
+  color: var(--text-accent, var(--interactive-accent));
+}
+
+/* Row action menu button ------------------------------------------------ */
+.flowkit-actions {
+  width: 1%;
+  white-space: nowrap;
+}
+.flowkit-menu-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  cursor: pointer;
+  color: var(--text-muted);
+  border-radius: 4px;
+}
+.flowkit-menu-btn:hover {
+  color: var(--text-normal);
+  background: var(--background-modifier-hover);
+}
+
+.flowkit-health-table tr.is-muted {
+  opacity: 0.6;
+}
+
+/* Summary tiles ---------------------------------------------------------- */
+.flowkit-health-summary {
+  display: flex;
+  gap: 10px;
+  margin: 8px 0 14px;
+  flex-wrap: wrap;
+}
+
+.flowkit-stat {
+  flex: 1 1 90px;
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  text-align: center;
+}
+
+.flowkit-stat-value {
+  font-size: 1.6em;
+  font-weight: 700;
+  line-height: 1.1;
+}
+.flowkit-stat-label {
+  font-size: 0.75em;
+  color: var(--text-muted);
+  margin-top: 2px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* Table ------------------------------------------------------------------ */
+.flowkit-health-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85em;
+}
+.flowkit-health-table th,
+.flowkit-health-table td {
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  text-align: left;
+}
+.flowkit-health-table th.num,
+.flowkit-health-table td.num {
+  text-align: center;
+  white-space: nowrap;
+}
+.flowkit-health-table th {
+  color: var(--text-muted);
+  font-weight: 600;
+  background: var(--background-primary);
+}
+.flowkit-health-table tr.is-disabled {
+  opacity: 0.55;
+}
+
+.flowkit-name-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.flowkit-plugin-name {
+  font-weight: 600;
+}
+.flowkit-plugin-meta {
+  font-size: 0.82em;
+  color: var(--text-muted);
+}
+
+/* Maintained / Aging / Unmaintained badge. */
+.flowkit-status-badge {
+  font-size: 0.68em;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  padding: 1px 6px;
+  border-radius: 4px;
+  border: 1px solid currentColor;
+  cursor: help;
+  white-space: nowrap;
+}
+.flowkit-status-badge.tone-good {
+  color: var(--color-green, #2e7d32);
+  background: color-mix(in srgb, var(--color-green, #2e7d32) 12%, transparent);
+}
+.flowkit-status-badge.tone-warn {
+  color: var(--color-yellow, #b8860b);
+  background: color-mix(in srgb, var(--color-yellow, #b8860b) 14%, transparent);
+}
+.flowkit-status-badge.tone-bad {
+  color: var(--color-red, #c62828);
+  background: color-mix(in srgb, var(--color-red, #c62828) 12%, transparent);
+}
+.flowkit-status-badge.tone-unknown {
+  color: var(--text-muted);
+  background: transparent;
+}
+
+/* Score chips ------------------------------------------------------------ */
+.flowkit-chip {
+  display: inline-flex;
+  align-items: baseline;
+  min-width: 32px;
+  justify-content: center;
+  padding: 2px 7px;
+  border-radius: 999px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  color: var(--text-on-accent, #fff);
+  cursor: help;
+}
+.flowkit-chip.tone-good {
+  background: var(--color-green, #2e7d32);
+}
+.flowkit-chip.tone-warn {
+  background: var(--color-yellow, #b8860b);
+  color: #1a1a1a;
+}
+.flowkit-chip.tone-bad {
+  background: var(--color-red, #c62828);
+}
+.flowkit-chip.tone-unknown {
+  background: var(--background-modifier-border);
+  color: var(--text-muted);
+}
+
+/* Tone applied to plain text (summary tiles). */
+.tone-good {
+  color: var(--color-green, #2e7d32);
+}
+.tone-warn {
+  color: var(--color-yellow, #b8860b);
+}
+.tone-bad {
+  color: var(--color-red, #c62828);
+}
+.tone-unknown {
+  color: var(--text-muted);
+}
+
+.flowkit-est {
+  font-size: 0.7em;
+  opacity: 0.85;
+  margin-left: 1px;
+}
+
+/* Estimated metrics get a subtle dashed underline to distinguish from measured. */
+.flowkit-chip.src-estimated {
+  outline: 1px dashed var(--background-modifier-border);
+  outline-offset: 1px;
+}
+
+.flowkit-health-empty {
+  color: var(--text-muted);
+  padding: 24px 0;
+  text-align: center;
+}
+
+.flowkit-health-legend {
+  margin-top: 16px;
+  font-size: 0.78em;
+  color: var(--text-muted);
+  line-height: 1.5;
+}

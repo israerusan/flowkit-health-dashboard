@@ -1,0 +1,28 @@
+{
+  "name": "flowkit-health-dashboard",
+  "version": "0.1.0",
+  "description": "FlowKit Plugin Health Dashboard for Obsidian.",
+  "main": "main.js",
+  "type": "module",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+    "typecheck": "tsc -noEmit -skipLibCheck",
+    "test": "node test/run.mjs"
+  },
+  "keywords": [
+    "obsidian",
+    "plugin",
+    "health",
+    "flowkit"
+  ],
+  "author": "Israel Avila",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "builtin-modules": "^3.3.0",
+    "esbuild": "^0.20.2",
+    "obsidian": "^1.5.7",
+    "typescript": "^5.4.5"
+  }
+}
