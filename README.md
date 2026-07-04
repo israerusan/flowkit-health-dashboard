@@ -43,6 +43,43 @@ Each plugin row also surfaces:
 - **Sideloaded** — the plugin isn't in Obsidian's community list, so it skipped
   community review. A trust signal, shown when online.
 
+## At a glance
+
+The top of the dashboard shows a **vault-health gauge** with a letter grade
+(A–F) and a one-line verdict, backed by tiles for plugin count, available
+updates, unmaintained plugins, and at-risk plugins.
+
+Below it, **Insights** turns the scores into a short, ranked to-do list — the
+incompatible plugins that won't load, the ones that look abandoned, the updates
+waiting, the sideloaded ones that skipped review — most urgent first.
+
+## Free vs Pro
+
+FlowKit is useful for free forever, and a one-time **Pro** unlock adds the
+power-user tooling. Pro is verified fully offline (a signed license key — no
+account, no server, no telemetry).
+
+### Free
+
+- The full **five-metric scorecard** and blended overall for every plugin
+- **Vault-health gauge**, letter grade, and summary tiles
+- The **top Insight** — your single most important thing to fix
+- **Search, filter, sort**, and the per-row menu (enable/disable, open settings,
+  open on GitHub, mute)
+- Fully **offline-capable**; online enrichment is optional
+
+### Pro ($6 one-time)
+
+- **Full Insights** — the complete ranked list, not just the top item
+- **One-click bulk actions** — disable all incompatible/abandoned plugins, or
+  mute all sideloaded ones, straight from an insight
+- **Export reports** — Markdown *and* CSV of the full scorecard
+- **Health trends** — FlowKit records your vault health over time and shows the
+  delta since the last scan, with a sparkline
+- **Auto-refresh on open** — always see a fresh scan
+
+Enter your license key under **Settings → FlowKit Pro** to unlock.
+
 ## Usage
 
 - Click the **activity** ribbon icon, or run the command
@@ -52,16 +89,20 @@ Each plugin row also surfaces:
   sort. Hover any score for the reasoning behind it.
 - **Row menu (⋮)** — enable/disable the plugin, open its settings, open its
   GitHub repo, or mute it from the counts.
-- **Export** writes the current (filtered) report to a Markdown note in your
-  vault and opens it.
+- **Insights** — act on the ranked list; Pro adds one-click bulk fixes.
+- **Export** *(Pro)* writes the current (filtered) report to a Markdown note or a
+  CSV file in your vault.
 - **Refresh** re-scores and re-downloads community data on demand.
 
 ## Settings
 
+- **FlowKit Pro** — paste your license key to unlock Pro features (verified
+  offline). Shows your Pro status and what it unlocks.
 - **Online enrichment** — fetch popularity + maintenance from Obsidian's public
   community data. Turn off to stay fully offline (those two metrics then show as
   unavailable). Local-first: no telemetry, no accounts.
 - **Show disabled plugins** — include installed-but-disabled plugins.
+- **Auto-refresh on open** *(Pro)* — recompute every time the dashboard opens.
 - **Muted plugins** — plugins you've muted from the at-risk / unmaintained
   counts; clear the list here.
 
@@ -76,8 +117,21 @@ npm test        # run the scoring engine test suite
 
 The test suite (`test/`) executes the real scoring code against mock plugin
 data — verifying compatibility, popularity, maintenance, performance, quality,
-the blended overall, the maintained/not status, update-available detection, and
-the sideload flag — so the engine is checked even without a live Obsidian vault.
+the blended overall, the maintained/not status, update-available detection, the
+sideload flag, the offline license verifier, and the insights engine — so the
+core logic is checked even without a live Obsidian vault.
+
+### Licensing (author-only)
+
+Pro is gated by an offline Ed25519 license key (`src/shared/verifyLicense.mjs`
+verifies against the public key in `src/license/publicKey.ts`). To mint a key
+for a customer you need the private signing key at
+`scripts/.license-private.key` (gitignored — **back it up; it can't be
+regenerated**):
+
+```bash
+npm run license:generate -- customer@email.com
+```
 
 Copy `main.js`, `manifest.json`, and `styles.css` into
 `<vault>/.obsidian/plugins/flowkit-health-dashboard/` to test in Obsidian, or

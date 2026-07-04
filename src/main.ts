@@ -3,12 +3,18 @@ import type { PluginManifest } from "obsidian";
 import { HealthDashboardView, VIEW_TYPE_HEALTH } from "./view";
 import { computeHealth } from "./scoring";
 import { fetchCommunityList, fetchRemoteStats } from "./dataSources";
+import { LicenseManager } from "./license/LicenseManager";
 import {
   DEFAULT_SETTINGS,
   FlowKitHealthSettingTab,
   FlowKitHealthSettings,
 } from "./settings";
-import type { CommunityList, PluginHealth, RemoteStats } from "./types";
+import type {
+  CommunityList,
+  HealthSnapshot,
+  PluginHealth,
+  RemoteStats,
+} from "./types";
 
 /** Obsidian's internal plugin registry — not in the public typings. */
 interface InternalPluginsApi {
@@ -29,8 +35,16 @@ type AppInternals = {
   setting?: InternalSettingApi;
 };
 
+/** Cap on stored trend snapshots — plenty for a readable history. */
+const MAX_HISTORY = 90;
+
 export default class FlowKitHealthPlugin extends Plugin {
   settings: FlowKitHealthSettings = DEFAULT_SETTINGS;
+
+  /** Pro entitlement, derived from the license key on load / change. */
+  isPro = false;
+  licenseEmail?: string;
+  licenseError?: string;
 
   /** Session cache of the (multi-MB) community data, so reopening the view or
    *  re-scoring doesn't re-download it. Cleared on an explicit Refresh. */
@@ -39,6 +53,7 @@ export default class FlowKitHealthPlugin extends Plugin {
 
   async onload(): Promise<void> {
     await this.loadSettings();
+    this.refreshLicense();
 
     this.registerView(
       VIEW_TYPE_HEALTH,
@@ -68,6 +83,21 @@ export default class FlowKitHealthPlugin extends Plugin {
 
   async saveSettings(): Promise<void> {
     await this.saveData(this.settings);
+  }
+
+  /** Re-verify the stored license key and update the Pro entitlement flags. */
+  refreshLicense(): void {
+    const key = this.settings.licenseKey?.trim();
+    if (!key) {
+      this.isPro = false;
+      this.licenseEmail = undefined;
+      this.licenseError = undefined;
+      return;
+    }
+    const result = LicenseManager.verify(key);
+    this.isPro = result.valid;
+    this.licenseEmail = result.valid ? result.email : undefined;
+    this.licenseError = result.valid ? undefined : result.error;
   }
 
   /** Reveal the dashboard in the right sidebar, creating it if needed. */
@@ -149,6 +179,16 @@ export default class FlowKitHealthPlugin extends Plugin {
     else await api.disablePluginAndSave?.(id);
   }
 
+  /** Bulk-disable a set of plugins (Pro bulk actions). Returns the count. */
+  async disableMany(ids: string[]): Promise<number> {
+    let count = 0;
+    for (const id of ids) {
+      await this.setPluginEnabled(id, false);
+      count++;
+    }
+    return count;
+  }
+
   /** Open Obsidian's settings window to a plugin's own tab, if it has one. */
   openPluginSettings(id: string): void {
     const setting = (this.app as unknown as AppInternals).setting;
@@ -165,7 +205,56 @@ export default class FlowKitHealthPlugin extends Plugin {
     await this.saveSettings();
   }
 
+  /** Mute several plugins at once, persisting a single time (Pro bulk action). */
+  async muteMany(ids: string[]): Promise<number> {
+    const set = new Set(this.settings.ignored);
+    const before = set.size;
+    for (const id of ids) set.add(id);
+    this.settings.ignored = [...set];
+    await this.saveSettings();
+    return set.size - before;
+  }
+
   isIgnored(id: string): boolean {
     return this.settings.ignored.includes(id);
   }
+
+  // --- Pro: health-trend history ------------------------------------------
+
+  /** The most recent snapshot recorded before `at`, for delta display. */
+  previousSnapshot(at: number): HealthSnapshot | null {
+    const prior = this.settings.history.filter((s) => s.at < at);
+    return prior.length ? prior[prior.length - 1] : null;
+  }
+
+  /**
+   * Record a vault-health snapshot for the trend tracker (Pro only). To keep
+   * the history compact, it replaces the last entry when it's from the same
+   * calendar day, and otherwise appends — capping the list to a recent window.
+   */
+  async recordSnapshot(snapshot: HealthSnapshot): Promise<void> {
+    if (!this.isPro) return;
+    const history = this.settings.history.slice();
+    const last = history[history.length - 1];
+    if (last && sameDay(last.at, snapshot.at)) {
+      history[history.length - 1] = snapshot;
+    } else {
+      history.push(snapshot);
+    }
+    if (history.length > MAX_HISTORY) {
+      history.splice(0, history.length - MAX_HISTORY);
+    }
+    this.settings.history = history;
+    await this.saveSettings();
+  }
+}
+
+function sameDay(a: number, b: number): boolean {
+  const da = new Date(a);
+  const db = new Date(b);
+  return (
+    da.getFullYear() === db.getFullYear() &&
+    da.getMonth() === db.getMonth() &&
+    da.getDate() === db.getDate()
+  );
 }

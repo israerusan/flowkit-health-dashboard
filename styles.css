@@ -6,6 +6,7 @@
   overflow-y: auto;
 }
 
+/* Header ----------------------------------------------------------------- */
 .flowkit-health-header {
   display: flex;
   align-items: center;
@@ -16,18 +17,34 @@
   top: 0;
   background: var(--background-primary);
   padding: 12px 0 8px;
-  z-index: 1;
+  z-index: 2;
 }
 
+.flowkit-title-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
 .flowkit-health-header h2 {
   margin: 0;
   font-size: 1.1em;
 }
 
+.flowkit-pro-pill {
+  font-size: 0.62em;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  padding: 2px 6px;
+  border-radius: 4px;
+  color: var(--text-on-accent, #fff);
+  background: var(--interactive-accent);
+}
+
 .flowkit-health-actions {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 .flowkit-health-status {
@@ -44,11 +61,280 @@
 .flowkit-health-btn {
   display: inline-flex;
   align-items: center;
-  gap: 2px;
+  gap: 3px;
   cursor: pointer;
 }
+.flowkit-health-btn .flowkit-lock {
+  display: inline-flex;
+  opacity: 0.7;
+  transform: scale(0.85);
+}
+.flowkit-upgrade-btn {
+  color: var(--text-on-accent, #fff);
+  background: var(--interactive-accent);
+}
+.flowkit-upgrade-btn:hover {
+  background: var(--interactive-accent-hover);
+}
 
-/* Toolbar: search + filter --------------------------------------------- */
+/* Hero: gauge + verdict -------------------------------------------------- */
+.flowkit-hero {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 14px;
+  margin: 6px 0 12px;
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 12px;
+}
+.flowkit-gauge {
+  position: relative;
+  flex: 0 0 auto;
+  width: 116px;
+  height: 116px;
+  display: grid;
+  place-items: center;
+}
+.flowkit-gauge-track {
+  stroke: var(--background-modifier-border);
+}
+.flowkit-gauge-arc.tone-good {
+  stroke: var(--color-green, #2e7d32);
+}
+.flowkit-gauge-arc.tone-warn {
+  stroke: var(--color-yellow, #b8860b);
+}
+.flowkit-gauge-arc.tone-bad {
+  stroke: var(--color-red, #c62828);
+}
+.flowkit-gauge-arc.tone-unknown {
+  stroke: var(--background-modifier-border);
+}
+.flowkit-gauge-label {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0;
+}
+.flowkit-gauge-score {
+  font-size: 2em;
+  font-weight: 800;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+.flowkit-gauge-grade {
+  font-size: 0.72em;
+  color: var(--text-muted);
+  margin-top: 2px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.flowkit-hero-text {
+  min-width: 0;
+}
+.flowkit-hero-text h3 {
+  margin: 0 0 4px;
+  font-size: 1.02em;
+  line-height: 1.3;
+}
+.flowkit-hero-sub {
+  margin: 0;
+  font-size: 0.82em;
+  color: var(--text-muted);
+}
+
+/* Summary tiles ---------------------------------------------------------- */
+.flowkit-health-summary {
+  display: flex;
+  gap: 10px;
+  margin: 0 0 14px;
+  flex-wrap: wrap;
+}
+.flowkit-stat {
+  flex: 1 1 80px;
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  padding: 8px 12px;
+  text-align: center;
+}
+.flowkit-stat-value {
+  font-size: 1.5em;
+  font-weight: 700;
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+}
+.flowkit-stat-label {
+  font-size: 0.72em;
+  color: var(--text-muted);
+  margin-top: 2px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* Section headers (Insights / Trends) ------------------------------------ */
+.flowkit-section-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 4px 0 8px;
+}
+.flowkit-section-icon {
+  display: inline-flex;
+  color: var(--text-muted);
+}
+.flowkit-section-title {
+  font-weight: 700;
+  font-size: 0.92em;
+}
+.flowkit-pro-tag {
+  font-size: 0.6em;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  padding: 1px 5px;
+  border-radius: 4px;
+  color: var(--interactive-accent);
+  border: 1px solid var(--interactive-accent);
+  margin-left: 2px;
+}
+
+/* Insights --------------------------------------------------------------- */
+.flowkit-insights {
+  margin: 6px 0 14px;
+}
+.flowkit-insight {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--background-modifier-border);
+  border-left-width: 3px;
+  border-radius: 8px;
+  margin-bottom: 8px;
+  background: var(--background-primary);
+}
+.flowkit-insight.tone-bad {
+  border-left-color: var(--color-red, #c62828);
+}
+.flowkit-insight.tone-warn {
+  border-left-color: var(--color-yellow, #b8860b);
+}
+.flowkit-insight.tone-good {
+  border-left-color: var(--color-green, #2e7d32);
+}
+.flowkit-insight.tone-info {
+  border-left-color: var(--interactive-accent);
+}
+.flowkit-insight-icon {
+  display: inline-flex;
+  margin-top: 1px;
+  flex: 0 0 auto;
+}
+.flowkit-insight.tone-bad .flowkit-insight-icon {
+  color: var(--color-red, #c62828);
+}
+.flowkit-insight.tone-warn .flowkit-insight-icon {
+  color: var(--color-yellow, #b8860b);
+}
+.flowkit-insight.tone-good .flowkit-insight-icon {
+  color: var(--color-green, #2e7d32);
+}
+.flowkit-insight.tone-info .flowkit-insight-icon {
+  color: var(--interactive-accent);
+}
+.flowkit-insight-body {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.flowkit-insight-title {
+  font-weight: 600;
+  font-size: 0.9em;
+}
+.flowkit-insight-detail {
+  font-size: 0.82em;
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+.flowkit-insight-action {
+  flex: 0 0 auto;
+  align-self: center;
+  cursor: pointer;
+  font-size: 0.82em;
+}
+
+/* Locked teaser card. */
+.flowkit-insight-lock {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px;
+  border: 1px dashed var(--interactive-accent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--interactive-accent) 6%, transparent);
+}
+.flowkit-insight-lock-body {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.flowkit-lock-icon {
+  display: inline-flex;
+  color: var(--interactive-accent);
+}
+.flowkit-lock-sub {
+  font-size: 0.8em;
+  color: var(--text-muted);
+  margin-top: 1px;
+}
+
+/* Trends ----------------------------------------------------------------- */
+.flowkit-trends {
+  margin: 6px 0 14px;
+}
+.flowkit-trends-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  background: var(--background-secondary);
+}
+.flowkit-sparkline-line {
+  stroke: var(--interactive-accent);
+}
+.flowkit-sparkline-dot {
+  fill: var(--interactive-accent);
+}
+.flowkit-trends-delta {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+}
+.flowkit-delta {
+  font-size: 1.15em;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.flowkit-delta-sub {
+  font-size: 0.78em;
+  color: var(--text-muted);
+}
+.flowkit-trends-empty {
+  font-size: 0.82em;
+  color: var(--text-muted);
+  padding: 10px 12px;
+  border: 1px dashed var(--background-modifier-border);
+  border-radius: 8px;
+}
+
+/* Toolbar: search + filter ---------------------------------------------- */
 .flowkit-health-toolbar {
   display: flex;
   gap: 8px;
@@ -77,76 +363,10 @@
   flex: 0 0 auto;
 }
 
-/* Sortable headers ------------------------------------------------------ */
-.flowkit-health-table th.sortable {
-  cursor: pointer;
-  user-select: none;
-}
-.flowkit-health-table th.sortable:hover {
-  color: var(--text-normal);
-}
-.flowkit-sort-arrow {
-  font-size: 0.8em;
-  color: var(--text-accent, var(--interactive-accent));
-}
-
-/* Row action menu button ------------------------------------------------ */
-.flowkit-actions {
-  width: 1%;
-  white-space: nowrap;
-}
-.flowkit-menu-btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  padding: 2px;
-  background: transparent;
-  border: none;
-  box-shadow: none;
-  cursor: pointer;
-  color: var(--text-muted);
-  border-radius: 4px;
-}
-.flowkit-menu-btn:hover {
-  color: var(--text-normal);
-  background: var(--background-modifier-hover);
-}
-
-.flowkit-health-table tr.is-muted {
-  opacity: 0.6;
-}
-
-/* Summary tiles ---------------------------------------------------------- */
-.flowkit-health-summary {
-  display: flex;
-  gap: 10px;
-  margin: 8px 0 14px;
-  flex-wrap: wrap;
-}
-
-.flowkit-stat {
-  flex: 1 1 90px;
-  background: var(--background-secondary);
-  border: 1px solid var(--background-modifier-border);
-  border-radius: 8px;
-  padding: 10px 12px;
-  text-align: center;
-}
-
-.flowkit-stat-value {
-  font-size: 1.6em;
-  font-weight: 700;
-  line-height: 1.1;
-}
-.flowkit-stat-label {
-  font-size: 0.75em;
-  color: var(--text-muted);
-  margin-top: 2px;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-}
-
 /* Table ------------------------------------------------------------------ */
+.flowkit-table-wrap {
+  overflow-x: auto;
+}
 .flowkit-health-table {
   width: 100%;
   border-collapse: collapse;
@@ -167,9 +387,28 @@
   color: var(--text-muted);
   font-weight: 600;
   background: var(--background-primary);
+  position: sticky;
+  top: 52px;
+}
+.flowkit-health-table th.sortable {
+  cursor: pointer;
+  user-select: none;
+}
+.flowkit-health-table th.sortable:hover {
+  color: var(--text-normal);
+}
+.flowkit-sort-arrow {
+  font-size: 0.8em;
+  color: var(--text-accent, var(--interactive-accent));
+}
+.flowkit-health-table tbody tr:hover {
+  background: var(--background-modifier-hover);
 }
 .flowkit-health-table tr.is-disabled {
   opacity: 0.55;
+}
+.flowkit-health-table tr.is-muted {
+  opacity: 0.6;
 }
 
 .flowkit-name-row {
@@ -184,6 +423,28 @@
 .flowkit-plugin-meta {
   font-size: 0.82em;
   color: var(--text-muted);
+}
+
+/* Row action menu button. */
+.flowkit-actions {
+  width: 1%;
+  white-space: nowrap;
+}
+.flowkit-menu-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  cursor: pointer;
+  color: var(--text-muted);
+  border-radius: 4px;
+}
+.flowkit-menu-btn:hover {
+  color: var(--text-normal);
+  background: var(--background-modifier-hover);
 }
 
 /* Maintained / Aging / Unmaintained badge. */
@@ -242,8 +503,18 @@
   background: var(--background-modifier-border);
   color: var(--text-muted);
 }
+/* Estimated metrics get a subtle dashed outline vs measured. */
+.flowkit-chip.src-estimated {
+  outline: 1px dashed var(--background-modifier-border);
+  outline-offset: 1px;
+}
+.flowkit-est {
+  font-size: 0.7em;
+  opacity: 0.85;
+  margin-left: 1px;
+}
 
-/* Tone applied to plain text (summary tiles). */
+/* Tone applied to plain text (summary tiles, gauge, deltas). */
 .tone-good {
   color: var(--color-green, #2e7d32);
 }
@@ -257,22 +528,20 @@
   color: var(--text-muted);
 }
 
-.flowkit-est {
-  font-size: 0.7em;
-  opacity: 0.85;
-  margin-left: 1px;
-}
-
-/* Estimated metrics get a subtle dashed underline to distinguish from measured. */
-.flowkit-chip.src-estimated {
-  outline: 1px dashed var(--background-modifier-border);
-  outline-offset: 1px;
-}
-
+/* Misc ------------------------------------------------------------------- */
 .flowkit-health-empty {
   color: var(--text-muted);
   padding: 24px 0;
   text-align: center;
+}
+.flowkit-spin {
+  display: inline-flex;
+  animation: flowkit-spin 900ms linear infinite;
+}
+@keyframes flowkit-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .flowkit-health-legend {
@@ -280,4 +549,41 @@
   font-size: 0.78em;
   color: var(--text-muted);
   line-height: 1.5;
+}
+
+/* Settings: Pro section -------------------------------------------------- */
+.flowkit-pro-banner {
+  padding: 12px 14px;
+  border-radius: 10px;
+  margin-bottom: 14px;
+  border: 1px solid var(--background-modifier-border);
+}
+.flowkit-pro-banner.is-pro {
+  border-color: var(--color-green, #2e7d32);
+  background: color-mix(in srgb, var(--color-green, #2e7d32) 8%, transparent);
+}
+.flowkit-pro-banner.is-free {
+  border-color: var(--interactive-accent);
+  background: color-mix(in srgb, var(--interactive-accent) 6%, transparent);
+}
+.flowkit-pro-list {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  font-size: 0.88em;
+  color: var(--text-muted);
+}
+.flowkit-pro-list li {
+  margin: 3px 0;
+}
+.flowkit-license-input {
+  width: 260px;
+  font-family: var(--font-monospace);
+}
+.flowkit-license-error {
+  color: var(--text-error, var(--color-red));
+  font-size: 0.82em;
+  margin: -4px 0 12px;
+}
+.flowkit-locked-setting {
+  opacity: 0.7;
 }

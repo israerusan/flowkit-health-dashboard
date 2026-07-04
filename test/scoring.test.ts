@@ -8,6 +8,10 @@ import {
   pickLatestVersion,
   type ScoreInput,
 } from "../src/scoring";
+import nacl from "tweetnacl";
+import { verifyLicense } from "../src/shared/verifyLicense.mjs";
+import { buildInsights } from "../src/insights";
+import type { PluginHealth } from "../src/types";
 
 const DAY = 86_400_000;
 const NOW = 2_000_000_000_000; // fixed "now" so the tests are deterministic
@@ -175,6 +179,116 @@ eq(
   eq("unknown sideload when no list", h.sideloaded, null);
   eq("muted flag propagates", h.muted, true);
   eq("no update without remote", h.updateAvailable, false);
+}
+
+// --- license verification (offline Ed25519) ---------------------------------
+function b64url(bytes: Uint8Array): string {
+  return Buffer.from(bytes)
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+}
+function makeLicense(secretKey: Uint8Array, product: string, email = "a@b.com"): string {
+  const payload = new TextEncoder().encode(
+    JSON.stringify({ product, email, issued: "2026-01-01" })
+  );
+  const sig = nacl.sign.detached(payload, secretKey);
+  return `${b64url(payload)}.${b64url(sig)}`;
+}
+{
+  const kp = nacl.sign.keyPair();
+  const pub = Buffer.from(kp.publicKey).toString("base64");
+  const PRODUCT = "flowkit-health-dashboard";
+  const good = makeLicense(kp.secretKey, PRODUCT);
+
+  const v = verifyLicense(good, PRODUCT, pub);
+  check("license valid", v.valid === true, v.error ?? "");
+  eq("license email extracted", v.email, "a@b.com");
+
+  eq(
+    "license wrong product rejected",
+    verifyLicense(makeLicense(kp.secretKey, "other-product"), PRODUCT, pub).valid,
+    false
+  );
+
+  const zeroSig = `${good.split(".")[0]}.${b64url(new Uint8Array(64))}`;
+  eq("license tampered signature rejected", verifyLicense(zeroSig, PRODUCT, pub).valid, false);
+  eq("license empty rejected", verifyLicense("", PRODUCT, pub).valid, false);
+  eq("license malformed rejected", verifyLicense("no-dot-here", PRODUCT, pub).valid, false);
+
+  const other = nacl.sign.keyPair();
+  const otherPub = Buffer.from(other.publicKey).toString("base64");
+  eq("license from another key rejected", verifyLicense(good, PRODUCT, otherPub).valid, false);
+}
+
+// --- insights ----------------------------------------------------------------
+function ph(overrides: Partial<PluginHealth>): PluginHealth {
+  const metric = (value: number | null) => ({
+    value,
+    source: "measured" as const,
+    detail: "",
+  });
+  return {
+    id: "p",
+    name: "P",
+    author: "A",
+    version: "1.0.0",
+    enabled: true,
+    maintenanceStatus: "maintained",
+    updateAvailable: false,
+    sideloaded: false,
+    muted: false,
+    overall: 90,
+    metrics: {
+      quality: metric(90),
+      maintenance: metric(90),
+      performance: metric(90),
+      popularity: metric(90),
+      compatibility: metric(100),
+    },
+    ...overrides,
+  };
+}
+{
+  // A tidy vault yields the single "healthy" insight.
+  const healthy = buildInsights([ph({}), ph({ id: "q", name: "Q" })]);
+  eq("insights healthy count", healthy.length, 1);
+  eq("insights healthy id", healthy[0].id, "healthy");
+
+  // Unmaintained → actionable insight referencing the plugin id.
+  const um = buildInsights([ph({ id: "old", maintenanceStatus: "unmaintained" })]).find(
+    (i) => i.id === "unmaintained"
+  );
+  check("insight unmaintained present", um != null);
+  eq("insight unmaintained action", um?.action, "disable-unmaintained");
+  eq("insight unmaintained id captured", um?.ids[0], "old");
+
+  // Muted plugins are ignored entirely.
+  eq(
+    "muted excluded from insights",
+    buildInsights([ph({ id: "m", maintenanceStatus: "unmaintained", muted: true })]).some(
+      (i) => i.id === "unmaintained"
+    ),
+    false
+  );
+
+  // Incompatible outranks unmaintained (severity ordering).
+  const inc = ph({ id: "inc", maintenanceStatus: "maintained" });
+  inc.metrics.compatibility = { value: 0, source: "measured", detail: "" };
+  const ordered = buildInsights([ph({ id: "old", maintenanceStatus: "unmaintained" }), inc]);
+  eq("insights severity ordered", ordered[0].id, "incompatible");
+
+  eq(
+    "insight updates present",
+    buildInsights([ph({ id: "up", updateAvailable: true })]).some((i) => i.id === "updates"),
+    true
+  );
+  eq(
+    "insight sideloaded present",
+    buildInsights([ph({ id: "s", sideloaded: true })]).some((i) => i.id === "sideloaded"),
+    true
+  );
 }
 
 // --- report -----------------------------------------------------------------

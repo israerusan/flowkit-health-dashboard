@@ -1,6 +1,6 @@
 {
   "name": "flowkit-health-dashboard",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "FlowKit Plugin Health Dashboard for Obsidian.",
   "main": "main.js",
   "type": "module",
@@ -8,7 +8,8 @@
     "dev": "node esbuild.config.mjs",
     "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
     "typecheck": "tsc -noEmit -skipLibCheck",
-    "test": "node test/run.mjs"
+    "test": "node test/run.mjs",
+    "license:generate": "node scripts/generate-license.mjs"
   },
   "keywords": [
     "obsidian",
@@ -24,5 +25,8 @@
     "esbuild": "^0.20.2",
     "obsidian": "^1.5.7",
     "typescript": "^5.4.5"
+  },
+  "dependencies": {
+    "tweetnacl": "^1.0.3"
   }
 }

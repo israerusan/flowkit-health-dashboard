@@ -82,6 +82,22 @@ export interface RemotePluginStat {
 /** Keyed by plugin id. */
 export type RemoteStats = Record<string, RemotePluginStat>;
 
+/**
+ * A point-in-time reading of overall vault health, used by the Pro trend
+ * tracker. Stored in plugin data; the list is capped to a recent window.
+ */
+export interface HealthSnapshot {
+  /** Epoch milliseconds. */
+  at: number;
+  /** Vault-wide average overall score, or null if nothing was scorable. */
+  avg: number | null;
+  /** Number of (non-muted) plugins scored. */
+  count: number;
+  atRisk: number;
+  unmaintained: number;
+  updates: number;
+}
+
 /** One plugin's entry in Obsidian's community-plugins list. */
 export interface CommunityListEntry {
   id: string;
