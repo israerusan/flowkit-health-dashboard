@@ -2,9 +2,9 @@
 // stub, then executes them. Keeps the tests running the real src/scoring.ts.
 import esbuild from "esbuild";
 import path from "path";
-import { pathToFileURL } from "url";
+import { pathToFileURL, fileURLToPath } from "url";
 
-const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const outfile = path.join(root, "test", ".build", "scoring.test.cjs");
 
 await esbuild.build({
