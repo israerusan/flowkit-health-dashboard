@@ -99,6 +99,9 @@
 .flowkit-gauge-track {
   stroke: var(--background-modifier-border);
 }
+.flowkit-gauge-arc {
+  transition: stroke-dasharray 600ms ease;
+}
 .flowkit-gauge-arc.tone-good {
   stroke: var(--color-green, #2e7d32);
 }

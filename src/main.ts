@@ -78,7 +78,9 @@ export default class FlowKitHealthPlugin extends Plugin {
   }
 
   async loadSettings(): Promise<void> {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    // `loadData()` is typed `any`; narrow it before merging so the assignment is type-safe.
+    const data = (await this.loadData()) as Partial<FlowKitHealthSettings> | null;
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
   }
 
   async saveSettings(): Promise<void> {
@@ -110,7 +112,9 @@ export default class FlowKitHealthPlugin extends Plugin {
       leaf = workspace.getRightLeaf(false);
       await leaf?.setViewState({ type: VIEW_TYPE_HEALTH, active: true });
     }
-    if (leaf) workspace.revealLeaf(leaf);
+    // `void` the reveal so no-floating-promises is satisfied (revealLeaf gained a
+    // Promise return in 1.7.2; we don't consume it).
+    if (leaf) void this.app.workspace.revealLeaf(leaf);
   }
 
   /**

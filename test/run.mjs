@@ -21,3 +21,6 @@ await esbuild.build({
 });
 
 await import(pathToFileURL(outfile).href);
+
+// Plain-Node contract tests (no `obsidian` import, so no bundling needed).
+await import(pathToFileURL(path.join(root, "test", "manifest-contract.test.mjs")).href);

@@ -8,7 +8,9 @@
     "dev": "node esbuild.config.mjs",
     "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
     "typecheck": "tsc -noEmit -skipLibCheck",
-    "test": "node test/run.mjs",
+    "lint": "tsc --noEmit -p . && eslint . --max-warnings 0",
+    "test": "npm run lint && node test/run.mjs",
+    "test:ci": "node test/run.mjs",
     "license:generate": "node scripts/generate-license.mjs"
   },
   "keywords": [
@@ -21,10 +23,12 @@
   "license": "MIT",
   "devDependencies": {
     "@types/node": "^20.11.0",
-    "builtin-modules": "^3.3.0",
     "esbuild": "^0.20.2",
-    "obsidian": "^1.5.7",
-    "typescript": "^5.4.5"
+    "eslint": "^9.39.4",
+    "eslint-plugin-obsidianmd": "^0.4.1",
+    "obsidian": "1.7.2",
+    "typescript": "^5.4.5",
+    "typescript-eslint": "^8.62.1"
   },
   "dependencies": {
     "tweetnacl": "^1.0.3"

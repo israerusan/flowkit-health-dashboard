@@ -1,4 +1,4 @@
-import { ItemView, Menu, Notice, TFile, WorkspaceLeaf, setIcon } from "obsidian";
+import { ItemView, Menu, Notice, WorkspaceLeaf, setIcon } from "obsidian";
 import type { MaintenanceStatus, MetricScore, PluginHealth } from "./types";
 import type FlowKitHealthPlugin from "./main";
 import { buildInsights, type BulkAction, type Insight } from "./insights";
@@ -366,7 +366,7 @@ export class HealthDashboardView extends ItemView {
       "stroke-width": stroke,
       class: "flowkit-gauge-track",
     });
-    const arc = svgEl(svg, "circle", {
+    svgEl(svg, "circle", {
       cx: size / 2,
       cy: size / 2,
       r,
@@ -377,7 +377,8 @@ export class HealthDashboardView extends ItemView {
       transform: `rotate(-90 ${size / 2} ${size / 2})`,
       class: `flowkit-gauge-arc tone-${grade.tone}`,
     });
-    arc.style.setProperty("transition", "stroke-dasharray 600ms ease");
+    // The reveal transition lives in styles.css (.flowkit-gauge-arc) rather than an
+    // inline style assignment (obsidianmd/no-static-styles-assignment).
     const label = gauge.createDiv({ cls: "flowkit-gauge-label" });
     label.createDiv({
       cls: `flowkit-gauge-score tone-${grade.tone}`,
@@ -792,7 +793,7 @@ export class HealthDashboardView extends ItemView {
     try {
       const file = await this.app.vault.create(path, content);
       if (format === "md") {
-        await this.app.workspace.getLeaf(true).openFile(file as TFile);
+        await this.app.workspace.getLeaf(true).openFile(file);
       }
       new Notice(`Exported health report to “${path}”.`);
     } catch (err) {
