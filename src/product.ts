@@ -2,7 +2,7 @@
 // to change.
 export const PRO_PRICE = "$6 one-time";
 export const PURCHASE_URL = "https://buymeacoffee.com/flowkithealth";
-export const PRODUCT_NAME = "FlowKit Plugin Health Dashboard";
+export const PRODUCT_NAME = "FlowKit Health Dashboard";
 
 /** Human-readable summary of what Pro unlocks — shown in settings and the CTA. */
 export const PRO_FEATURES: string[] = [

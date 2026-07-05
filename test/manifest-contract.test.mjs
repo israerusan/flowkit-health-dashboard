@@ -13,16 +13,16 @@ const pkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"))
 const versions = JSON.parse(fs.readFileSync(path.join(root, "versions.json"), "utf8"));
 
 // --- Redundant words the review rejects -------------------------------------
-// NOTE on the word "plugin": for THIS plugin it is legitimate — the product's whole
-// function is scoring every installed *plugin* ("Plugin Health Dashboard"), so it
-// appears in both the name and the description, and the plugin already passed
-// Obsidian's community review with it. We therefore do NOT assert the description or
-// name are free of "plugin". "Obsidian" is always redundant (implied by the
-// directory), so we still forbid it everywhere.
-assert.ok(!/\bobsidian\b/i.test(manifest.description), 'manifest.description must not contain the word "Obsidian" (implied by the plugin directory)');
-assert.ok(!/obsidian/i.test(manifest.name), 'manifest.name must not contain "Obsidian"');
-assert.ok(!/obsidian/i.test(manifest.id), 'manifest.id must not contain "obsidian"');
-assert.ok(!/plugin/i.test(manifest.id), 'manifest.id must not contain "plugin"');
+// The review bot's validate-manifest rule does a blunt case-insensitive SUBSTRING
+// check for "obsidian" and "plugin" in name/description/id — with NO exception for a
+// plugin that is *about* plugins. (An earlier version of this test wrongly exempted
+// "plugin" here on the theory that a "Plugin Health Dashboard" earned it; the bot
+// rejected that. Mirror the bot exactly instead.)
+for (const key of ["name", "description", "id"]) {
+	for (const word of ["obsidian", "plugin"]) {
+		assert.ok(!new RegExp(word, "i").test(manifest[key]), `manifest.${key} must not contain "${word}" (the Obsidian review bot rejects it)`);
+	}
+}
 
 // --- Shape -------------------------------------------------------------------
 assert.ok(/^[a-z0-9-]+$/.test(manifest.id), "manifest.id must be lowercase letters/digits/hyphens");

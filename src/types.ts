@@ -1,4 +1,4 @@
-// Shared types for the FlowKit Plugin Health Dashboard.
+// Shared types for the FlowKit Health Dashboard.
 
 /**
  * How much to trust a metric value.

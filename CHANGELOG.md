@@ -3,6 +3,21 @@
 All notable changes to FlowKit Plugin Health Dashboard are documented here. This
 project follows [Semantic Versioning](https://semver.org/).
 
+## [0.2.2] - 2026-07-05
+
+### Changed
+- **Renamed to "FlowKit Health Dashboard"** (was "FlowKit Plugin Health
+  Dashboard") and reworded the description. Obsidian's community-plugin review
+  rejects the words "Obsidian" and "plugin" anywhere in the manifest name,
+  description, or id — even for a plugin whose job is scoring add-ons — so both
+  had to drop "plugin". The ribbon tooltip and command name were updated to
+  match; the plugin id, license binding, and settings are unchanged.
+
+### Internal
+- Corrected the manifest-contract test to enforce the review bot's actual rule
+  (no "obsidian"/"plugin" substring in name/description/id, no exception), so
+  this class of failure is caught locally from now on.
+
 ## [0.2.1] - 2026-07-05
 
 ### Internal

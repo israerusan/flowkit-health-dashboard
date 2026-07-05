@@ -60,13 +60,13 @@ export default class FlowKitHealthPlugin extends Plugin {
       (leaf) => new HealthDashboardView(leaf, this)
     );
 
-    this.addRibbonIcon("activity", "Open Plugin Health Dashboard", () => {
+    this.addRibbonIcon("activity", "Open FlowKit Health Dashboard", () => {
       void this.activateView();
     });
 
     this.addCommand({
       id: "open-health-dashboard",
-      name: "Open Plugin Health Dashboard",
+      name: "Open health dashboard",
       callback: () => void this.activateView(),
     });
 

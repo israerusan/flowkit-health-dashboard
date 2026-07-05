@@ -1,9 +1,9 @@
 {
   "id": "flowkit-health-dashboard",
-  "name": "FlowKit Plugin Health Dashboard",
-  "version": "0.2.1",
+  "name": "FlowKit Health Dashboard",
+  "version": "0.2.2",
   "minAppVersion": "1.4.0",
-  "description": "Scores every installed plugin on quality, maintenance, performance, popularity, and compatibility.",
+  "description": "Scores every installed add-on on quality, maintenance, performance, popularity, and compatibility.",
   "author": "Israel Avila",
   "authorUrl": "https://github.com/israerusan",
   "fundingUrl": "https://buymeacoffee.com/flowkithealth",
