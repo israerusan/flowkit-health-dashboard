@@ -1,7 +1,7 @@
 // Product / Pro-tier constants, kept in one place so pricing and links are easy
 // to change.
 export const PRO_PRICE = "$6 one-time";
-export const PURCHASE_URL = "https://buymeacoffee.com/flowkithealth";
+export const PURCHASE_URL = "https://buymeacoffee.com/vaultspotlight/e/560206";
 export const PRODUCT_NAME = "FlowKit Health Dashboard";
 
 /** Human-readable summary of what Pro unlocks — shown in settings and the CTA. */

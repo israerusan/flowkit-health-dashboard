@@ -1,11 +1,11 @@
 {
   "id": "flowkit-health-dashboard",
   "name": "FlowKit Health Dashboard",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "minAppVersion": "1.4.0",
   "description": "Scores every installed add-on on quality, maintenance, performance, popularity, and compatibility.",
   "author": "Israel Avila",
   "authorUrl": "https://github.com/israerusan",
-  "fundingUrl": "https://buymeacoffee.com/flowkithealth",
+  "fundingUrl": "https://buymeacoffee.com/vaultspotlight/e/560206",
   "isDesktopOnly": false
 }
