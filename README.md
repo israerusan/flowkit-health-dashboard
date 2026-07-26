@@ -94,6 +94,12 @@ Purchase: [Buy Me a Coffee — FlowKit Pro](https://buymeacoffee.com/vaultspotli
 2. Your license key is emailed to you **automatically, within seconds** — the whole thing is fully automated, no waiting on a human.
 3. Obsidian → **Settings → FlowKit Pro** → paste the key. Pro unlocks immediately (offline verification).
 
+## Install
+
+**Community plugins (recommended):** open **Settings → Community plugins**, search **FlowKit**, and install it — one click, auto-updates.
+
+**Manual install:** copy `main.js`, `manifest.json`, and `styles.css` into `<vault>/.obsidian/plugins/flowkit-health-dashboard/` and enable it in Settings → Community plugins.
+
 ## Usage
 
 - Click the **activity** ribbon icon, or run the command
