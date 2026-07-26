@@ -1,7 +1,15 @@
 # FlowKit Plugin Health Dashboard
 
-An Obsidian plugin that scores every installed community plugin on five signals,
-so you can tell at a glance which plugins are healthy and which are risks.
+> Know which of your Obsidian plugins are healthy, which are abandoned, and which are quietly slowing you down — at a glance.
+
+FlowKit scores every installed community plugin on five signals and turns the
+result into a ranked to-do list, so you can stop guessing which plugins are safe
+to keep and which are risks worth removing.
+
+<!-- SCREENSHOT SLOT — drop a real Obsidian capture here to lift conversions.
+     ![FlowKit dashboard: vault-health gauge, letter grade, and the ranked plugin scorecard](docs/assets/hero.png)
+     Suggested shot: the dashboard open in the right sidebar showing the health gauge + a few scored rows. Save as docs/assets/hero.png -->
+
 
 ## Metrics
 
@@ -78,7 +86,13 @@ account, no server, no telemetry).
   delta since the last scan, with a sparkline
 - **Auto-refresh on open** — always see a fresh scan
 
-Enter your license key under **Settings → FlowKit Pro** to unlock.
+Purchase: [Buy Me a Coffee — FlowKit Pro](https://buymeacoffee.com/vaultspotlight/e/560206). License keys are verified **offline** (Ed25519) — no account, server, or subscription.
+
+### Activate Pro
+
+1. Purchase on [Buy Me a Coffee](https://buymeacoffee.com/vaultspotlight/e/560206).
+2. Your license key is emailed to you **automatically, within seconds** — the whole thing is fully automated, no waiting on a human.
+3. Obsidian → **Settings → FlowKit Pro** → paste the key. Pro unlocks immediately (offline verification).
 
 ## Usage
 
