@@ -29,7 +29,18 @@ import {
 import { WEIGHTS } from "./scoring";
 import { clearCooldown } from "./dataSources";
 import { totalUncaught } from "./errors";
+import { conflictsFor, describeConflict, type Conflict } from "./conflicts";
+import { describeMute } from "./mutes";
+import { formatBytes, formatPeriod, pollPenalty, startupCost } from "./runtime";
+import { rankSafeDisable } from "./triage";
+import { describeRound, remainingText, roundsNeeded } from "./bisect";
+import { describeEvent, describeGap } from "./timeline";
+import { AUTO_SNAPSHOT, isNoop, type PluginProfile } from "./profiles";
+import { findKnownIssues } from "./issueSearch";
 import { BulkConfirmModal } from "./ui/BulkConfirmModal";
+import { BisectStartModal } from "./ui/BisectModal";
+import { MuteModal } from "./ui/MuteModal";
+import { SaveProfileModal } from "./ui/ProfileModal";
 import { UpgradeModal } from "./ui/UpgradeModal";
 import { PRODUCT_NAME, PRO_PRICE } from "./product";
 
@@ -47,6 +58,8 @@ type FilterKey =
   | "delisted"
   | "sideloaded"
   | "update"
+  | "heavy"
+  | "watched"
   | "disabled"
   | "muted";
 
@@ -69,7 +82,7 @@ const METRIC_COLUMNS: Array<{ key: MetricKey; label: string; hint: string }> = [
   {
     key: "footprint",
     label: "Footprint",
-    hint: "Code and styles loaded at startup, measured on disk. Weighted 15%.",
+    hint: "What it costs to run: code loaded at startup, measured load time, and any fast repeating timer. Weighted 15%.",
   },
   {
     key: "hygiene",
@@ -92,6 +105,8 @@ const FILTERS: Array<{ key: FilterKey; label: string }> = [
   { key: "delisted", label: "Delisted" },
   { key: "sideloaded", label: "Local installs" },
   { key: "update", label: "Update available" },
+  { key: "heavy", label: "Heaviest to run" },
+  { key: "watched", label: "Watching" },
   { key: "disabled", label: "Disabled" },
   { key: "muted", label: "Muted" },
 ];
@@ -104,6 +119,11 @@ const MAINTENANCE_META: Record<
     label: "Maintained",
     tone: "good",
     hint: "Released within the last 6 months.",
+  },
+  active: {
+    label: "Active",
+    tone: "good",
+    hint: "No recent release, but its repository was pushed to in the last 6 months — being worked on, just not tagged.",
   },
   aging: { label: "Aging", tone: "warn", hint: "No release in 6–18 months." },
   stable: {
@@ -207,6 +227,10 @@ export class HealthDashboardView extends ItemView {
   private expandedId: string | null = null;
   /** The last bulk action, so it can be undone for the rest of the session. */
   private lastBulk: { label: string; revert: () => Promise<void> } | null = null;
+  /** Plugins competing for the same shortcut or command name, read per scan. */
+  private conflicts: Conflict[] = [];
+  /** Mutes that lapsed since the last render, shown once. */
+  private lapsedMutes: string[] = [];
 
   // View controls
   private search = "";
@@ -299,6 +323,11 @@ export class HealthDashboardView extends ItemView {
       const { results, coverage } = await this.plugin.computeAll({ force, allowFetch });
       this.results = results;
       this.coverage = coverage;
+      // Read fresh each scan: hotkeys change the moment the user rebinds one,
+      // and a stale conflict list is worse than no conflict list.
+      this.conflicts = this.plugin.detectConflicts();
+      const lapsed = this.plugin.takeLapsedMutes();
+      if (lapsed.length) this.lapsedMutes = lapsed;
       const s = this.summaryStats();
       await this.plugin.recordSnapshot({
         at: Date.now(),
@@ -339,7 +368,7 @@ export class HealthDashboardView extends ItemView {
       // below it contradicts.
       if (this.scopeInsight) {
         const id = this.scopeInsight.id;
-        this.scopeInsight = buildInsights(this.results).find((i) => i.id === id) ?? null;
+        this.scopeInsight = this.insights().find((i) => i.id === id) ?? null;
       }
       this.render();
       // Put the user back exactly where they were.
@@ -360,8 +389,32 @@ export class HealthDashboardView extends ItemView {
    * was pure latency on the most casual action in the product.
    */
   private async toggleMute(r: PluginHealth): Promise<void> {
-    await this.plugin.toggleIgnore(r.id);
-    r.muted = !r.muted;
+    if (r.muted) {
+      await this.plugin.unmute(r.id);
+      r.muted = false;
+      r.mute = undefined;
+      this.afterMuteChange();
+      return;
+    }
+    // Muting asks for a span and a reason. A one-click permanent mute is a way
+    // to make a real problem invisible forever, and the old menu item offered
+    // nothing else — so a decision taken in a hurry outlived its reason with
+    // nothing recorded about what the reason had been.
+    new MuteModal(this.app, {
+      pluginName: r.name,
+      appVersion: apiVersion,
+      onConfirm: (kind, reason) => {
+        void this.plugin.mute(r.id, kind, reason).then(() => {
+          r.muted = true;
+          r.mute = this.plugin.muteOf(r.id);
+          this.afterMuteChange();
+        });
+      },
+    }).open();
+  }
+
+  /** Repaint after a mute change, without rescanning — it changes no score. */
+  private afterMuteChange(): void {
     const s = this.summaryStats();
     this.plugin.updateStatusBar(
       s.avg,
@@ -399,6 +452,14 @@ export class HealthDashboardView extends ItemView {
   }
 
   // --- data shaping ---------------------------------------------------------
+
+  /**
+   * The findings, built from this scan plus the vault-level evidence that isn't
+   * a property of any single plugin.
+   */
+  private insights(): Insight[] {
+    return buildInsights(this.results, { conflicts: this.conflicts });
+  }
 
   private summaryStats(): SummaryStats {
     const active = this.results.filter((r) => !r.muted);
@@ -450,6 +511,12 @@ export class HealthDashboardView extends ItemView {
           return r.listing === "local";
         case "update":
           return r.updateAvailable;
+        case "heavy":
+          // The triage view: only things actually running can be slowing you
+          // down, and a disabled plugin scores 100 here by definition.
+          return r.enabled;
+        case "watched":
+          return r.watched;
         case "disabled":
           return !r.enabled;
         case "muted":
@@ -498,6 +565,12 @@ export class HealthDashboardView extends ItemView {
     if (typeof scope === "string") {
       this.filter = scope;
       this.scopeInsight = null;
+      // "Heaviest to run" is a question, not a cohort — it only answers it if
+      // the table is actually ordered by cost when you get there.
+      if (scope === "heavy") {
+        this.sortKey = "footprint";
+        this.sortDir = 1;
+      }
     } else {
       this.scopeInsight = scope;
       this.filter = "all";
@@ -570,13 +643,25 @@ export class HealthDashboardView extends ItemView {
       return;
     }
 
+    // A running bisect owns the page. Everything else is a report about a vault
+    // that is, right now, deliberately half switched off — so the scores below
+    // are not what the user's vault normally looks like, and the one control
+    // that matters is the question being asked.
+    this.renderBisect(root);
+    this.renderAppUpdate(root);
     this.renderChanges(root);
+    this.renderCorrelations(root);
+    this.renderLapsedMutes(root);
     this.renderIntro(root);
     this.renderHero(root);
     this.renderCoverageNotice(root);
     this.renderUndoBar(root);
-    this.renderSummary(root);
+    // The to-do list, then the evidence. It used to sit below four stat tiles
+    // and a trend chart, which is a spreadsheet-first ordering for a product
+    // whose entire value is the ranked list of what to do — and on a phone it
+    // put the answer a full screen below the question.
     this.renderInsights(root);
+    this.renderSummary(root);
     this.renderTrends(root);
     this.renderToolbar(root);
 
@@ -636,14 +721,19 @@ export class HealthDashboardView extends ItemView {
     // differentiator is honest provenance, overstated itself.
     const cachedAt = this.plugin.settings.cache?.at;
     const age = cachedAt ? ` · community data from ${describeWhen(cachedAt)}` : "";
+    // Two different ages, and they are genuinely different: the scan is local
+    // and current, the community data behind it may be a day old. Saying only
+    // one of them is how a fresh-looking page ends up quoting stale numbers.
+    const scannedAt = this.plugin.settings.lastScanAt;
+    const scanned = scannedAt ? `Scanned ${describeWhen(scannedAt)}` : "Scanned just now";
     status.setText(
       this.loading
         ? "Scoring…"
         : full
-          ? `Online — all signals${age}`
+          ? `${scanned} · all signals${age}`
           : this.coverage.stats || this.coverage.list
-            ? `Online — some signals unavailable${age}`
-            : "Local signals only"
+            ? `${scanned} · some signals unavailable${age}`
+            : `${scanned} · local signals only`
     );
     status.addClass(full ? "is-online" : "is-offline");
 
@@ -657,24 +747,21 @@ export class HealthDashboardView extends ItemView {
       exportBtn.onclick = (evt) => this.onExportClick(evt);
     }
 
-    // Only ask once there is something to ask about, and never above an empty
-    // dashboard. The old button rendered before the early returns, so the same
-    // context-free "Upgrade" sat above "No installed community plugins found" —
-    // loudest exactly where it was least earned.
-    if (!this.plugin.isPro && !this.loading && this.results.length > 0) {
-      const fixable = new Set(
-        buildInsights(this.results)
-          .filter((i) => i.action && i.ids.length)
-          .flatMap((i) => i.ids)
-      ).size;
-      if (fixable > 0) {
-        const up = actions.createEl("button", {
-          cls: "flowkit-health-btn flowkit-upgrade-btn",
-        });
-        setIcon(up.createSpan(), "zap");
-        up.createSpan({ text: ` Fix ${fixable} in one click` });
-        up.onclick = () => this.openUpgrade("bulk");
-      }
+    // No standing upsell button here any more. It counted plugins a bulk fix
+    // could change, and bulk fixes are free — so it advertised something the
+    // reader already had. The upgrade path now runs through the capability the
+    // user actually reached for, which is the only context that earns the ask.
+
+    // The diagnostic entry point. It leads with bisect deliberately: that is
+    // the thing somebody with a broken vault came here to do, and burying it in
+    // a row menu would hide the only feature nothing else in the ecosystem has.
+    if (!this.loading && this.results.length > 0) {
+      const tools = actions.createEl("button", {
+        cls: "flowkit-health-btn flowkit-tools-btn",
+      });
+      setIcon(tools.createSpan(), "stethoscope");
+      tools.createSpan({ text: " Diagnose" });
+      tools.onclick = (evt) => this.openToolsMenu(evt);
     }
 
     const refreshBtn = actions.createEl("button", { cls: "flowkit-health-btn" });
@@ -682,6 +769,49 @@ export class HealthDashboardView extends ItemView {
     refreshBtn.createSpan({ text: " Refresh" });
     refreshBtn.disabled = this.loading;
     refreshBtn.onclick = () => void this.refresh(true);
+  }
+
+  private openToolsMenu(evt: MouseEvent): void {
+    const menu = new Menu();
+    const enabled = this.results.filter((r) => r.enabled);
+
+    menu.addItem((item) =>
+      item
+        .setTitle(
+          this.plugin.isPro
+            ? "Find what's breaking my vault…"
+            : "Find what's breaking my vault… (Pro)"
+        )
+        .setIcon("search-check")
+        .onClick(() => this.startBisect())
+    );
+
+    menu.addItem((item) =>
+      item
+        .setTitle(this.plugin.isPro ? "Profile startup…" : "Profile startup… (Pro)")
+        .setIcon("timer")
+        .onClick(() => this.startProfileAll(enabled.map((r) => r.id)))
+    );
+
+    menu.addSeparator();
+    menu.addItem((item) =>
+      item
+        .setTitle(this.plugin.isPro ? "Save this plugin set…" : "Save this plugin set… (Pro)")
+        .setIcon("bookmark")
+        .onClick(() => this.saveProfile())
+    );
+
+    const profiles = this.plugin.settings.profiles;
+    for (const profile of profiles) {
+      menu.addItem((item) =>
+        item
+          .setTitle(`Switch to “${profile.name}”`)
+          .setIcon("layers")
+          .onClick(() => this.applyProfile(profile))
+      );
+    }
+
+    menu.showAtMouseEvent(evt);
   }
 
   private renderHero(root: HTMLElement): void {
@@ -785,6 +915,201 @@ export class HealthDashboardView extends ItemView {
   }
 
   /**
+   * A search in progress.
+   *
+   * Deliberately the loudest thing on the page while it runs: the vault is
+   * currently in a state the user did not choose, and every number below is
+   * measured against that state rather than their real setup.
+   */
+  private renderBisect(root: HTMLElement): void {
+    const state = this.plugin.bisect;
+    if (!state) return;
+
+    const box = root.createDiv({ cls: "flowkit-bisect" });
+    const head = box.createDiv({ cls: "flowkit-bisect-head" });
+    setIcon(head.createSpan({ cls: "flowkit-bisect-icon" }), "search-check");
+    head.createSpan({
+      cls: "flowkit-bisect-title",
+      text: state.done ? "Search finished" : "Finding what's breaking your vault",
+    });
+    head.createSpan({ cls: "flowkit-bisect-progress", text: remainingText(state) });
+
+    if (state.done) {
+      const culprit = state.culprit
+        ? (this.results.find((r) => r.id === state.culprit)?.name ?? state.culprit)
+        : null;
+      const body = box.createDiv({ cls: "flowkit-bisect-body" });
+      body.setText(
+        culprit
+          ? `It's ${culprit}. It is switched off now; everything else is back on.`
+          : "The problem survived with every candidate switched off, so no installed plugin is causing it. Worth looking at your theme, CSS snippets, or Obsidian itself."
+      );
+      const actions = box.createDiv({ cls: "flowkit-bisect-actions" });
+      const done = actions.createEl("button", { cls: "mod-cta", text: culprit ? "Keep it off" : "Restore everything" });
+      done.onclick = () => void this.plugin.finishBisect(true).then(() => this.render());
+      if (culprit) {
+        const restore = actions.createEl("button", { text: "Turn it back on too" });
+        restore.onclick = () => void this.plugin.finishBisect(false).then(() => this.render());
+      }
+      return;
+    }
+
+    if (state.symptom) {
+      box.createDiv({
+        cls: "flowkit-bisect-symptom",
+        text: `Testing for: ${state.symptom}`,
+      });
+    }
+    box.createDiv({ cls: "flowkit-bisect-body", text: describeRound(state) });
+
+    const off = state.disabled
+      .map((id) => this.results.find((r) => r.id === id)?.name ?? id)
+      .sort((a, b) => a.localeCompare(b));
+    const list = box.createEl("details", { cls: "flowkit-bisect-list" });
+    list.createEl("summary", { text: `Currently switched off (${off.length})` });
+    list.createDiv({ text: off.join(", ") });
+
+    const actions = box.createDiv({ cls: "flowkit-bisect-actions" });
+    const gone = actions.createEl("button", { cls: "mod-cta", text: "The problem is gone" });
+    gone.onclick = () => void this.answerBisect(true);
+    const still = actions.createEl("button", { text: "Still happening" });
+    still.onclick = () => void this.answerBisect(false);
+    const stop = actions.createEl("button", { cls: "flowkit-bisect-stop", text: "Stop and restore" });
+    stop.onclick = () => void this.plugin.cancelBisect().then(() => this.render());
+
+    box.createDiv({
+      cls: "flowkit-bisect-note",
+      text: "Some plugins only fully unload after a restart. If nothing seems different, restart Obsidian and answer then — the search survives it.",
+    });
+  }
+
+  private async answerBisect(gone: boolean): Promise<void> {
+    const next = await this.plugin.answerBisect(gone);
+    if (next?.done && next.culprit) {
+      const name = this.results.find((r) => r.id === next.culprit)?.name ?? next.culprit;
+      new Notice(`Found it: ${name}.`, 8000);
+    }
+    await this.refresh(false, false);
+  }
+
+  /**
+   * Changes that were followed by errors.
+   *
+   * FlowKit already stored both halves of this and never put them together.
+   * "Templater has thrown 40 errors" is a fact; "Templater started throwing
+   * errors two hours after it updated to 2.4.1" is a diagnosis, and it is the
+   * same data.
+   */
+  private renderCorrelations(root: HTMLElement): void {
+    const found = this.plugin.correlations(this.results);
+    if (!found.length) return;
+
+    const box = root.createDiv({ cls: "flowkit-correlation" });
+    const head = box.createDiv({ cls: "flowkit-correlation-head" });
+    setIcon(head.createSpan({ cls: "flowkit-correlation-icon" }), "git-compare");
+    head.createSpan({
+      cls: "flowkit-correlation-title",
+      text: found.length === 1 ? "This looks related" : "These look related",
+    });
+
+    for (const c of found.slice(0, 3)) {
+      const line = box.createDiv({ cls: "flowkit-correlation-line" });
+      line.createSpan({ cls: "flowkit-change-name", text: c.name });
+      line.createSpan({
+        text: ` started throwing errors ${describeGap(c.gapMs)} after it ${describeEvent(
+          c.event
+        )}.`,
+      });
+    }
+    box.createDiv({
+      cls: "flowkit-correlation-note",
+      // Said plainly, because the inference is genuinely weak — it is a
+      // sequence, not a cause, and presenting it as proof would be the exact
+      // kind of confident wrongness the scoring rework removed everywhere else.
+      text: "That is a sequence, not proof. It is usually where to look first.",
+    });
+  }
+
+  /**
+   * What the last Obsidian update did to this vault.
+   *
+   * This is the moment somebody opens a plugin-health dashboard: an update
+   * landed and something stopped working. Every other section can answer "what
+   * is wrong"; only this one answers "what did *that* change", which is the
+   * question actually being asked — and it leads the page for exactly as long
+   * as it is news.
+   */
+  private renderAppUpdate(root: HTMLElement): void {
+    const change = this.plugin.recentAppUpdate();
+    if (!change) return;
+
+    // Re-resolve against the current scan rather than trusting the recorded
+    // list: the user may have already updated or removed one of them, and a
+    // banner naming a plugin that is fine now is worse than no banner.
+    const broke = this.results.filter(
+      (r) => change.brokeIds.includes(r.id) && r.metrics.compatibility.value === 0
+    );
+    const box = root.createDiv({
+      cls: `flowkit-appupdate ${broke.length ? "is-bad" : "is-good"}`,
+    });
+    const head = box.createDiv({ cls: "flowkit-appupdate-head" });
+    setIcon(head.createSpan({ cls: "flowkit-appupdate-icon" }), broke.length ? "alert-octagon" : "check-circle");
+    head.createSpan({
+      cls: "flowkit-appupdate-title",
+      text: `Obsidian updated — ${change.from} → ${change.to}`,
+    });
+    const dismiss = head.createEl("button", {
+      cls: "flowkit-changes-dismiss",
+      text: "×",
+    });
+    dismiss.setAttr("aria-label", "Mark this as seen");
+    dismiss.onclick = () => {
+      void this.plugin.markChangesSeen().then(() => this.render());
+    };
+
+    const body = box.createDiv({ cls: "flowkit-appupdate-body" });
+    if (!broke.length) {
+      body.setText(
+        `FlowKit re-checked all ${this.results.length} of your plugins against ${change.to}. Nothing that worked before has stopped loading.`
+      );
+      return;
+    }
+    body.setText(
+      `${broke.length} plugin${broke.length === 1 ? "" : "s"} can no longer load on this version: ${broke
+        .map((r) => r.name)
+        .join(", ")}. Check for updates first — an incompatible plugin is usually one release behind, not broken.`
+    );
+    const show = box.createEl("button", { cls: "mod-cta", text: "Show these" });
+    show.onclick = () => this.applyScope("incompatible");
+  }
+
+  /**
+   * Mutes that ran out.
+   *
+   * A mute with an expiry is only honest if its expiry is visible. Without
+   * this, a plugin quietly rejoins the counts and the user reads it as the
+   * score wobbling rather than as a decision they made lapsing on schedule.
+   */
+  private renderLapsedMutes(root: HTMLElement): void {
+    if (!this.lapsedMutes.length) return;
+    const names = this.lapsedMutes.map(
+      (id) => this.results.find((r) => r.id === id)?.name ?? id
+    );
+    const box = root.createDiv({ cls: "flowkit-lapsed" });
+    setIcon(box.createSpan({ cls: "flowkit-lapsed-icon" }), "bell-ring");
+    box.createSpan({
+      text: `Mute expired for ${names.join(", ")} — ${
+        names.length === 1 ? "it is" : "they are"
+      } back in the counts.`,
+    });
+    const ok = box.createEl("button", { text: "OK" });
+    ok.onclick = () => {
+      this.lapsedMutes = [];
+      this.render();
+    };
+  }
+
+  /**
    * A one-time orientation. Landing on a wall of numbers with no idea what they
    * are or what to do next is how a first run ends in an uninstall.
    */
@@ -881,6 +1206,119 @@ export class HealthDashboardView extends ItemView {
       attention > 0 ? "bad" : "good",
       "attention"
     );
+
+    this.renderStartupCost(root);
+  }
+
+  /**
+   * "Why is my vault slow?", as a question the dashboard can answer.
+   *
+   * Everything needed for this was already measured and shown one row at a
+   * time, where nobody adds it up. Stated as a vault total with a way into the
+   * ordered list, the same data becomes a performance triage tool rather than a
+   * maintenance checklist.
+   */
+  private renderStartupCost(root: HTMLElement): void {
+    const enabled = this.results.filter((r) => r.enabled && !r.muted);
+    if (enabled.length === 0) return;
+
+    const cost = startupCost(
+      enabled.map((r) => ({ id: r.id, enabled: true, bytes: r.bundleBytes })),
+      Object.fromEntries(enabled.map((r) => [r.id, r.runtime ?? {}]))
+    );
+
+    const bar = root.createDiv({ cls: "flowkit-startup" });
+    setIcon(bar.createSpan({ cls: "flowkit-startup-icon" }), "gauge");
+    const parts = [`${enabled.length} plugins load at startup`];
+    if (cost.bytes > 0) parts.push(`${formatBytes(cost.bytes)} of code`);
+    if (cost.measuredCount > 0) {
+      parts.push(
+        `${Math.round(cost.measuredMs)} ms measured across ${cost.measuredCount}`
+      );
+    }
+    if (cost.polling > 0) {
+      parts.push(`${cost.polling} running a fast repeating timer`);
+    }
+    bar.createSpan({ cls: "flowkit-startup-text", text: parts.join(" · ") });
+
+    // Say how partial the measurement is. "142 ms across 3" beside "38 plugins
+    // enabled" invites the reading that the other 35 are free.
+    const unmeasured = enabled.length - cost.measuredCount;
+    if (this.plugin.runtimeTracking && unmeasured > 0) {
+      const profile = bar.createEl("button", {
+        text: `Profile the other ${unmeasured}`,
+      });
+      profile.setAttr(
+        "aria-label",
+        "Restart each unmeasured plugin in turn and time how long it takes to load"
+      );
+      profile.onclick = () => this.startProfileAll(enabled.map((r) => r.id));
+    }
+
+    const btn = bar.createEl("button", { text: "Why is my vault slow?" });
+    btn.setAttr("aria-label", "Order the table by what each plugin costs to run");
+    btn.onclick = () => this.applyScope("heavy");
+  }
+
+  /**
+   * Time every enabled plugin in one pass.
+   *
+   * Passive timing only ever catches the plugins Obsidian loads after FlowKit,
+   * so on most vaults the column is mostly blank — which makes the whole
+   * "why is my vault slow" answer partial. This fills it, at the cost of
+   * genuinely restarting everything, so it is confirmed and it is Pro.
+   */
+  private startProfileAll(ids: string[]): void {
+    if (!this.plugin.isPro) {
+      this.openUpgrade("profile");
+      return;
+    }
+    new BulkConfirmModal(this.app, {
+      title: `Profile ${ids.length} plugins?`,
+      intro:
+        `FlowKit will switch each plugin off and straight back on, one at a time, and ` +
+        `time how long each takes to load. Expect this to take a few seconds and for the ` +
+        `interface to flicker while it runs.`,
+      rows: [
+        {
+          name: "Everything restarts",
+          detail:
+            "Anything a plugin is holding in memory but hasn't written is lost, and views they own will reload. Nothing is uninstalled and nothing stays off.",
+        },
+        {
+          name: "Do it when you're not mid-note",
+          detail: "Finish what you're writing first. This is a measurement, not a repair.",
+        },
+      ],
+      confirmLabel: `Profile ${ids.length}`,
+      onConfirm: () => void this.runProfileAll(ids),
+    }).open();
+  }
+
+  private async runProfileAll(ids: string[]): Promise<void> {
+    const notice = new Notice(`Profiling 0 of ${ids.length}…`, 0);
+    try {
+      const result = await this.plugin.profileAll(ids, (done, total, id) => {
+        notice.setMessage(`Profiling ${done} of ${total} — ${id}`);
+      });
+      notice.hide();
+      if (!result) {
+        new Notice("Runtime measurement is switched off — turn it on in settings first.");
+        return;
+      }
+      new Notice(
+        result.failed.length
+          ? `Profiled ${result.measured} plugins. ${result.failed.length} couldn't be measured.`
+          : `Profiled ${result.measured} plugins.`,
+        6000
+      );
+      await this.refresh(false, false);
+    } catch (err) {
+      notice.hide();
+      console.error("FlowKit: profiling failed", err);
+      new Notice("Profiling stopped early — see the console.");
+      await this.refresh(false, false);
+    }
   }
 
   /** A standing way back from the last bulk action, for the rest of the session. */
@@ -912,7 +1350,7 @@ export class HealthDashboardView extends ItemView {
   // --- insights -------------------------------------------------------------
 
   private renderInsights(root: HTMLElement): void {
-    const insights = buildInsights(this.results);
+    const insights = this.insights();
     const section = root.createDiv({ cls: "flowkit-insights" });
 
     const head = section.createDiv({ cls: "flowkit-section-head" });
@@ -928,6 +1366,8 @@ export class HealthDashboardView extends ItemView {
       return;
     }
 
+    this.renderStartHere(section);
+
     // The complete diagnosis, for everyone.
     //
     // This used to show insights[0] and then a lock card. It converted nobody:
@@ -936,28 +1376,89 @@ export class HealthDashboardView extends ItemView {
     // each hidden cohort, so any user could reconstruct the whole list in five
     // seconds and conclude the gate was artificial. What Pro sells now is
     // applying the fixes, not being told what they are.
-    for (const ins of insights) this.renderInsightCard(section, ins, this.plugin.isPro);
+    for (const ins of insights) this.renderInsightCard(section, ins);
 
     if (this.plugin.isPro) return;
 
-    const actionable = insights.filter((i) => i.action && i.ids.length);
-    if (!actionable.length) return;
+    // The ask, framed around the one question this list cannot answer.
+    //
+    // A ranked to-do list tells you what is wrong with each plugin. It says
+    // nothing about the problem that has no single culprit — the lag, the
+    // freeze, the thing that started last Tuesday — and that is exactly the
+    // problem people install a plugin-health tool to solve. So the pitch is
+    // the search, on this vault's real numbers.
+    const enabled = this.results.filter((r) => r.enabled).length;
+    if (enabled < 2) return;
 
-    const affected = new Set(actionable.flatMap((i) => i.ids));
     const lock = section.createDiv({ cls: "flowkit-insight-lock" });
     const body = lock.createDiv({ cls: "flowkit-insight-lock-body" });
-    setIcon(body.createSpan({ cls: "flowkit-lock-icon" }), "zap");
+    setIcon(body.createSpan({ cls: "flowkit-lock-icon" }), "search-check");
     const txt = body.createDiv();
     txt.createEl("strong", {
-      text: `Apply ${affected.size} of these fixes in one click`,
+      text: "Something wrong that isn't on this list?",
     });
     txt.createDiv({
       cls: "flowkit-lock-sub",
-      text: `Review what changes, apply it together, undo if you disagree — plus monitoring, reports and history. Pro, ${PRO_PRICE}.`,
+      text:
+        `FlowKit can find it by elimination — switching off half your plugins, asking whether the problem is still there, ` +
+        `and halving until one is left. That's ${roundsNeeded(enabled)} questions to search your ${enabled} enabled plugins, ` +
+        `instead of an evening of it. Your exact setup is restored afterwards. Pro, ${PRO_PRICE}.`,
     });
     const btn = lock.createEl("button", { cls: "flowkit-health-btn flowkit-upgrade-btn" });
-    btn.setText("See what Pro adds");
-    btn.onclick = () => this.openUpgrade("bulk");
+    btn.setText("See how it works");
+    btn.onclick = () => this.openUpgrade("bisect");
+  }
+
+  /**
+   * The order to act in.
+   *
+   * The findings say what is wrong; for a vault with nine of them, that still
+   * isn't an answer. Ranking by badness alone answers it wrongly — the
+   * worst-scoring plugin is often the one used every day, while the easy win is
+   * the broken thing the user forgot was installed. This ranks by trouble
+   * removed per feature given up, and says what each one would cost.
+   */
+  private renderStartHere(section: HTMLElement): void {
+    const ranked = rankSafeDisable(this.results, 3);
+    // Below three findings there is no ordering problem to solve, and a "start
+    // here" list in front of a two-item list is furniture.
+    if (ranked.length < 2) return;
+
+    const box = section.createDiv({ cls: "flowkit-starthere" });
+    const head = box.createDiv({ cls: "flowkit-starthere-head" });
+    setIcon(head.createSpan({ cls: "flowkit-section-icon" }), "list-ordered");
+    head.createSpan({ cls: "flowkit-starthere-title", text: "Disable these first" });
+    head.createSpan({
+      cls: "flowkit-starthere-sub",
+      text: "Most trouble removed for the least you'd give up",
+    });
+
+    const list = box.createEl("ol", { cls: "flowkit-starthere-list" });
+    for (const c of ranked) {
+      const li = list.createEl("li");
+      const name = li.createEl("button", {
+        cls: "flowkit-plugin-name",
+        text: c.name,
+      });
+      name.setAttr("aria-label", `${c.name} — open its reasoning`);
+      name.onclick = () => {
+        this.expandedId = c.id;
+        // Scoped by id rather than by searching its name: a plugin whose name
+        // is a substring of another's would otherwise take you to a list of
+        // two, which is not what the card promised.
+        this.applyScope({
+          id: `plugin:${c.id}`,
+          tone: "info",
+          icon: "plug",
+          title: c.name,
+          detail: "",
+          ids: [c.id],
+          match: (r: PluginHealth) => r.id === c.id,
+        });
+      };
+      li.createDiv({ cls: "flowkit-starthere-why", text: `Because ${c.why}.` });
+      li.createDiv({ cls: "flowkit-starthere-loss", text: `You'd lose: ${c.loss}.` });
+    }
   }
 
   /** The good case, stated as the checks that passed rather than as an absence. */
@@ -985,7 +1486,7 @@ export class HealthDashboardView extends ItemView {
     for (const c of checks) list.createEl("li", { text: c });
   }
 
-  private renderInsightCard(parent: HTMLElement, ins: Insight, pro: boolean): void {
+  private renderInsightCard(parent: HTMLElement, ins: Insight): void {
     const card = parent.createDiv({ cls: `flowkit-insight tone-${ins.tone}` });
     setIcon(card.createSpan({ cls: "flowkit-insight-icon" }), ins.icon);
     const body = card.createDiv({ cls: "flowkit-insight-body" });
@@ -1014,51 +1515,21 @@ export class HealthDashboardView extends ItemView {
         go();
       };
     }
+    // Free since 1.4.0. Charging for this asked people to pay for the
+    // difference between one click and three — a thirty-second job they can do
+    // in Obsidian's own settings, which is why it converted nobody. What Pro
+    // sells now is the work that genuinely can't be done by hand: the search,
+    // the profile, the saved sets.
     if (ins.action && ins.ids.length) {
       const btn = card.createEl("button", { cls: "flowkit-insight-action" });
-      if (pro) {
-        btn.setText(ins.actionLabel ?? "Apply");
-        btn.onclick = () => this.runBulk(ins);
-      } else {
-        // Shown, not hidden: the user should see the capability they would be
-        // buying, on their own vault's numbers — and pressing it shows them the
-        // exact set it would act on before anything mentions money. Bouncing
-        // straight to a checkout page from a button the user pressed to find
-        // out what it does is the interaction most likely to end in an
-        // uninstall.
-        btn.addClass("is-locked");
-        setIcon(btn.createSpan({ cls: "flowkit-lock-icon" }), "lock");
-        btn.createSpan({ text: ` ${ins.actionLabel ?? "Apply"}` });
-        btn.setAttr("aria-label", `${ins.actionLabel ?? "Apply"} — preview what Pro would change`);
-        btn.onclick = () => this.previewBulk(ins);
-      }
+      btn.setText(ins.actionLabel ?? "Apply");
+      btn.onclick = () => this.runBulk(ins);
     }
-  }
-
-  /** For free users: the same review screen, ending in the offer rather than the act. */
-  private previewBulk(ins: Insight): void {
-    const affected = this.results.filter((r) => ins.ids.includes(r.id));
-    const disabling = ins.action !== "mute-sideloaded";
-    const rows = disabling ? affected.filter((r) => r.enabled) : affected.filter((r) => !r.muted);
-    if (!rows.length) {
-      new Notice("Nothing to change — those plugins are already in that state.");
-      return;
-    }
-    new BulkConfirmModal(this.app, {
-      title: disabling ? "Pro would disable these" : "Pro would mute these",
-      intro: `These are the ${rows.length} plugin${rows.length === 1 ? "" : "s"} this fix would change, with the evidence for each. Pro applies it in one click, with undo.`,
-      rows: rows.map((r) => ({
-        name: r.name,
-        detail: this.bulkReason(r, ins.action ?? "disable-incompatible"),
-      })),
-      confirmLabel: `See Pro — ${PRO_PRICE}`,
-      onConfirm: () => this.openUpgrade("bulk"),
-    }).open();
   }
 
   /** Show what a bulk action will do, then do it — and keep a way back. */
   private runBulk(ins: Insight): void {
-    if (!this.plugin.isPro || !ins.action || !ins.ids.length) return;
+    if (!ins.action || !ins.ids.length) return;
     const action: BulkAction = ins.action;
     const affected = this.results.filter((r) => ins.ids.includes(r.id));
     const disabling = action !== "mute-sideloaded";
@@ -1122,6 +1593,16 @@ export class HealthDashboardView extends ItemView {
         line.createSpan({ cls: "flowkit-error-count", text: `×${sig.count}` });
       }
 
+      // A user staring at an error message is one search away from the thread
+      // where three other people described it and the author already answered —
+      // and they almost never make that search, because copying a stack trace
+      // into GitHub is friction at the exact moment they are already annoyed.
+      if (r.repo) {
+        const lookup = item.createDiv({ cls: "flowkit-error-lookup" });
+        const ask = lookup.createEl("button", { text: "Is this a known issue?" });
+        ask.onclick = () => void this.lookUpIssue(r, sig.message, lookup, ask);
+      }
+
       if (!sig.stack) continue;
       if (this.plugin.isPro) {
         const details = item.createEl("details", { cls: "flowkit-error-stack" });
@@ -1132,6 +1613,90 @@ export class HealthDashboardView extends ItemView {
         setIcon(locked.createSpan({ cls: "flowkit-lock-icon" }), "lock");
         const btn = locked.createEl("button", { text: "See the stack trace with Pro" });
         btn.onclick = () => this.openUpgrade("errors");
+      }
+    }
+  }
+
+  /**
+   * Who else is claiming this plugin's shortcuts.
+   *
+   * Deliberately not scored. Neither plugin is at fault for a collision, and
+   * docking one of them for it would be inventing a defect — but the user still
+   * needs to know, because Obsidian's own UI never says which binding wins.
+   */
+  private renderConflictDetail(panel: HTMLElement, r: PluginHealth): void {
+    const mine = conflictsFor(this.conflicts, r.id);
+    if (!mine.length) return;
+
+    const box = panel.createDiv({ cls: "flowkit-detail-conflicts" });
+    const head = box.createDiv({ cls: "flowkit-detail-errors-head" });
+    setIcon(head.createSpan({ cls: "flowkit-detail-errors-icon" }), "keyboard");
+    head.createSpan({
+      text: `${mine.length} clash${mine.length === 1 ? "" : "es"} with other plugins`,
+    });
+    for (const conflict of mine.slice(0, 5)) {
+      box.createDiv({
+        cls: "flowkit-conflict-line",
+        text: describeConflict(conflict, r.id),
+      });
+    }
+    const fix = box.createEl("button", { text: "Open Obsidian's hotkey settings" });
+    fix.onclick = () => this.plugin.openHotkeySettings();
+  }
+
+  /**
+   * Search a plugin's own issue tracker for this error.
+   *
+   * On demand only, and never as part of a scan: GitHub's search API allows
+   * roughly ten unauthenticated requests a minute, which is ample for a button
+   * somebody presses and useless for anything automatic.
+   */
+  private async lookUpIssue(
+    r: PluginHealth,
+    message: string,
+    host: HTMLElement,
+    trigger: HTMLButtonElement
+  ): Promise<void> {
+    trigger.disabled = true;
+    trigger.setText("Looking…");
+    const result = await findKnownIssues(r.repo, message);
+    trigger.remove();
+
+    if (!result.ok) {
+      host.createSpan({
+        cls: "flowkit-error-lookup-note",
+        text:
+          result.reason === "rate-limited"
+            ? "GitHub is rate-limiting searches right now — try again in a minute."
+            : "Couldn't search that repository.",
+      });
+      return;
+    }
+    if (!result.issues.length) {
+      const none = host.createDiv({ cls: "flowkit-error-lookup-note" });
+      none.appendText("Nothing matching in their tracker. ");
+      const open = none.createEl("a", {
+        text: "Open a new issue",
+        href: `https://github.com/${r.repo}/issues/new`,
+      });
+      open.setAttr("target", "_blank");
+      return;
+    }
+
+    const list = host.createDiv({ cls: "flowkit-error-issues" });
+    for (const issue of result.issues.slice(0, 3)) {
+      const line = list.createDiv({ cls: "flowkit-error-issue" });
+      line.createSpan({
+        cls: `flowkit-issue-state is-${issue.state}`,
+        text: issue.state,
+      });
+      const link = line.createEl("a", { text: issue.title, href: issue.url });
+      link.setAttr("target", "_blank");
+      if (issue.comments) {
+        line.createSpan({
+          cls: "flowkit-issue-comments",
+          text: ` · ${issue.comments} comment${issue.comments === 1 ? "" : "s"}`,
+        });
       }
     }
   }
@@ -1194,7 +1759,7 @@ export class HealthDashboardView extends ItemView {
   private async copySummary(): Promise<void> {
     const s = this.summaryStats();
     const grade = gradeFor(s.avg);
-    const insights = buildInsights(this.results);
+    const insights = this.insights();
     const lines = [
       `${PRODUCT_NAME}: vault health ${s.avg ?? "—"}/100 (Grade ${grade.letter}) across ${s.count} plugins.`,
     ];
@@ -1500,6 +2065,7 @@ export class HealthDashboardView extends ItemView {
       row.createSpan({ cls: "flowkit-detail-metric-detail", text: m.detail });
     }
 
+    this.renderConflictDetail(panel, r);
     this.renderErrorDetail(panel, r);
 
     const facts = panel.createDiv({ cls: "flowkit-detail-facts" });
@@ -1510,6 +2076,69 @@ export class HealthDashboardView extends ItemView {
           : ""
       } · by ${r.author}`,
     });
+
+    // What it costs and what it does, side by side — the two halves of the
+    // question "should I turn this off".
+    const runtime = r.runtime;
+    const runtimeParts: string[] = [];
+    if (r.bundleBytes) runtimeParts.push(`${formatBytes(r.bundleBytes)} on disk`);
+    if (runtime?.loadMs != null && runtime.loadVersion === r.version) {
+      runtimeParts.push(`loaded in ${Math.round(runtime.loadMs)} ms`);
+    }
+    if (runtime?.minIntervalMs != null) {
+      const period = formatPeriod(runtime.minIntervalMs);
+      runtimeParts.push(
+        pollPenalty(runtime.minIntervalMs) > 0
+          ? `repeating timer every ${period}`
+          : `slowest-cost timer every ${period}`
+      );
+    }
+    if (runtime?.commands) {
+      runtimeParts.push(`${runtime.commands} command${runtime.commands === 1 ? "" : "s"}`);
+    }
+    if (runtime?.handlers) {
+      runtimeParts.push(`${runtime.handlers} registered hooks`);
+    }
+    if (runtimeParts.length) facts.createDiv({ text: runtimeParts.join(" · ") });
+    if (r.enabled && this.plugin.runtimeTracking && runtime?.loadMs == null) {
+      facts.createDiv({
+        cls: "flowkit-detail-muted",
+        text: "Load time not measured — FlowKit only times loads it witnesses. Use “Measure load time” to get a real number.",
+      });
+    }
+
+    const repo = r.repoActivity;
+    if (repo) {
+      const bits: string[] = [];
+      if (repo.archived) bits.push("repository archived by its author");
+      else if (repo.failed === "missing") bits.push("repository no longer exists");
+      else if (repo.pushedAt) bits.push(`last push ${describeWhen(repo.pushedAt)}`);
+      if (repo.openIssues != null) {
+        bits.push(`${repo.openIssues} open issue${repo.openIssues === 1 ? "" : "s"}`);
+      }
+      if (bits.length) facts.createDiv({ text: `GitHub: ${bits.join(" · ")}` });
+    }
+
+    if (r.muted && r.mute) {
+      facts.createDiv({
+        cls: "flowkit-detail-muted",
+        text: `Muted ${describeMute(r.mute, Date.now())}`,
+      });
+    }
+
+    // Its own history. When something broke, "what changed" is the first
+    // question, and it used to be unanswerable from inside the product.
+    const history = this.plugin.eventsFor(r.id);
+    if (history.length) {
+      const box = panel.createDiv({ cls: "flowkit-detail-history" });
+      box.createDiv({ cls: "flowkit-detail-history-head", text: "Recent changes" });
+      for (const event of history.slice(0, 4)) {
+        box.createDiv({
+          cls: "flowkit-history-line",
+          text: `${describeWhen(event.at)} — ${describeEvent(event)}`,
+        });
+      }
+    }
 
     const actions = panel.createDiv({ cls: "flowkit-detail-actions" });
     const toggle = actions.createEl("button", {
@@ -1530,8 +2159,14 @@ export class HealthDashboardView extends ItemView {
       const report = actions.createEl("button", { cls: "mod-cta", text: "Copy bug report" });
       report.onclick = () => void this.copyBugReport(r);
     }
+    const watch = actions.createEl("button", {
+      text: r.watched ? "Stop watching" : "Watch this",
+    });
+    watch.onclick = () => {
+      void this.toggleWatch(r);
+    };
     const mute = actions.createEl("button", {
-      text: r.muted ? "Unmute" : "Mute from counts",
+      text: r.muted ? "Unmute" : "Mute from counts…",
     });
     mute.onclick = () => {
       void this.toggleMute(r);
@@ -1607,9 +2242,38 @@ export class HealthDashboardView extends ItemView {
     // Good state is silent. Every healthy row used to carry a "Maintained"
     // badge, so the badge system marked the normal case and nothing stood out.
     // "Muted" is gone too — the row is already dimmed for it.
+    if (r.watched) {
+      const star = nameRow.createSpan({ cls: "flowkit-watch-star" });
+      setIcon(star, "star");
+      star.setAttr("aria-label", "You're watching this plugin");
+      star.setAttr("title", "You're watching this plugin");
+    }
+
     const status = MAINTENANCE_META[r.maintenanceStatus];
     if (r.maintenanceStatus === "unmaintained") {
       this.badge(nameRow, status.label, status.tone, status.hint);
+    }
+    // The one repository fact worth a badge: an archived repo is the author
+    // saying, on the record, that nothing more is coming.
+    if (r.repoActivity?.archived) {
+      this.badge(
+        nameRow,
+        "Archived",
+        "bad",
+        "Its author has archived the repository — no further fixes are planned."
+      );
+    }
+    // Conflicts belong on the row, not only in the panel: a shortcut that
+    // silently doesn't fire is exactly the kind of thing nobody goes looking
+    // for, because they've assumed it's their own mistake.
+    const clashes = conflictsFor(this.conflicts, r.id).length;
+    if (clashes > 0 && r.enabled) {
+      this.badge(
+        nameRow,
+        clashes === 1 ? "Clash" : `${clashes} clashes`,
+        "warn",
+        "Shares a shortcut or command name with another plugin — only one of them answers."
+      );
     }
     if (r.updateAvailable) {
       this.badge(
@@ -1721,15 +2385,186 @@ export class HealthDashboardView extends ItemView {
       );
     }
 
+    if (r.enabled && this.plugin.runtimeTracking) {
+      menu.addItem((item) =>
+        item
+          .setTitle("Measure load time")
+          .setIcon("timer")
+          .onClick(() => void this.measureLoad(r))
+      );
+    }
+
     menu.addSeparator();
     menu.addItem((item) =>
       item
-        .setTitle(r.muted ? "Unmute plugin" : "Mute from counts")
+        .setTitle(r.watched ? "Stop watching" : "Watch this plugin")
+        .setIcon(r.watched ? "star-off" : "star")
+        .onClick(() => void this.toggleWatch(r))
+    );
+    menu.addItem((item) =>
+      item
+        .setTitle(r.muted ? "Unmute plugin" : "Mute from counts…")
         .setIcon(r.muted ? "bell" : "bell-off")
         .onClick(() => void this.toggleMute(r))
     );
 
     menu.showAtMouseEvent(evt);
+  }
+
+  /**
+   * Time one plugin's load by restarting it.
+   *
+   * Confirmed first, and honest about the cost: this genuinely turns the plugin
+   * off and on again, so anything holding unsaved in-memory state loses it.
+   * That is the price of a real number instead of a file size.
+   */
+  private async measureLoad(r: PluginHealth): Promise<void> {
+    new BulkConfirmModal(this.app, {
+      title: `Measure ${r.name}?`,
+      intro:
+        "FlowKit will turn this plugin off and straight back on, and time how " +
+        "long it takes to load. There is no other way to measure a plugin that " +
+        "was already running before FlowKit started.",
+      rows: [
+        {
+          name: r.name,
+          detail:
+            "It restarts, so anything it is holding in memory but hasn't saved is lost. Views it owns will reload.",
+        },
+      ],
+      caveat:
+        "Not something to run on a plugin you're in the middle of using — finish the note first.",
+      confirmLabel: "Measure it",
+      onConfirm: () => {
+        void this.plugin.measureLoad(r.id).then(async (ms) => {
+          if (ms == null) {
+            new Notice("Couldn't measure that one — see the console.");
+            return;
+          }
+          new Notice(`${r.name} loaded in ${Math.round(ms)} ms.`);
+          await this.refresh(false, false);
+        });
+      },
+    }).open();
+  }
+
+  /**
+   * Open a search.
+   *
+   * Candidates are the enabled plugins, worst-scoring first — bisect halves
+   * either way, so the order doesn't change how many rounds it takes, but it
+   * does mean the first half switched off is the half most likely to contain
+   * the problem, and a lucky first answer ends the search early.
+   */
+  private startBisect(): void {
+    if (!this.plugin.isPro) {
+      this.openUpgrade("bisect");
+      return;
+    }
+    const candidates = this.results
+      .filter((r) => r.enabled)
+      .sort((a, b) => (a.overall ?? 100) - (b.overall ?? 100))
+      .map((r) => r.id);
+
+    if (candidates.length < 2) {
+      new Notice("Bisect needs at least two enabled plugins to search.");
+      return;
+    }
+
+    new BisectStartModal(this.app, {
+      candidateCount: candidates.length,
+      maxRounds: roundsNeeded(candidates.length),
+      snapshotName: AUTO_SNAPSHOT,
+      onConfirm: (symptom) => {
+        void this.plugin
+          .startBisect(candidates, symptom || undefined)
+          .then(() => this.refresh(false, false));
+      },
+    }).open();
+  }
+
+  private saveProfile(): void {
+    if (!this.plugin.isPro) {
+      this.openUpgrade("profiles");
+      return;
+    }
+    const count = this.results.filter((r) => r.enabled).length;
+    new SaveProfileModal(this.app, {
+      count,
+      existing: this.plugin.settings.profiles,
+      onConfirm: (name) => {
+        void this.plugin.saveCurrentProfile(name).then(() => {
+          new Notice(`Saved “${name}”.`);
+          this.render();
+        });
+      },
+    }).open();
+  }
+
+  /** Switch to a saved set, after showing exactly what it would change. */
+  private applyProfile(profile: PluginProfile): void {
+    if (!this.plugin.isPro) {
+      this.openUpgrade("profiles");
+      return;
+    }
+    const delta = this.plugin.deltaFor(profile);
+    if (isNoop(delta)) {
+      new Notice(`“${profile.name}” is already what you're running.`);
+      return;
+    }
+    const name = (id: string): string =>
+      this.results.find((r) => r.id === id)?.name ?? id;
+    const rows = [
+      ...delta.enable.map((id) => ({ name: name(id), detail: "Would be switched on." })),
+      ...delta.disable.map((id) => ({ name: name(id), detail: "Would be switched off." })),
+    ];
+    // Named, not counted: a profile captured months ago can quietly no longer
+    // mean what its name says, and this is the moment to find that out.
+    if (delta.missing.length) {
+      rows.push({
+        name: `${delta.missing.length} no longer installed`,
+        detail: `Recorded in this set but not in this vault: ${delta.missing.join(", ")}.`,
+      });
+    }
+
+    new BulkConfirmModal(this.app, {
+      title: `Switch to “${profile.name}”?`,
+      intro: `${delta.enable.length} on, ${delta.disable.length} off. Nothing is uninstalled, and you can undo this straight after.`,
+      rows,
+      confirmLabel: "Switch",
+      onConfirm: () => void this.runApplyProfile(profile),
+    }).open();
+  }
+
+  private async runApplyProfile(profile: PluginProfile): Promise<void> {
+    const applied = await this.plugin.applyProfile(profile);
+    this.lastBulk = {
+      label: `Switched to “${profile.name}”`,
+      revert: async () => {
+        // The exact inverse of what was actually changed, not of what was
+        // requested — so undo can't switch on something that was already off.
+        await this.plugin.disableMany(applied.enable);
+        await this.plugin.enableMany(applied.disable);
+      },
+    };
+    new Notice(`Switched to “${profile.name}”.`);
+    await this.refresh(false, false);
+  }
+
+  /** Star or unstar a plugin, without rescanning — it changes no score. */
+  private async toggleWatch(r: PluginHealth): Promise<void> {
+    const watching = await this.plugin.toggleWatch(r.id);
+    r.watched = watching;
+    new Notice(
+      watching
+        ? `Watching ${r.name} — FlowKit will lead with it when something changes.`
+        : `No longer watching ${r.name}.`
+    );
+    const scrollTop = this.contentEl.scrollTop;
+    const focusedId = this.focusedRowId();
+    this.render();
+    this.contentEl.scrollTop = scrollTop;
+    this.restoreFocus(focusedId);
   }
 
   private scoreCell(
@@ -1783,9 +2618,25 @@ export class HealthDashboardView extends ItemView {
         "renormalised over whatever data is actually available, with the " +
         "confidence figure above showing how much that was. A plugin that " +
         "can't load is capped at 20 regardless of its other scores, and one " +
-        "removed from the community directory at 30. Popularity is context, " +
-        "not health: a niche plugin isn't a worse plugin. Click a column to " +
-        "sort; use the ⋮ menu to enable/disable, open, or mute.",
+        "removed from the community directory at 30. Click a column to " +
+        "sort; use the ⋮ menu to enable/disable, open, watch, or mute.",
+    });
+
+    // Said in the product, not only in the README. A letter grade is a
+    // confident-looking artifact and people read it as a verdict on the
+    // software, which is a claim this cannot support and has never made.
+    const limits = legend.createDiv({ cls: "flowkit-legend-limits" });
+    limits.createEl("strong", { text: "What this score is not: " });
+    limits.createSpan({
+      text:
+        "it is not a judgement of whether a plugin is any good, whether its " +
+        "code is safe, or whether you should keep it. It measures whether it " +
+        "can run here, whether it has thrown errors on this machine, whether " +
+        "it is still being worked on, and what it costs to load. A plugin you " +
+        "love can score badly for being finished; a plugin you never use can " +
+        "score perfectly. Popularity is context, not health — a niche plugin " +
+        "is not a worse plugin. Treat a low score as a reason to look, not a " +
+        "reason to uninstall.",
     });
   }
 
@@ -1793,17 +2644,21 @@ export class HealthDashboardView extends ItemView {
 
   /** The one way to reach the upgrade path, from anywhere in the view. */
   private openUpgrade(
-    feature?: "bulk" | "export" | "history" | "monitoring" | "errors"
+    feature?: "bisect" | "profile" | "profiles" | "export" | "history" | "monitoring" | "errors"
   ): void {
-    const insights = buildInsights(this.results);
-    const affected = new Set(
-      insights.filter((i) => i.action && i.ids.length).flatMap((i) => i.ids)
-    );
+    // Built from this vault, not from the catalogue. The headline used to
+    // count fixable plugins, which is now a free capability — so it promised
+    // something the buyer already had.
+    const enabled = this.results.filter((r) => r.enabled).length;
+    const headline =
+      feature === "bisect" && enabled > 1
+        ? `Isolate the culprit among your ${enabled} plugins in ${roundsNeeded(enabled)} questions.`
+        : feature === "profile" && enabled > 0
+          ? `Time all ${enabled} of your enabled plugins in one pass.`
+          : undefined;
     new UpgradeModal(this.app, {
       feature,
-      headline: affected.size
-        ? `Fix ${affected.size} plugin${affected.size === 1 ? "" : "s"} in this vault in one click.`
-        : undefined,
+      headline,
       activate: async (key) => {
         this.plugin.settings.licenseKey = key;
         await this.plugin.saveSettings();
@@ -1935,7 +2790,7 @@ export class HealthDashboardView extends ItemView {
     // The report never called buildInsights, so the one thing this product
     // produces that other people actually see was an uninterpreted grid of
     // numbers. Lead with the conclusions.
-    const insights = buildInsights(this.results);
+    const insights = this.insights();
     lines.push("## What to fix");
     lines.push("");
     for (const ins of insights) {
@@ -1966,7 +2821,21 @@ export class HealthDashboardView extends ItemView {
       "Overall is a weighted blend — Compatibility 25%, Reliability 25%, " +
         "Maintenance 25%, Footprint 15%, Hygiene 5%, Popularity 5% — " +
         "renormalised over the signals available. A plugin that can't load is " +
-        "capped at 20; one removed from the community directory at 30."
+        "capped at 20; one removed from the community directory at 30. " +
+        "Footprint is what a plugin costs to run: code loaded at startup, " +
+        "measured load time where FlowKit witnessed the load, and any fast " +
+        "repeating timer it holds."
+    );
+    lines.push("");
+    // The report is the artefact that leaves the vault, so the caveat has to
+    // travel with it. A letter grade quoted out of context in someone's issue
+    // tracker is exactly the misreading this paragraph exists to prevent.
+    lines.push(
+      "*This is not a judgement of whether a plugin is any good, whether its " +
+        "code is safe, or whether it should be uninstalled. It measures whether " +
+        "a plugin can run on this setup, whether it has thrown errors on this " +
+        "machine, whether it is still being worked on, and what it costs to " +
+        "load. A finished plugin can score badly for being finished.*"
     );
     lines.push("");
     lines.push(
@@ -2030,8 +2899,10 @@ export class HealthDashboardView extends ItemView {
       r.updateAvailable ? "Update" : "",
       r.listing === "delisted" ? "Delisted" : "",
       r.listing === "local" ? "Local install" : "",
+      r.repoActivity?.archived ? "Archived" : "",
       r.enabled ? "" : "Disabled",
       r.muted ? "Muted" : "",
+      r.watched ? "Watching" : "",
     ]
       .filter(Boolean)
       .join(", ");

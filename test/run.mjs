@@ -22,5 +22,25 @@ await esbuild.build({
 
 await import(pathToFileURL(outfile).href);
 
+// Integration tests for the code that reaches into Obsidian's internals: the
+// runtime watcher's monkey-patches and the bisect loop driven against a plugin
+// registry whose enabled set really changes. ESM, because it awaits at the top
+// level and drives real timers.
+const integrationOut = path.join(root, "test", ".build", "integration.test.mjs");
+await esbuild.build({
+  entryPoints: [path.join(root, "test", "integration.test.ts")],
+  bundle: true,
+  outfile: integrationOut,
+  format: "esm",
+  platform: "node",
+  target: "node18",
+  logLevel: "warning",
+  alias: {
+    obsidian: path.join(root, "test", "obsidian-stub.ts"),
+  },
+});
+
+await import(pathToFileURL(integrationOut).href);
+
 // Plain-Node contract tests (no `obsidian` import, so no bundling needed).
 await import(pathToFileURL(path.join(root, "test", "manifest-contract.test.mjs")).href);

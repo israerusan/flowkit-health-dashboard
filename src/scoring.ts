@@ -5,6 +5,9 @@ import {
   MIN_OBSERVATION_MS,
   reliabilityScore,
 } from "./errors";
+import { readFootprint, type RuntimeProfile } from "./runtime";
+import type { MuteRecord } from "./mutes";
+import type { RepoActivity } from "./repoActivity";
 import type {
   CachedPlugin,
   MaintenanceStatus,
@@ -108,6 +111,21 @@ export interface ScoreInput {
   observedMs?: number;
   /** User has muted this plugin. */
   muted?: boolean;
+  /** The live mute record, when muted. */
+  mute?: MuteRecord;
+  /** User is watching this plugin specifically. */
+  watched?: boolean;
+  /**
+   * What the plugin costs while running — load time and repeating timers.
+   * Bundle size alone said a 60 KB plugin polling four times a second was
+   * cheaper than a 400 KB one that loads and sits idle.
+   */
+  runtime?: RuntimeProfile;
+  /**
+   * What the plugin's repository says about itself. This is what separates
+   * "finished" from "abandoned" — release dates alone cannot.
+   */
+  repoActivity?: RepoActivity;
 }
 
 /**
@@ -232,15 +250,80 @@ export function isMatureStable(remote: RemotePluginStat | undefined): boolean {
   return releaseCount(remote) >= 8 && rate != null && rate >= 0.5;
 }
 
+/** A repository is "active" if code moved within this window. */
+const REPO_ACTIVE_DAYS = 180;
+/** …and dormant once nothing has moved for this long. */
+const REPO_DORMANT_DAYS = 730;
+
 /**
- * Maintenance — MEASURED when online, from how recently the plugin was updated,
- * with a carve-out for mature plugins that are simply finished.
+ * What the repository says, reduced to a verdict.
+ *
+ * `null` means it said nothing decisive — a push nine months ago is neither
+ * evidence of life nor of death, and must leave the release-based reading
+ * exactly as it was.
+ */
+export type RepoVerdict = "archived" | "gone" | "active" | "dormant" | null;
+
+export function repoVerdict(
+  activity: RepoActivity | undefined,
+  now: number
+): RepoVerdict {
+  if (!activity) return null;
+  if (activity.archived) return "archived";
+  if (activity.failed === "missing") return "gone";
+  if (activity.pushedAt == null) return null;
+  const days = Math.max(0, (now - activity.pushedAt) / DAY_MS);
+  if (days <= REPO_ACTIVE_DAYS) return "active";
+  if (days >= REPO_DORMANT_DAYS) return "dormant";
+  return null;
+}
+
+/** How long ago the repository last moved, in words. */
+function pushedAgo(activity: RepoActivity | undefined, now: number): string {
+  if (!activity?.pushedAt) return "a while ago";
+  const days = Math.max(0, Math.round((now - activity.pushedAt) / DAY_MS));
+  if (days <= 1) return "today";
+  if (days < 60) return `${days} days ago`;
+  const months = Math.round(days / 30);
+  if (months < 24) return `${months} months ago`;
+  return `about ${Math.round(months / 12)} years ago`;
+}
+
+/**
+ * Maintenance — MEASURED when online, from how recently the plugin was
+ * released, corrected by what its repository says.
+ *
+ * Release age on its own cannot tell "finished" from "abandoned", and the
+ * maturity carve-out that stands in for the difference (many releases, users on
+ * the newest) is a fair guess and no more than a guess. When the repository has
+ * been asked, it overrules: an archived repo is a decision the author published,
+ * and a repo pushed to last week is a plugin still being worked on whatever its
+ * tag history says.
  */
 function scoreMaintenance(i: ScoreInput, now: number): MetricScore {
+  const verdict = repoVerdict(i.repoActivity, now);
   const updated = i.remote?.updated;
+
   if (updated == null) {
+    // No release data — but a repository lookup can still be decisive, and an
+    // archived repository is worth saying even offline.
+    if (verdict === "archived") {
+      return {
+        value: 5,
+        source: "measured",
+        detail: "The author has archived its repository — it is no longer being worked on.",
+      };
+    }
+    if (verdict === "gone") {
+      return {
+        value: 10,
+        source: "measured",
+        detail: "Its repository no longer exists on GitHub.",
+      };
+    }
     return UNAVAILABLE("Needs online community stats (enable enrichment).");
   }
+
   const ageDays = Math.max(0, (now - updated) / DAY_MS);
   const months = Math.max(1, Math.round(ageDays / 30));
 
@@ -248,6 +331,45 @@ function scoreMaintenance(i: ScoreInput, now: number): MetricScore {
   if (ageDays <= 90) score = 100;
   else if (ageDays >= 730) score = 5;
   else score = clamp(100 - ((ageDays - 90) / (730 - 90)) * 95);
+
+  if (verdict === "archived") {
+    return {
+      value: Math.min(Math.round(score), 10),
+      source: "measured",
+      detail: `The author has archived its repository — no more fixes are coming. Last release about ${months} months ago.`,
+    };
+  }
+  if (verdict === "gone") {
+    return {
+      value: Math.min(Math.round(score), 20),
+      source: "measured",
+      detail: `Its repository no longer exists on GitHub. Last release about ${months} months ago.`,
+    };
+  }
+  if (verdict === "active" && ageDays > 180) {
+    // Code is moving; the tag history just doesn't show it. This is the case
+    // the release-only reading got most wrong, and the one users disputed.
+    return {
+      value: Math.max(Math.round(score), 65),
+      source: "measured",
+      detail: `No release in about ${months} months, but its repository was updated ${pushedAgo(
+        i.repoActivity,
+        now
+      )} — still being worked on.`,
+    };
+  }
+  if (verdict === "dormant" && ageDays > 540) {
+    // Overrules the maturity carve-out: many published versions means nothing
+    // if nobody has touched the code in two years.
+    return {
+      value: Math.min(Math.round(score), 25),
+      source: "measured",
+      detail: `No release in about ${months} months, and nothing pushed to its repository since ${pushedAgo(
+        i.repoActivity,
+        now
+      )}.`,
+    };
+  }
 
   if (ageDays > 540 && isMatureStable(i.remote)) {
     score = Math.max(score, 60);
@@ -268,19 +390,25 @@ function scoreMaintenance(i: ScoreInput, now: number): MetricScore {
 }
 
 /**
- * Plain maintained / not verdict from the last-update timestamp. Shares its
- * thresholds with the maintenance score above, but collapses to a category
- * that's easy to scan.
+ * Plain maintained / not verdict. Shares its thresholds with the maintenance
+ * score above, but collapses to a category that's easy to scan — and defers to
+ * the repository whenever it was asked.
  */
 export function deriveMaintenanceStatus(
   updated: number | undefined,
   now: number,
-  remote?: RemotePluginStat
+  remote?: RemotePluginStat,
+  repoActivity?: RepoActivity
 ): MaintenanceStatus {
-  if (updated == null) return "unknown";
+  const verdict = repoVerdict(repoActivity, now);
+  if (verdict === "archived" || verdict === "gone") return "unmaintained";
+  if (updated == null) return verdict === "active" ? "active" : "unknown";
   const ageDays = Math.max(0, (now - updated) / DAY_MS);
   if (ageDays <= 180) return "maintained";
+  // A repository pushed to this year outranks any release-age bucket below.
+  if (verdict === "active") return "active";
   if (ageDays <= 540) return "aging";
+  if (verdict === "dormant") return "unmaintained";
   return isMatureStable(remote) ? "stable" : "unmaintained";
 }
 
@@ -333,32 +461,22 @@ function describeAge(ms: number): string {
   return days === 1 ? "yesterday" : `${days} days ago`;
 }
 
-/** Human-readable byte size for the footprint tooltip. */
-function formatBytes(bytes: number): string {
-  if (bytes >= 1_048_576) return `${(bytes / 1_048_576).toFixed(1)} MB`;
-  if (bytes >= 1024) return `${Math.round(bytes / 1024)} KB`;
-  return `${bytes} B`;
-}
-
-/** Where the footprint curve is anchored: 50 KB scores 100, each 10× costs 40. */
-const FOOTPRINT_BASE_BYTES = 50_000;
-
 /**
- * Footprint — MEASURED, from the plugin's own code and stylesheet on disk.
+ * Footprint — MEASURED, from what the plugin loads and what it does afterwards.
  *
  * This replaces the old "Performance" metric, which read exactly two inputs:
  * `isDesktopOnly` and the vault-wide count of enabled plugins. Because the
  * second is identical for every row, every enabled non-desktop-only plugin in a
  * 30-plugin vault scored exactly 75 — a literal constant down a sortable
- * column, carrying a fifth of Overall. A user could click the header, watch
- * nothing reorder, and have proof in four seconds that 20% of the score was
- * fabricated.
+ * column, carrying a fifth of Overall.
  *
- * Bundle size is not runtime cost, and this does not claim to be: it is what
- * Obsidian actually lets a plugin observe about another plugin, it is local,
- * offline and mobile-safe, and it differs by two to three orders of magnitude
- * across a real vault. The vault-wide startup point still exists — as a
- * vault-level insight, where it belongs.
+ * For one version it was bundle size alone, which is honest about what it reads
+ * and misleading about what it means: a 60 KB plugin polling four times a
+ * second is worse for a vault than a 400 KB one that loads and sits idle, and
+ * the metric said the opposite. It now also carries measured load time and
+ * observed repeating timers, blended by taking the WORST of the three — see
+ * `readFootprint`. Every added signal can only lower a score, and only when it
+ * was actually observed, so a plugin is never marked expensive on a guess.
  */
 function scoreFootprint(i: ScoreInput): MetricScore {
   if (!i.enabled) {
@@ -372,17 +490,9 @@ function scoreFootprint(i: ScoreInput): MetricScore {
       detail: "Disabled — not loaded at startup.",
     };
   }
-  if (i.bundleBytes == null || i.bundleBytes <= 0) {
-    return UNAVAILABLE("Couldn't read this plugin's files on disk.");
-  }
-  const score = clamp(
-    100 - 40 * Math.log10(i.bundleBytes / FOOTPRINT_BASE_BYTES)
-  );
-  return {
-    value: Math.round(score),
-    source: "measured",
-    detail: `${formatBytes(i.bundleBytes)} of code and styles loaded at startup.`,
-  };
+  const reading = readFootprint(i.bundleBytes, i.runtime, i.manifest.version);
+  if (reading.value == null) return UNAVAILABLE(reading.detail);
+  return { value: reading.value, source: "measured", detail: reading.detail };
 }
 
 /**
@@ -672,14 +782,24 @@ export function computeHealth(i: ScoreInput, now: number): PluginHealth {
     version: i.manifest.version,
     enabled: i.enabled,
     repo: i.repo,
-    maintenanceStatus: deriveMaintenanceStatus(i.remote?.updated, now, i.remote),
+    maintenanceStatus: deriveMaintenanceStatus(
+      i.remote?.updated,
+      now,
+      i.remote,
+      i.repoActivity
+    ),
     updateAvailable,
     latestVersion,
     listing,
     muted: i.muted ?? false,
+    mute: i.mute,
+    watched: i.watched ?? false,
     overall,
     confidence: coverage,
     metrics,
     errors: i.errors,
+    runtime: i.runtime,
+    bundleBytes: i.bundleBytes,
+    repoActivity: i.repoActivity,
   };
 }

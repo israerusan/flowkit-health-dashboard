@@ -1,6 +1,14 @@
 import { App, Notice, PluginSettingTab, Setting } from "obsidian";
 import type FlowKitHealthPlugin from "./main";
+import type { BisectState } from "./bisect";
+import type { MuteMap } from "./mutes";
+import { describeMute } from "./mutes";
+import type { PluginProfile } from "./profiles";
+import type { PluginEvent, SeenMap } from "./timeline";
+import type { RepoActivityMap } from "./repoActivity";
+import type { RuntimeProfiles } from "./runtime";
 import type {
+  AppVersionChange,
   HealthChange,
   HealthChangeKind,
   HealthSnapshot,
@@ -20,8 +28,18 @@ export interface FlowKitHealthSettings {
   enableOnlineEnrichment: boolean;
   /** Include disabled plugins in the dashboard. */
   showDisabled: boolean;
-  /** Plugin ids the user has muted from the at-risk / unmaintained counts. */
+  /**
+   * Plugin ids muted before 1.3, migrated into `mutes` on load and then left
+   * alone. Kept so downgrading doesn't silently un-mute everything.
+   */
   ignored: string[];
+  /** Muted plugins, with the reason and the expiry the user chose. */
+  mutes: MuteMap;
+  /**
+   * Plugins the user has asked to be told about specifically. A vault-wide
+   * report is global noise; three plugins someone actually depends on is not.
+   */
+  watched: string[];
   /** Pro license key (offline-verified). Empty when unlicensed. */
   licenseKey: string;
   /** Pro: recompute automatically whenever the dashboard is opened. */
@@ -64,12 +82,51 @@ export interface FlowKitHealthSettings {
   watchingSince: number | null;
   /** Errors observed, keyed by plugin id. Local only; never transmitted. */
   errorLog: Record<string, PluginErrorRecord>;
+  /**
+   * Measure what plugins cost while running — load time and repeating timers.
+   * Requires wrapping `setInterval` and Obsidian's plugin loader, so it is a
+   * switch rather than an assumption.
+   */
+  trackRuntime: boolean;
+  /** Measured load times, keyed by plugin id. Timers are session-only. */
+  runtimeProfiles: RuntimeProfiles;
+  /**
+   * Ask GitHub's API whether a plugin's repository is archived or still being
+   * pushed to. Off by default: it is the only thing here that talks to an API
+   * rather than downloading a public file, and it names your plugins to it.
+   */
+  checkRepoActivity: boolean;
+  /** Cached repository readings, keyed by plugin id. */
+  repoActivity: RepoActivityMap;
+  /** The Obsidian version the last scan ran against, to detect an update. */
+  lastApiVersion: string | null;
+  /** The most recent Obsidian update and what it broke, for the post-update view. */
+  appVersionChange: AppVersionChange | null;
+  /** When the last scan completed, so the dashboard can say how old it is. */
+  lastScanAt: number | null;
+  /**
+   * An in-progress bisect. Persisted rather than held in memory because
+   * reproducing a problem often means restarting Obsidian — and coming back to
+   * a vault with half its plugins off and no record of which would be worse
+   * than never having started.
+   */
+  bisect: BisectState | null;
+  /** What each plugin looked like on the last scan, to notice it changing. */
+  seenPlugins: SeenMap;
+  /** Installs, updates, removals and toggles, newest last. Pruned to 90 days. */
+  events: PluginEvent[];
+  /** Whether the install baseline has been taken; the first scan is silent. */
+  eventBaselineSet: boolean;
+  /** Saved sets of enabled plugins. */
+  profiles: PluginProfile[];
 }
 
 export const DEFAULT_SETTINGS: FlowKitHealthSettings = {
   enableOnlineEnrichment: true,
   showDisabled: true,
   ignored: [],
+  mutes: {},
+  watched: [],
   licenseKey: "",
   autoRefreshOnOpen: false,
   history: [],
@@ -85,6 +142,18 @@ export const DEFAULT_SETTINGS: FlowKitHealthSettings = {
   trackConsoleErrors: true,
   watchingSince: null,
   errorLog: {},
+  trackRuntime: true,
+  runtimeProfiles: {},
+  checkRepoActivity: false,
+  repoActivity: {},
+  lastApiVersion: null,
+  appVersionChange: null,
+  lastScanAt: null,
+  bisect: null,
+  seenPlugins: {},
+  events: [],
+  eventBaselineSet: false,
+  profiles: [],
 };
 
 export class FlowKitHealthSettingTab extends PluginSettingTab {
@@ -152,6 +221,47 @@ export class FlowKitHealthSettingTab extends PluginSettingTab {
             this.plugin.settings.autoRefreshOnOpen = value;
             await this.plugin.saveSettings();
           })
+      );
+
+    new Setting(containerEl)
+      .setName("Check repository activity")
+      .setDesc(
+        "Ask GitHub whether a plugin's repository has been archived or is still " +
+          "being pushed to. This is what separates a plugin that is finished from " +
+          "one that was abandoned — release dates alone can't. Only plugins whose " +
+          "maintenance verdict is genuinely in doubt are looked up, a few per scan, " +
+          "cached for a week. It sends nothing but the repository name, which is " +
+          "already public."
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.checkRepoActivity)
+          .setDisabled(!this.plugin.settings.enableOnlineEnrichment)
+          .onChange(async (value) => {
+            this.plugin.settings.checkRepoActivity = value;
+            await this.plugin.saveSettings();
+            this.plugin.refreshViews(true, value);
+          })
+      );
+
+    new Setting(containerEl).setName("Performance").setHeading();
+
+    new Setting(containerEl)
+      .setName("Measure what plugins cost while running")
+      .setDesc(
+        "Time plugin loads and notice repeating timers, so Footprint reflects " +
+          "what a plugin does rather than only how big it is. Only measurements " +
+          "FlowKit actually witnesses are used — a plugin it couldn't observe is " +
+          "never penalised for it. Requires a reload to take effect."
+      )
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.trackRuntime).onChange(async (value) => {
+          this.plugin.settings.trackRuntime = value;
+          if (!value) this.plugin.settings.runtimeProfiles = {};
+          await this.plugin.saveSettings();
+          new Notice("Reload Obsidian for this to take effect.");
+          this.display();
+        })
       );
 
     new Setting(containerEl).setName("Error tracking").setHeading();
@@ -228,20 +338,101 @@ export class FlowKitHealthSettingTab extends PluginSettingTab {
       );
     if (!this.plugin.isPro) monitoring.settingEl.addClass("flowkit-locked-setting");
 
-    const muted = this.plugin.settings.ignored;
+    new Setting(containerEl).setName("Saved plugin sets").setHeading();
+
+    const profiles = this.plugin.settings.profiles;
+    new Setting(containerEl)
+      .setName("Profiles")
+      .setDesc(
+        profiles.length
+          ? `${profiles.length} saved. Switching between them from the dashboard turns the right plugins on and the rest off — the one thing here that genuinely can't be done by hand in half a minute.`
+          : "None yet. Save your current set from the dashboard, so there is always a recorded way back."
+      )
+      .addButton((btn) =>
+        btn
+          .setButtonText("Clear all")
+          .setDisabled(profiles.length === 0)
+          .onClick(async () => {
+            this.plugin.settings.profiles = [];
+            await this.plugin.saveSettings();
+            this.display();
+          })
+      );
+
+    if (profiles.length) {
+      const list = containerEl.createEl("ul", { cls: "flowkit-settings-list" });
+      for (const profile of profiles) {
+        list.createEl("li", {
+          text: `${profile.name} — ${profile.ids.length} plugin(s)`,
+        });
+      }
+    }
+
+    const events = this.plugin.settings.events.length;
+    new Setting(containerEl)
+      .setName("Change history")
+      .setDesc(
+        events
+          ? `${events} recorded install, update and removal(s) over the last 90 days. This is what lets FlowKit say "it started erroring two hours after that update".`
+          : "Nothing recorded yet. FlowKit notes installs, updates and removals as it sees them."
+      )
+      .addButton((btn) =>
+        btn
+          .setButtonText("Clear")
+          .setDisabled(events === 0)
+          .onClick(async () => {
+            this.plugin.settings.events = [];
+            await this.plugin.saveSettings();
+            this.plugin.refreshViews();
+            this.display();
+          })
+      );
+
+    new Setting(containerEl).setName("Muted and watched").setHeading();
+
+    const mutes = Object.entries(this.plugin.settings.mutes);
+    const now = Date.now();
     new Setting(containerEl)
       .setName("Muted plugins")
       .setDesc(
-        muted.length
-          ? `${muted.length} plugin(s) muted from the at-risk counts: ${muted.join(", ")}`
+        mutes.length
+          ? `${mutes.length} plugin(s) muted from the at-risk counts. Mutes with an expiry lapse on their own; FlowKit tells you when one does.`
           : "None. Mute a plugin from the dashboard's row menu to hide it from the at-risk and unmaintained counts."
       )
       .addButton((btn) =>
         btn
           .setButtonText("Clear all")
-          .setDisabled(muted.length === 0)
+          .setDisabled(mutes.length === 0)
           .onClick(async () => {
+            this.plugin.settings.mutes = {};
             this.plugin.settings.ignored = [];
+            await this.plugin.saveSettings();
+            this.plugin.refreshViews(true);
+            this.display();
+          })
+      );
+
+    if (mutes.length) {
+      const list = containerEl.createEl("ul", { cls: "flowkit-settings-list" });
+      for (const [id, rec] of mutes) {
+        list.createEl("li", { text: `${id} — ${describeMute(rec, now)}` });
+      }
+    }
+
+    const watched = this.plugin.settings.watched;
+    new Setting(containerEl)
+      .setName("Watched plugins")
+      .setDesc(
+        watched.length
+          ? `Told about first, and never recommended for a bulk disable: ${watched.join(", ")}`
+          : "None. Star a plugin from the dashboard's row menu to have FlowKit lead with it whenever something changes."
+      )
+      .addButton((btn) =>
+        btn
+          .setButtonText("Clear all")
+          .setDisabled(watched.length === 0)
+          .onClick(async () => {
+            this.plugin.settings.watched = [];
             await this.plugin.saveSettings();
             this.plugin.refreshViews(true);
             this.display();

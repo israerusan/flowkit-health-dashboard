@@ -1241,3 +1241,357 @@
 .flowkit-health-toolbar {
   scroll-margin-top: 60px;
 }
+
+/* Obsidian update banner ---------------------------------------------------
+   Leads the page for exactly as long as it is news. Every other section can
+   say what is wrong; only this one says what the update changed, which is the
+   question actually being asked when somebody opens this after a release. */
+.flowkit-appupdate {
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--background-modifier-border);
+  border-left: 3px solid var(--color-red, #c62828);
+  border-radius: 8px;
+  background: var(--background-secondary);
+}
+.flowkit-appupdate.is-good {
+  border-left-color: var(--color-green, #2e7d32);
+}
+.flowkit-appupdate-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+.flowkit-appupdate-icon {
+  display: inline-flex;
+  color: var(--text-muted);
+}
+.flowkit-appupdate.is-bad .flowkit-appupdate-icon {
+  color: var(--color-red, #c62828);
+}
+.flowkit-appupdate.is-good .flowkit-appupdate-icon {
+  color: var(--color-green, #2e7d32);
+}
+.flowkit-appupdate-title {
+  flex: 1 1 auto;
+  font-weight: 600;
+}
+.flowkit-appupdate-body {
+  font-size: 0.9em;
+  color: var(--text-muted);
+  margin-bottom: 8px;
+}
+
+/* Lapsed mutes ------------------------------------------------------------- */
+.flowkit-lapsed {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 0 0 12px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: var(--background-secondary);
+  font-size: 0.9em;
+}
+.flowkit-lapsed-icon {
+  display: inline-flex;
+  color: var(--text-muted);
+}
+
+/* "Disable these first" -----------------------------------------------------
+   The findings say what is wrong; this says what to do about it first, which
+   for a vault with nine of them is a different question. */
+.flowkit-starthere {
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  background: var(--background-primary-alt, var(--background-secondary));
+}
+.flowkit-starthere-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+.flowkit-starthere-title {
+  font-weight: 600;
+}
+.flowkit-starthere-sub {
+  font-size: 0.82em;
+  color: var(--text-muted);
+}
+.flowkit-starthere-list {
+  margin: 0;
+  padding-left: 20px;
+}
+.flowkit-starthere-list li {
+  margin-bottom: 6px;
+}
+.flowkit-starthere-why,
+.flowkit-starthere-loss {
+  font-size: 0.85em;
+  color: var(--text-muted);
+}
+
+/* Startup cost strip ------------------------------------------------------- */
+.flowkit-startup {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 0 0 12px;
+  font-size: 0.85em;
+  color: var(--text-muted);
+}
+.flowkit-startup-icon {
+  display: inline-flex;
+}
+.flowkit-startup-text {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* Watched plugins ---------------------------------------------------------- */
+.flowkit-watch-star {
+  display: inline-flex;
+  align-items: center;
+  color: var(--color-yellow, #b8860b);
+}
+.flowkit-watch-star svg {
+  width: 13px;
+  height: 13px;
+}
+
+/* Conflicts ---------------------------------------------------------------- */
+.flowkit-detail-conflicts {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--background-secondary);
+}
+.flowkit-conflict-line {
+  font-size: 0.85em;
+  padding: 2px 0;
+}
+.flowkit-detail-conflicts button {
+  margin-top: 6px;
+}
+
+/* Detail asides ------------------------------------------------------------ */
+.flowkit-detail-muted {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+/* Legend: what the score is not -------------------------------------------- */
+.flowkit-legend-limits {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--background-modifier-border);
+}
+
+/* Settings ----------------------------------------------------------------- */
+.flowkit-settings-list {
+  margin: -6px 0 12px;
+  padding-left: 20px;
+  font-size: 0.85em;
+  color: var(--text-muted);
+}
+.flowkit-mute-reason {
+  width: 100%;
+}
+
+/* Narrow widths: the new blocks stack rather than compete for a row. --------
+   The insight list is the primary surface on a phone, so nothing above it is
+   allowed to grow a second line it doesn't need. */
+@container flowkit-health (max-width: 620px) {
+  .flowkit-startup,
+  .flowkit-lapsed {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .flowkit-starthere-head {
+    flex-direction: column;
+    gap: 2px;
+  }
+  .flowkit-appupdate .mod-cta {
+    width: 100%;
+  }
+}
+
+/* Bisect ------------------------------------------------------------------
+   Owns the page while it runs: the vault is currently in a state the user did
+   not choose, so every score below it is measured against the wrong thing. */
+.flowkit-bisect {
+  margin: 0 0 14px;
+  padding: 12px 14px;
+  border: 2px solid var(--interactive-accent);
+  border-radius: 10px;
+  background: var(--background-secondary);
+}
+.flowkit-bisect-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+.flowkit-bisect-icon {
+  display: inline-flex;
+  color: var(--interactive-accent);
+}
+.flowkit-bisect-title {
+  font-weight: 700;
+}
+.flowkit-bisect-progress {
+  margin-left: auto;
+  font-size: 0.82em;
+  color: var(--text-muted);
+}
+.flowkit-bisect-symptom {
+  font-size: 0.88em;
+  font-style: italic;
+  color: var(--text-muted);
+  margin-bottom: 4px;
+}
+.flowkit-bisect-body {
+  margin-bottom: 8px;
+}
+.flowkit-bisect-list {
+  font-size: 0.85em;
+  color: var(--text-muted);
+  margin-bottom: 10px;
+}
+.flowkit-bisect-list summary {
+  cursor: pointer;
+}
+.flowkit-bisect-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.flowkit-bisect-stop {
+  margin-left: auto;
+}
+.flowkit-bisect-note {
+  margin-top: 8px;
+  font-size: 0.8em;
+  color: var(--text-muted);
+}
+.flowkit-bisect-steps {
+  margin: 0 0 12px;
+  padding-left: 20px;
+  font-size: 0.9em;
+  line-height: 1.6;
+}
+.flowkit-bisect-symptom-input,
+.flowkit-profile-name {
+  width: 100%;
+}
+
+/* Change correlation ------------------------------------------------------- */
+.flowkit-correlation {
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--background-modifier-border);
+  border-left: 3px solid var(--color-orange, #e07b39);
+  border-radius: 8px;
+  background: var(--background-secondary);
+}
+.flowkit-correlation-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+.flowkit-correlation-icon {
+  display: inline-flex;
+  color: var(--text-muted);
+}
+.flowkit-correlation-title {
+  font-size: 0.78em;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+}
+.flowkit-correlation-line {
+  font-size: 0.9em;
+  padding: 1px 0;
+}
+.flowkit-correlation-note {
+  margin-top: 6px;
+  font-size: 0.8em;
+  color: var(--text-muted);
+}
+
+/* Known issues ------------------------------------------------------------- */
+.flowkit-error-lookup {
+  margin-top: 4px;
+}
+.flowkit-error-lookup-note {
+  font-size: 0.82em;
+  color: var(--text-muted);
+}
+.flowkit-error-issues {
+  margin-top: 4px;
+}
+.flowkit-error-issue {
+  font-size: 0.85em;
+  padding: 1px 0;
+}
+.flowkit-issue-state {
+  display: inline-block;
+  min-width: 46px;
+  margin-right: 6px;
+  font-size: 0.85em;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.flowkit-issue-state.is-open {
+  color: var(--color-green, #2e7d32);
+}
+.flowkit-issue-state.is-closed {
+  color: var(--text-muted);
+}
+.flowkit-issue-comments {
+  color: var(--text-muted);
+}
+
+/* Per-plugin change history ------------------------------------------------ */
+.flowkit-detail-history {
+  margin-top: 10px;
+}
+.flowkit-detail-history-head {
+  font-size: 0.78em;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  margin-bottom: 2px;
+}
+.flowkit-history-line {
+  font-size: 0.85em;
+  color: var(--text-muted);
+}
+
+@container flowkit-health (max-width: 620px) {
+  .flowkit-bisect-actions {
+    flex-direction: column;
+  }
+  .flowkit-bisect-actions button {
+    width: 100%;
+  }
+  .flowkit-bisect-stop {
+    margin-left: 0;
+  }
+  .flowkit-bisect-progress {
+    margin-left: 0;
+    width: 100%;
+  }
+}
