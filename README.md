@@ -49,9 +49,12 @@ tell it whether the problem is still there.
   [ The problem is gone ]  [ Still happening ]            [ Stop and restore ]
 ```
 
-- **Your exact setup is saved before it starts**, and restored when it ends —
-  including if you stop halfway through, or restart Obsidian mid-search. The
-  session survives a restart, because reproducing a problem often needs one.
+- **Your setup is saved before it starts**, and every plugin the search
+  switched off goes back on when it ends — including if you stop halfway
+  through, or restart Obsidian mid-search. The session survives a restart,
+  because reproducing a problem often needs one. Anything you switch on
+  yourself while it runs is left exactly as you left it: the search undoes its
+  own work, not yours.
 - **The last suspect is actually tested before it's accused.** Narrowing to one
   plugin isn't proof — so FlowKit switches that one off and asks once more. This
   is why *"no plugin is responsible"* is an answer it can give you, pointing at
@@ -389,7 +392,7 @@ Key didn't arrive, or want a refund? Email <iavila01@gmail.com>.
   incompatible, delisted, local installs, update available, disabled, muted),
   and **click any column** to sort.
 - **Export** writes a report — findings, scorecard and methodology — to a
-  Markdown note or CSV. Free includes one; Pro is unlimited and adds CSV.
+  Markdown note or CSV. The Markdown report is free and unlimited; CSV is Pro.
 - **Refresh** re-scores and re-downloads community data on demand. Otherwise the
   cached data is reused for a day so the dashboard opens instantly.
 

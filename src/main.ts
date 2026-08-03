@@ -60,6 +60,7 @@ import {
   FlowKitHealthSettings,
 } from "./settings";
 import type {
+  CachedPlugin,
   DataCoverage,
   HealthChange,
   HealthChangeKind,
@@ -188,6 +189,27 @@ export default class FlowKitHealthPlugin extends Plugin {
 
   /** Shared between concurrent scans, so one cold start means one download. */
   private inFlightFetch: Promise<RemoteCache | null> | null = null;
+
+  /**
+   * A scan already running, and what it was permitted to do.
+   *
+   * Every startup with the dashboard left open ran the whole scan twice within
+   * a second: Obsidian restores the tab, the view scans on open, and the
+   * layout-ready background pass then scans the same vault again — two passes
+   * over every plugin's files, two sets of scores built and thrown at the same
+   * screen, and two writes to data.json. `inFlightFetch` only ever shared the
+   * download; the local half, which is all of the work on a warm cache, was
+   * duplicated in full.
+   *
+   * A later caller reuses this only when the running scan is permitted to do at
+   * least as much as it asked for — a pass that may not touch the network
+   * cannot stand in for one that was told to refetch.
+   */
+  private inFlightScan: {
+    allowFetch: boolean;
+    force: boolean;
+    promise: Promise<{ results: PluginHealth[]; coverage: DataCoverage }>;
+  } | null = null;
 
   /** Guards the background repository lookups against overlapping batches. */
   private repoLookupInFlight = false;
@@ -475,6 +497,30 @@ export default class FlowKitHealthPlugin extends Plugin {
    */
   updateStatusBar(avg: number | null, active: PluginHealth[]): void {
     if (!this.statusBarEl) return;
+
+    // A search in progress owns this strip, exactly as it owns the dashboard.
+    //
+    // Without it, the one surface that is always on screen quoted a health
+    // score for a vault FlowKit had itself switched half of off — and it is the
+    // ONLY surface a user sees if they closed the dashboard, or restarted
+    // Obsidian mid-search and their tab didn't come back. That is the person
+    // most in need of being told: their vault is missing plugins, there is a
+    // reason, and here is the way back.
+    const search = this.settings.bisect;
+    if (search && !search.done) {
+      const off = search.disabled.length;
+      this.statusBarEl.empty();
+      this.statusBarEl.toggleClass("is-alert", true);
+      this.statusBarEl.setText(`Plugin search · ${off} off`);
+      this.statusBarEl.setAttr(
+        "aria-label",
+        `FlowKit is searching for what's breaking your vault — ${off} plugin${
+          off === 1 ? "" : "s"
+        } switched off for round ${search.round}. Open FlowKit to answer or stop.`
+      );
+      return;
+    }
+
     const enabled = active.filter((r) => r.enabled);
     const wontLoad = enabled.filter((r) => r.metrics.compatibility.value === 0).length;
     const delisted = enabled.filter((r) => r.listing === "delisted").length;
@@ -585,7 +631,7 @@ export default class FlowKitHealthPlugin extends Plugin {
   }
 
   /** Whether this scan should keep its observations out of the history. */
-  private recordingSuspended(): boolean {
+  recordingSuspended(): boolean {
     return this.bisectInProgress() || this.vaultMutationDepth > 0;
   }
 
@@ -725,6 +771,17 @@ export default class FlowKitHealthPlugin extends Plugin {
     ) {
       this.bisectSalvage = bisect;
       this.settings.bisect = null;
+    }
+    // The undo record is a convenience, not a recovery record: `bisect` itself
+    // holds the way back. A malformed one is dropped rather than salvaged.
+    const undo = this.settings.bisectUndo;
+    if (
+      undo &&
+      (!Array.isArray(undo.candidates) ||
+        !Array.isArray(undo.originalEnabled) ||
+        !Array.isArray(undo.disabled))
+    ) {
+      this.settings.bisectUndo = null;
     }
     // The persisted community projection is read without further checking all
     // through `computeAll` — `cache?.plugins[id]` optional-chains the cache and
@@ -953,6 +1010,34 @@ export default class FlowKitHealthPlugin extends Plugin {
     opts: { force?: boolean; allowFetch?: boolean; onPhase?: ScanPhaseReporter } = {}
   ): Promise<{ results: PluginHealth[]; coverage: DataCoverage }> {
     const { force = false, allowFetch = true, onPhase } = opts;
+    // Reuse a scan already in flight when it covers this one. Deliberately not
+    // when a progress reporter was passed: that caller is painting a loading
+    // screen for the user, and silently attaching it to somebody else's scan
+    // would leave the progress bar describing a stage it cannot see.
+    const running = this.inFlightScan;
+    if (
+      running &&
+      !onPhase &&
+      (running.allowFetch || !allowFetch) &&
+      (running.force || !force)
+    ) {
+      return running.promise;
+    }
+    const scan = this.runScan(force, allowFetch, onPhase);
+    const entry = { allowFetch, force, promise: scan };
+    this.inFlightScan = entry;
+    try {
+      return await scan;
+    } finally {
+      if (this.inFlightScan === entry) this.inFlightScan = null;
+    }
+  }
+
+  private async runScan(
+    force: boolean,
+    allowFetch: boolean,
+    onPhase?: ScanPhaseReporter
+  ): Promise<{ results: PluginHealth[]; coverage: DataCoverage }> {
     // Reported, not invented. A progress line that names stages the code cannot
     // observe is worse than a spinner: it looks like information and is
     // theatre, and the one stage that genuinely takes seconds — downloading
@@ -1119,6 +1204,20 @@ export default class FlowKitHealthPlugin extends Plugin {
     if (Object.keys(repos).length !== Object.keys(this.settings.repoActivity).length) {
       this.settings.repoActivity = repos;
       dirty = true;
+    }
+    // The community projection was the one store this never reached, so an
+    // uninstalled plugin's row survived until a network fetch happened to
+    // rebuild the cache — and, before the merge was scoped, not even then.
+    // Pruned locally means it goes on the next scan, offline included.
+    const cache = this.settings.cache;
+    if (cache) {
+      const keep = Object.keys(cache.plugins).filter((id) => installed.has(id));
+      if (keep.length !== Object.keys(cache.plugins).length) {
+        const plugins: Record<string, CachedPlugin> = {};
+        for (const id of keep) plugins[id] = cache.plugins[id];
+        this.settings.cache = { ...cache, plugins };
+        dirty = true;
+      }
     }
     return dirty;
   }
@@ -1303,9 +1402,18 @@ export default class FlowKitHealthPlugin extends Plugin {
     );
     const state = beginBisect(searchable, enabled, Date.now(), symptom);
     this.settings.bisect = state;
+    // A new search has no previous answer to take back, and a leftover record
+    // would offer to restore a round belonging to a search that is over.
+    this.settings.bisectUndo = null;
     await this.saveSettings();
-    await this.applyBisectState(state);
-    return state;
+    // The boolean matters. This used to return the session regardless, so
+    // "a search was opened" and "its first experiment is actually set up" were
+    // the same answer — and a caller could report a started search over a vault
+    // that had never reached the round it was about to be asked about. The
+    // record deliberately stays either way: it holds `originalEnabled`, which
+    // is the only thing that knows how to put a half-moved vault back.
+    const established = await this.applyBisectState(state);
+    return established ? state : null;
   }
 
   /**
@@ -1323,10 +1431,41 @@ export default class FlowKitHealthPlugin extends Plugin {
     // is still being rearranged.
     if (!current || this.bisectApplying) return null;
     const next = bisectStep(current, gone);
+    // Kept before the step is taken, and persisted with it, so the way back
+    // survives the restart that reproducing a problem so often needs.
+    this.settings.bisectUndo = current;
     this.settings.bisect = next;
     await this.saveSettings();
     await this.applyBisectState(next);
     return next;
+  }
+
+  /** Whether the last answer can still be taken back. */
+  get bisectCanUndo(): boolean {
+    return this.settings.bisectUndo != null && !this.bisectApplying;
+  }
+
+  /**
+   * Take back the last answer and put the vault into the round it was asked
+   * about.
+   *
+   * The search asks a yes/no question about something the user has to go and
+   * observe for themselves, and answering it wrongly is an ordinary mistake —
+   * you press "still happening" and realise a second later you hadn't actually
+   * checked. Without this, that slip is unrecoverable and invisible: half the
+   * candidates are gone, the search carries on with a straight face, and it
+   * ends by naming a plugin that was never a suspect.
+   */
+  async undoBisectAnswer(): Promise<BisectState | null> {
+    const previous = this.settings.bisectUndo;
+    if (!previous || this.bisectApplying) return null;
+    this.settings.bisect = previous;
+    // One step only — see `bisectUndo`. Cleared as part of the same write, so
+    // the record can never describe a round two answers ago.
+    this.settings.bisectUndo = null;
+    await this.saveSettings();
+    await this.applyBisectState(previous);
+    return previous;
   }
 
   /**
@@ -1350,6 +1489,7 @@ export default class FlowKitHealthPlugin extends Plugin {
         return;
       }
       this.settings.bisect = null;
+      this.settings.bisectUndo = null;
       this.bisectError = null;
       await this.saveSettings();
     } finally {
@@ -1385,6 +1525,7 @@ export default class FlowKitHealthPlugin extends Plugin {
         return;
       }
       this.settings.bisect = null;
+      this.settings.bisectUndo = null;
       this.bisectError = null;
       await this.saveSettings();
     } finally {
@@ -1642,8 +1783,10 @@ export default class FlowKitHealthPlugin extends Plugin {
       installed
     );
     // Merge rather than replace: when only one of the two feeds answered, the
-    // other half of what we already knew is still the best data we have.
-    const merged = mergeRemoteCache(this.settings.cache, built);
+    // other half of what we already knew is still the best data we have —
+    // scoped to what is installed, so uninstalling something drops its cache
+    // row rather than carrying it in every write for the life of the vault.
+    const merged = mergeRemoteCache(this.settings.cache, built, installed);
     this.settings.cache = merged;
     await this.saveSettings();
     return merged;
@@ -1696,6 +1839,18 @@ export default class FlowKitHealthPlugin extends Plugin {
     this.refreshViews(true);
   }
 
+  /**
+   * Where FlowKit's own settings live, vault-relative.
+   *
+   * Only ever shown to somebody whose `data.json` could not be read, which is
+   * the one situation where "restart and hope" is not a repair and the user has
+   * to go and look at the file themselves.
+   */
+  dataFilePath(): string {
+    const dir = this.manifest.dir ?? `.obsidian/plugins/${this.manifest.id}`;
+    return `${dir}/data.json`;
+  }
+
   /** Whether Obsidian currently has this plugin enabled. */
   isEnabled(id: string): boolean {
     return this.pluginsApi().enabledPlugins?.has(id) ?? false;
@@ -1726,8 +1881,19 @@ export default class FlowKitHealthPlugin extends Plugin {
     // before the promise resolves, and reporting a successful change as a
     // failure is not a harmless conservatism here — it pauses a bisect and
     // tells the user to go and fix something by hand that is already fine.
-    // One turn, then give up: this is insurance against ordering, not a poll.
+    //
+    // A single microtask was too narrow a bound for that argument to hold. It
+    // covers a projection updated in an already-queued `then`, and nothing
+    // else: a registry that settles on a timer, an animation frame, or any
+    // continuation scheduled as a macrotask would be declared a failure while
+    // the change was in fact seconds from completing. So the microtask is kept
+    // as the fast path and one macrotask turn follows it. Still not a poll,
+    // and still bounded — the point is to survive plausible ordering, not to
+    // wait out a plugin that is genuinely wedged.
     if (this.isEnabled(id) !== enabled) await Promise.resolve();
+    if (this.isEnabled(id) !== enabled) {
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+    }
     if (this.isEnabled(id) !== enabled) {
       throw new Error(`${id} did not ${enabled ? "turn on" : "turn off"}.`);
     }
@@ -1903,6 +2069,15 @@ export default class FlowKitHealthPlugin extends Plugin {
    * user already sitting on months of their own history.
    */
   async recordSnapshot(snapshot: HealthSnapshot): Promise<void> {
+    // A vault with half its plugins deliberately switched off has not become
+    // less healthy, and this is the one recorder that never learned it. The
+    // change log and the event log are both suspended during a search and a
+    // profiling run; the trend was not, so a search that ran across a day
+    // boundary wrote its own surgery into the ninety-day chart as a cliff — and
+    // the reading is kept, because the day's entry is replaced rather than
+    // appended to. Enforced here rather than at the two call sites, so the next
+    // thing that records a snapshot cannot forget.
+    if (this.recordingSuspended()) return;
     const history = this.settings.history.slice();
     const last = history[history.length - 1];
     if (last && sameDay(last.at, snapshot.at)) {

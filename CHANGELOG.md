@@ -3,6 +3,147 @@
 All notable changes to FlowKit Plugin Health Dashboard are documented here. This
 project follows [Semantic Versioning](https://semver.org/).
 
+## [1.6.0] - 2026-08-03
+
+An adversarial-review release. Two outside models were asked to attack the
+1.5.0 build with no brief except to find what is wrong with it; everything below
+is either something they found and I could reproduce, or something the review
+turned up on the way. Most of it is about the same thing: a diagnostic tool is
+only worth the trust it asks for, and several places were quietly claiming more
+than the code delivered.
+
+### FlowKit could keep running after Obsidian had unloaded it
+
+- **The timer and plugin-loader hooks are now inert once FlowKit stops.**
+  FlowKit deliberately declines to unhook a global that another plugin has since
+  wrapped, because pulling its own layer out would take the other plugin's with
+  it — but the layer it left behind still held the watcher, its maps and the
+  unloaded plugin's settings. Every timer created afterwards was attributed,
+  recorded, and flushed through a callback that saves settings and rescans, on
+  behalf of an instance that no longer existed. A wrapper that survives now
+  passes straight through and observes nothing.
+- **A wrapper is only ever removed by the instance that installed it.**
+  Restoration tested for a marker every FlowKit wrapper carries rather than for
+  its own, so during a reload one generation could replace another's live
+  wrapper with its own stale predecessor — leaving the survivor blind.
+- **A timer being cleared now updates the dashboard**, as creating one always
+  did. A plugin that stopped polling went on being shown as a poller until
+  something unrelated forced a re-score.
+
+### Saving is honest about which write failed
+
+- **A failed write no longer fails the callers queued behind it.** They
+  inherited the rejection wholesale — told their state had not reached disk when
+  it had never been attempted — and, worse, their snapshot was then left
+  unwritten until something else happened to save. `await saveSettings()` is the
+  durability barrier bisect leans on before it switches a plugin off, so
+  "somebody else's write failed" now means "attempt mine".
+- **Typing a licence key no longer rewrites the whole database per keystroke.**
+  Every save clones and writes all of it — cache, history, error log, saved sets
+  — so pasting a key in on a phone or a synced vault meant one full rewrite, and
+  one sync event, per character. The check still runs on every keystroke; only
+  the write waits, and a key that verifies is written at once.
+
+### The community data says how old it actually is
+
+- **Each feed is dated by its own fetch.** The two files fail independently and
+  merge independently, but one timestamp covered both — so a run of stats-only
+  successes kept refreshing it while the community list, which is where
+  delisting, repository links and sideload detection come from, aged silently
+  underneath. The header now quotes the older of the two.
+- **Uninstalling a plugin drops its cached row.** The merge unioned the old and
+  new key sets, so every plugin the vault had ever held survived every refresh
+  and rode along in every subsequent write, forever.
+- **The cache guard checks the records, not just the container.** It promised
+  all-or-nothing and validated only the outer shape, so a sync-mangled row went
+  into scoring — where a stringly-typed listing flag is the difference between
+  "installed outside the directory" and "Obsidian pulled this".
+- **A rate limit is respected even when the mirror then fails differently.** The
+  backoff read only the last attempt's outcome, so the commonest shape of this
+  failure — GitHub refuses, the mirror times out — set no cooldown at all.
+
+### The search can be answered wrongly, so now it can be un-answered
+
+- **Undo last answer.** Two buttons, each irreversible, each discarding half the
+  remaining suspects: pressing one before you had actually checked produced a
+  search that ran to completion and confidently named the wrong plugin, with
+  nothing to suggest anything had gone wrong. One step back is offered every
+  round, and it survives a restart.
+- **The status bar says when a search is running.** It quoted a health score for
+  a vault FlowKit had itself switched half of off — and it is the only surface
+  left if the dashboard is closed or a restart didn't restore the tab.
+- **The setup step no longer promises "exactly as it was".** A search only ever
+  switches plugins off, and restoring deliberately does not reverse anything you
+  turned on yourself while it ran. The code has said so for a version; the
+  consent copy had not caught up.
+- **It also says, before you start, that it looks for one plugin acting alone.**
+  Against two plugins that only misbehave together the search still finishes and
+  still names somebody, which is the one way this feature can be confidently
+  wrong.
+- **A step that fails no longer claims nothing moved.** A round is persisted
+  before it is applied, so a failure part-way through leaves the record ahead of
+  the vault — which is exactly what the drift prompt exists to handle, and the
+  old message talked the user straight past it.
+- **Starting a search reports whether the first round was actually established**,
+  rather than reporting success for a session whose vault never reached it.
+
+### Failures reach you instead of vanishing
+
+- **Every action button now reports its own failure.** Enable, disable, mute,
+  mark-as-seen, save-a-set, and both settings shortcuts were written so that a
+  rejected write or a plugin that refused to move took the rest of the handler
+  with it: no change, no message, nothing in the console, and an unhandled
+  rejection — inside the plugin whose job is to notice exactly that.
+- **A failed refresh keeps the report you were reading.** It replaced the whole
+  dashboard with a retry button, so a rejected write on a synced vault threw
+  away a complete and still-accurate diagnosis. It is a banner now, and only
+  takes the page when there is nothing behind it.
+- **The unreadable-settings banner says what to actually do.** "Restart
+  Obsidian" does not repair a malformed file; it names the file, offers to copy
+  the path, and says what restarting will and won't fix.
+- **A plugin lifecycle change is given a little longer to settle.** One
+  microtask covered a registry updated in an already-queued callback and nothing
+  else, so a change that completed a moment later was reported as a failure —
+  which pauses a search and sends the user to fix something by hand that is
+  already fine.
+- **Scan progress and the search panel are announced to screen readers.** Both
+  are dynamic regions that were only ever repainted, so a screen-reader user
+  could start an operation that rearranges their vault and be told nothing about
+  what it was doing.
+
+### The numbers agree with each other, and with the price list
+
+- **The vault's startup total applies the same version rule the rows do.** After
+  a plugin updated, its Footprint correctly ignored the load time measured
+  against the old build while the headline went on adding it — and the detail
+  panel showed neither the reading nor the offer to re-measure, so the row
+  simply went quiet.
+- **The trend history is no longer recorded mid-surgery.** The change log and
+  the event log are both suspended while a search or a profiling run has the
+  vault rearranged; the trend was not, so a search running across midnight wrote
+  its own handiwork into the ninety-day chart as a cliff.
+- **Opening Obsidian with the dashboard open scans once, not twice.** The
+  restored tab scanned on open and the startup pass scanned again a moment
+  later; only the download was ever shared.
+- **The Export button's padlock is gone.** The Markdown report is free and
+  unlimited — it is the diagnosis, and the diagnosis stays free — but a free
+  user who exported once got a lock icon on a door that was never shut.
+- **The exported report sells the product that exists.** Its footer still
+  advertised bulk fixes and unlimited reports, both free for a version, and this
+  is the one artefact that leaves the vault into other people's issue trackers.
+- **The history upsell counts something the purchase would change**, rather than
+  counting readings the chart had dropped for being offline or scored on an
+  older model.
+
+### Tests
+
+The suite gained the adversarial cases it was missing: a wrapper still in the
+chain after unload recording nothing, two watcher generations and wrapper
+ownership, a cleared timer notifying its host, a failed write followed by a
+newer one, alternating partial cache refreshes, uninstall across a merge, and
+mangled cache records. One existing test was rewritten — it asserted that a
+later wrapper survived unload, which blessed the leak instead of catching it.
+
 ## [1.5.0] - 2026-08-03
 
 A hardening and polish release. No new features — this is the pass that makes

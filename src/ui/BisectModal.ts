@@ -16,7 +16,7 @@ export interface BisectStartOptions {
  * Bisect turns plugins off, which is alarming if you don't know it puts them
  * back. Everything the user needs to not be alarmed is stated before the first
  * click: how many rounds, what gets saved, and that cancelling at any point
- * restores exactly what they had.
+ * switches back on everything the search switched off.
  */
 export class BisectStartModal extends Modal {
   private symptom = "";
@@ -49,11 +49,31 @@ export class BisectStartModal extends Modal {
     steps.createEl("li", {
       text: "Nothing is uninstalled. Plugins are only switched off, the same as doing it by hand.",
     });
+    // "Exactly as it was" is the one claim this modal must not make, and it is
+    // the claim `restoreState` explicitly declines to honour: a search only
+    // ever switches plugins OFF, so undoing it is entirely the switching-back-on
+    // side — and it deliberately does not reverse anything the user turned on
+    // themselves mid-search. Consent copy has to describe the guarantee the
+    // code actually gives, not the tidier one.
     steps.createEl("li", {
-      text: "Stop at any point and everything goes back exactly as it was — including if you restart Obsidian mid-search.",
+      text: "Stop at any point and every plugin the search switched off goes back on — including if you restart Obsidian mid-search. Anything you switch on yourself along the way is left alone.",
     });
     steps.createEl("li", {
       text: "Some plugins only fully unload after a restart. If the symptom seems not to change, restart and answer again.",
+    });
+    // Said before the first click, not implied by the wording of the result.
+    //
+    // Elimination finds ONE plugin that reproduces the problem on its own. It
+    // cannot find two plugins that are only broken together, and against that
+    // kind of fault it will still run to completion and still name somebody —
+    // which is the one way this feature can be confidently wrong. The finishing
+    // copy hedges carefully; the consent step said nothing at all, which is the
+    // wrong way round for a claim a user is about to act on.
+    steps.createEl("li", {
+      text: "It looks for one plugin acting alone. If two only misbehave together, the search can still end up naming just one of them — so treat the answer as where to look first.",
+    });
+    steps.createEl("li", {
+      text: "Answered the wrong way by mistake? Each round offers to undo the previous answer.",
     });
 
     new Setting(contentEl)

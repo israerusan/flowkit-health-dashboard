@@ -269,7 +269,7 @@ export interface CachedPlugin {
 }
 
 export interface RemoteCache {
-  /** When this projection was built. */
+  /** When this projection was last rebuilt, from whichever feeds answered. */
   at: number;
   plugins: Record<string, CachedPlugin>;
   /** Sorted download counts across the directory, for percentile ranking. */
@@ -277,6 +277,22 @@ export interface RemoteCache {
   /** Which feeds contributed, so a cached scan reports coverage honestly. */
   hadStats: boolean;
   hadList: boolean;
+  /**
+   * When each feed was last fetched SUCCESSFULLY.
+   *
+   * The two files fail independently and are merged independently, so one
+   * timestamp for both was a claim the cache could not support: a run of
+   * stats-only successes kept bumping `at` while the community list — which is
+   * what delisting, repository links and sideload detection are read from —
+   * quietly aged behind it, under a header saying the data was from an hour
+   * ago. The dashboard now dates each half by its own fetch and quotes the
+   * older of the two.
+   *
+   * Optional because a cache written by an earlier version has neither; the
+   * header falls back to `at`, which is what it always used.
+   */
+  statsAt?: number;
+  listAt?: number;
 }
 
 /** One plugin's entry in Obsidian's community-plugins list. */

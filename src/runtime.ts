@@ -174,11 +174,7 @@ export function readFootprint(
     parts.push(`${formatBytes(bytes)} of code and styles loaded at startup`);
   }
 
-  const load =
-    profile?.loadMs != null &&
-    (profile.loadVersion == null || version == null || profile.loadVersion === version)
-      ? profile.loadMs
-      : undefined;
+  const load = currentLoadMs(profile, version);
   if (load != null) {
     sawRuntime = true;
     scores.push(loadScore(load));
@@ -267,9 +263,36 @@ export function pruneProfiles(
   return out;
 }
 
-/** Total startup weight across the enabled set, for the slow-vault triage view. */
+/**
+ * Whether a recorded load time describes the build that is installed now.
+ *
+ * The same question `readFootprint` asks, extracted so every surface asks it
+ * the same way. It used to be asked in two places and skipped in a third, and
+ * the three then disagreed about the same plugin: after an update the row's
+ * Footprint ignored the stale reading, the detail panel showed neither the time
+ * nor the "not measured yet" hint, and the vault total went on adding
+ * milliseconds measured against a build the user no longer runs.
+ */
+export function currentLoadMs(
+  profile: RuntimeProfile | undefined,
+  version?: string
+): number | undefined {
+  if (profile?.loadMs == null) return undefined;
+  if (profile.loadVersion != null && version != null && profile.loadVersion !== version) {
+    return undefined;
+  }
+  return profile.loadMs;
+}
+
+/**
+ * Total startup weight across the enabled set, for the slow-vault triage view.
+ *
+ * @param rows each plugin's id, enabled state, bytes and INSTALLED version —
+ *   the version so a load time measured for an older build is left out of the
+ *   total rather than quoted as current.
+ */
 export function startupCost(
-  rows: Array<{ id: string; enabled: boolean; bytes?: number }>,
+  rows: Array<{ id: string; enabled: boolean; bytes?: number; version?: string }>,
   profiles: RuntimeProfiles
 ): { bytes: number; measuredMs: number; measuredCount: number; polling: number } {
   let bytes = 0;
@@ -280,8 +303,9 @@ export function startupCost(
     if (!row.enabled) continue;
     bytes += row.bytes ?? 0;
     const profile = profiles[row.id];
-    if (profile?.loadMs != null) {
-      measuredMs += profile.loadMs;
+    const load = currentLoadMs(profile, row.version);
+    if (load != null) {
+      measuredMs += load;
       measuredCount++;
     }
     if (profile?.minIntervalMs != null && pollPenalty(profile.minIntervalMs) > 0) polling++;

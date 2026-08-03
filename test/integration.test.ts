@@ -278,11 +278,22 @@ async function timerTests(): Promise<void> {
 
   // If somebody else wrapped setInterval after us, restoring ours would undo
   // theirs. Leaving ours in place is the lesser harm, and it is what happens.
+  //
+  // That compromise is only defensible if the wrapper we leave behind is DEAD.
+  // It was not: the closure still held the watcher, its maps and its host, so
+  // every timer created afterwards was attributed, recorded, and flushed
+  // through `onChange` — which saves settings and rescans — on behalf of a
+  // plugin Obsidian had already unloaded. The old test asserted only that the
+  // later wrapper survived, which blessed the leak rather than catching it.
+  let deadHostCalls = 0;
+  const store2: RuntimeProfiles = {};
   const watcher2 = new RuntimeWatcher(app as never, {
     installedIds: () => new Set(Object.keys(app.manifests)),
-    store: () => store,
+    store: () => store2,
     versionOf: (id) => app.manifests[id]?.version,
-    onChange: () => undefined,
+    onChange: () => {
+      deadHostCalls++;
+    },
   });
   watcher2.start();
   const ours = window.setInterval;
@@ -291,6 +302,106 @@ async function timerTests(): Promise<void> {
   window.setInterval = theirs;
   watcher2.stop();
   eq("a later wrapper is not clobbered on unload", window.setInterval, theirs);
+
+  // Now drive a timer through the chain that still contains our wrapper.
+  const afterUnload = asPlugin("alpha", () =>
+    asPlugin("flowkit-health-dashboard", () => window.setInterval(() => undefined, 20))
+  );
+  const strandedSnapshot = watcher2.snapshot();
+  check(
+    "a wrapper that survives unload records nothing",
+    strandedSnapshot.alpha?.timers == null,
+    `got ${strandedSnapshot.alpha?.timers}`
+  );
+  await sleep(60);
+  window.clearInterval(afterUnload);
+  eq("and never calls back into the unloaded plugin", deadHostCalls, 0);
+  window.setInterval = beforeSet;
+
+  // Two generations of FlowKit can coexist for a moment during a reload. The
+  // marker they share says "some FlowKit wrapper", not "mine" — so restoring on
+  // the marker alone let one instance replace the other's LIVE wrapper with its
+  // own stale predecessor, leaving the survivor blind.
+  const firstStore: RuntimeProfiles = {};
+  const first = new RuntimeWatcher(app as never, {
+    installedIds: () => new Set(Object.keys(app.manifests)),
+    store: () => firstStore,
+    versionOf: (id: string) => app.manifests[id]?.version,
+    onChange: () => undefined,
+  });
+  const second = new RuntimeWatcher(app as never, {
+    installedIds: () => new Set(Object.keys(app.manifests)),
+    store: () => store,
+    versionOf: (id: string) => app.manifests[id]?.version,
+    onChange: () => undefined,
+  });
+  first.start();
+  second.start();
+  const secondsWrapper = window.setInterval;
+  first.stop();
+  eq(
+    "one instance does not restore over another's live wrapper",
+    window.setInterval,
+    secondsWrapper
+  );
+  // The outgoing instance cannot unhook itself from the middle of the chain —
+  // its wrapper is underneath the survivor's, and pulling it out would take the
+  // survivor with it. What matters is that it observes nothing more.
+  const afterFirstStopped = asPlugin("alpha", () =>
+    asPlugin("flowkit-health-dashboard", () => window.setInterval(() => undefined, 400))
+  );
+  check(
+    "the stopped instance in the middle of the chain records nothing",
+    first.snapshot().alpha?.timers == null
+  );
+  check(
+    "while the live one still measures normally",
+    (second.snapshot().alpha?.timers ?? 0) > 0
+  );
+  window.clearInterval(afterFirstStopped);
+  second.stop();
+  window.setInterval = beforeSet;
+
+  // Clearing a timer changes the snapshot as much as creating one, and only
+  // the creating side ever said so — so a plugin that stopped polling went on
+  // being displayed as a poller until something unrelated forced a re-score.
+  let clearNotifications = 0;
+  const watcher3 = new RuntimeWatcher(
+    app as never,
+    {
+      installedIds: () => new Set(Object.keys(app.manifests)),
+      store: () => store,
+      versionOf: (id) => app.manifests[id]?.version,
+      onChange: () => {
+        clearNotifications++;
+      },
+    },
+    20
+  );
+  watcher3.start();
+  const doomed = asPlugin("alpha", () =>
+    asPlugin("flowkit-health-dashboard", () => window.setInterval(() => undefined, 300))
+  );
+  // Let the creation's own flush land first, so what is counted below is the
+  // clear and nothing else.
+  await sleep(60);
+  clearNotifications = 0;
+  window.clearInterval(doomed);
+  await sleep(60);
+  eq(
+    "clearing an attributed timer tells the host the snapshot moved",
+    clearNotifications,
+    1
+  );
+  // …and clearing something we never attributed says nothing, so an unrelated
+  // plugin's housekeeping cannot rescore the dashboard.
+  const untracked = window.setInterval(() => undefined, 300);
+  await sleep(60);
+  clearNotifications = 0;
+  window.clearInterval(untracked);
+  await sleep(60);
+  eq("an unattributed timer's removal does not", clearNotifications, 0);
+  watcher3.stop();
   window.setInterval = beforeSet;
 }
 
@@ -619,6 +730,57 @@ async function persistenceTests(): Promise<void> {
     check("the queue still works afterwards", queue.settled, `${writes} writes`);
   }
 
+  // …but a failed write must NOT reject a caller whose state it never held.
+  //
+  // Callers queued behind a running write used to inherit its rejection
+  // wholesale. Two things went wrong at once: the later caller was told its
+  // state had not reached disk when its snapshot had never been attempted, and
+  // — worse — the loop exited, leaving that snapshot pending and unwritten
+  // until something else happened to call save(). `await saveSettings()` is the
+  // durability barrier bisect leans on before switching a plugin off, so
+  // "someone else's write failed" has to mean "attempt mine".
+  {
+    let attempts = 0;
+    let state = 0;
+    const written: number[] = [];
+    const gate: { release: () => void } = { release: () => undefined };
+    const queue = new SaveQueue<number>(
+      () => state,
+      async (snapshot) => {
+        const mine = ++attempts;
+        await new Promise<void>((resolve) => {
+          gate.release = resolve;
+        });
+        // Only the very first physical write fails.
+        if (mine === 1) throw new Error("disk went away for a moment");
+        written.push(snapshot);
+      }
+    );
+
+    state = 1;
+    const doomed = queue.save();
+    await sleep(0); // let it take the job and block
+    state = 2;
+    const later = queue.save();
+
+    let doomedRejected = false;
+    gate.release();
+    await doomed.catch(() => {
+      doomedRejected = true;
+    });
+    check("the caller whose write failed is told", doomedRejected);
+
+    await sleep(0);
+    gate.release();
+    let laterRejected = false;
+    await later.catch(() => {
+      laterRejected = true;
+    });
+    check("a later caller does not inherit that verdict", !laterRejected);
+    eq("its own snapshot really was written", written.join(), "2");
+    check("and the queue reports everything settled", queue.settled);
+  }
+
   // The scan pool must return results in input order whatever finishes first,
   // or equal-scoring plugins reshuffle on every scan.
   {
@@ -653,6 +815,35 @@ async function persistenceTests(): Promise<void> {
     check("nor one with a junk timestamp", !isUsableCache({ ...good, at: NaN }));
     check("nor one with a junk distribution", !isUsableCache({ ...good, distribution: [1, "x"] }));
     check("nor one missing its coverage flags", !isUsableCache({ ...good, hadStats: undefined }));
+
+    // The entries, not just the container. The guard validated the shell and
+    // stopped, while its own contract promised all-or-nothing — so a mangled
+    // row went straight into scoring, where `listed` being truthy is the
+    // difference between "installed outside the directory" and the far more
+    // serious "Obsidian pulled this from the community directory".
+    const withEntry = (entry: unknown) => ({ ...good, plugins: { alpha: entry } });
+    check(
+      "a well-formed entry is fine",
+      isUsableCache(withEntry({ downloads: 10, updated: 1, latest: "1.0.0", listed: true }))
+    );
+    check("an entry that is a string is not", !isUsableCache(withEntry("nonsense")));
+    check("nor one that is an array", !isUsableCache(withEntry([1, 2])));
+    check("nor one that is null", !isUsableCache(withEntry(null)));
+    check(
+      "nor a download count that isn't a number",
+      !isUsableCache(withEntry({ downloads: "12000" }))
+    );
+    check(
+      "nor a non-finite one",
+      !isUsableCache(withEntry({ downloads: Number.POSITIVE_INFINITY }))
+    );
+    check("nor a stringly-typed listing flag", !isUsableCache(withEntry({ listed: "true" })));
+    check("nor a version that isn't a string", !isUsableCache(withEntry({ latest: 3 })));
+    check(
+      "per-feed timestamps are optional but must be numbers",
+      isUsableCache({ ...good, statsAt: 5, listAt: undefined }) &&
+        !isUsableCache({ ...good, listAt: "yesterday" })
+    );
   }
 }
 

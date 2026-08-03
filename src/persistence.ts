@@ -25,9 +25,10 @@ import type { RemoteCache } from "./types";
  *
  * A revision counter gives that. Each request takes the next revision; each
  * physical write records the highest revision it covered; a caller returns only
- * once a completed write covers its own. A failed write rejects the callers it
- * would have covered — they are entitled to know their state is not on disk —
- * and leaves the queue usable for the next attempt.
+ * once a completed write covers its own. A failed write rejects the caller that
+ * ran it — it is entitled to know its state is not on disk — while callers
+ * queued behind it fall through to attempt their own newer snapshot rather than
+ * inheriting a verdict on a write that never contained their mutations.
  */
 export class SaveQueue<T> {
   private requested = 0;
@@ -62,7 +63,17 @@ export class SaveQueue<T> {
       if (this.inFlight) {
         // Someone else's write is running. It may already cover this caller;
         // if not, the next pass starts one that does.
-        await this.inFlight;
+        //
+        // Its failure is NOT this caller's failure. Inheriting the rejection
+        // here was wrong twice over: this caller was told its state didn't
+        // reach disk when its snapshot had never been attempted, and — worse —
+        // the loop exited, so that snapshot sat in `pending` unwritten until
+        // something else happened to call `save()`. `await saveSettings()` is
+        // used as a durability barrier before bisect switches a plugin off, so
+        // "somebody else's write failed" must mean "try mine", not "give up on
+        // both". Swallowing it is safe because the loop is the only way out:
+        // this caller now runs its own write, and rejects only if that fails.
+        await this.inFlight.catch(() => undefined);
         continue;
       }
       const job = this.pending;
@@ -156,5 +167,41 @@ export function isUsableCache(cache: unknown): cache is RemoteCache {
   if (!Array.isArray(c.distribution)) return false;
   if (c.distribution.some((n) => typeof n !== "number" || !Number.isFinite(n))) return false;
   if (typeof c.hadStats !== "boolean" || typeof c.hadList !== "boolean") return false;
+  if (!isOptionalTime(c.statsAt) || !isOptionalTime(c.listAt)) return false;
+  // The entries, not just the container. The check validated the shell and
+  // stopped, while the paragraph above promised all-or-nothing — so a
+  // sync-mangled row (a string where a record belongs, a download count of
+  // `null`, a `listed` that is the string "true") passed the guard and went
+  // straight into scoring, where `listed` being truthy is the difference
+  // between "installed outside the directory" and "Obsidian pulled this".
+  for (const entry of Object.values(c.plugins)) {
+    if (!isUsableEntry(entry)) return false;
+  }
+  return true;
+}
+
+function isOptionalTime(value: unknown): boolean {
+  return value === undefined || (typeof value === "number" && Number.isFinite(value));
+}
+
+function isOptionalNumber(value: unknown): boolean {
+  return value === undefined || (typeof value === "number" && Number.isFinite(value));
+}
+
+function isOptionalString(value: unknown): boolean {
+  return value === undefined || typeof value === "string";
+}
+
+/** One cached plugin row, checked field by field. */
+function isUsableEntry(entry: unknown): boolean {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return false;
+  const e = entry as Record<string, unknown>;
+  if (!isOptionalNumber(e.downloads)) return false;
+  if (!isOptionalNumber(e.updated)) return false;
+  if (!isOptionalNumber(e.latestDownloads)) return false;
+  if (!isOptionalNumber(e.releases)) return false;
+  if (!isOptionalString(e.latest)) return false;
+  if (!isOptionalString(e.repo)) return false;
+  if (e.listed !== undefined && typeof e.listed !== "boolean") return false;
   return true;
 }

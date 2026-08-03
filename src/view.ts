@@ -32,7 +32,13 @@ import { clearCooldown } from "./dataSources";
 import { totalUncaught } from "./errors";
 import { conflictsFor, describeConflict, type Conflict } from "./conflicts";
 import { describeMute } from "./mutes";
-import { formatBytes, formatPeriod, pollPenalty, startupCost } from "./runtime";
+import {
+  currentLoadMs,
+  formatBytes,
+  formatPeriod,
+  pollPenalty,
+  startupCost,
+} from "./runtime";
 import { rankSafeDisable } from "./triage";
 import {
   describeRound,
@@ -343,6 +349,29 @@ export class HealthDashboardView extends ItemView {
   }
 
   /**
+   * Run a click handler's async work so that a failure reaches the user.
+   *
+   * Every one of these paths can genuinely fail — a read-only or synced
+   * `data.json` rejects the write, and the plugin lifecycle calls throw when
+   * Obsidian's internals are missing or the registry doesn't settle. They were
+   * written as `void promise.then(...)`, which means the failure took the
+   * `then` with it: the button appeared to do nothing, no message was shown,
+   * nothing was written to the console, and the rejection escaped as an
+   * unhandled one — inside the plugin whose job is to notice exactly that
+   * happening to somebody else.
+   *
+   * `saveQuietly` in main.ts already established the rule for background work.
+   * This is the same rule for work a user asked for, where saying nothing is
+   * the worse half of the failure.
+   */
+  private act(work: Promise<unknown>, failure: string): void {
+    void work.catch((err) => {
+      console.error("FlowKit: action failed —", failure, err);
+      new Notice(`${failure} — see the console for details.`, 8000);
+    });
+  }
+
+  /**
    * Recompute all scores and re-render.
    *
    * @param force re-download community data instead of using the cache.
@@ -480,11 +509,14 @@ export class HealthDashboardView extends ItemView {
       pluginName: r.name,
       appVersion: apiVersion,
       onConfirm: (kind, reason) => {
-        void this.plugin.mute(r.id, kind, reason).then(() => {
-          r.muted = true;
-          r.mute = this.plugin.muteOf(r.id);
-          this.afterMuteChange();
-        });
+        this.act(
+          this.plugin.mute(r.id, kind, reason).then(() => {
+            r.muted = true;
+            r.mute = this.plugin.muteOf(r.id);
+            this.afterMuteChange();
+          }),
+          `Couldn't mute ${r.name}`
+        );
       },
     }).open();
   }
@@ -751,15 +783,34 @@ export class HealthDashboardView extends ItemView {
       return;
     }
 
+    // A failed scan is a banner when there is a previous report to keep, and
+    // only takes the page when there is nothing behind it.
+    //
+    // It used to replace the dashboard unconditionally. So a rejected write on
+    // a synced vault — the commonest way this fails, and one that has nothing
+    // to do with the scores — threw away a complete, still-accurate diagnosis
+    // the user was reading, and replaced it with a retry button. The last good
+    // answer is the most useful thing on screen at the moment something goes
+    // wrong; the header already says when it was taken.
     if (this.scanError) {
       const card = root.createDiv({ cls: "flowkit-health-error" });
+      card.setAttr("role", "alert");
       setIcon(card.createSpan({ cls: "flowkit-error-icon" }), "alert-triangle");
       const body = card.createDiv();
-      body.createEl("strong", { text: "The scan didn't finish." });
+      const stale = this.results.length > 0;
+      body.createEl("strong", {
+        text: stale ? "That refresh didn't finish." : "The scan didn't finish.",
+      });
       body.createDiv({ cls: "flowkit-error-detail", text: this.scanError });
+      if (stale) {
+        body.createDiv({
+          cls: "flowkit-error-detail",
+          text: "Everything below is the last scan that did — see the header for when that was.",
+        });
+      }
       const retry = card.createEl("button", { cls: "mod-cta", text: "Try again" });
       retry.onclick = () => this.forceRetry();
-      return;
+      if (!stale) return;
     }
 
     if (this.results.length === 0) {
@@ -831,6 +882,12 @@ export class HealthDashboardView extends ItemView {
       cls: "flowkit-loading-label",
       text: this.phase?.label ?? "Reading your plugin list…",
     });
+    // The phase text is rewritten in place as the scan moves, which is a change
+    // only a sighted user was told about. On a large vault the download stage
+    // alone can hold this screen for several seconds, so silence here is
+    // indistinguishable from a plugin that has hung.
+    this.phaseEl.setAttr("role", "status");
+    this.phaseEl.setAttr("aria-live", "polite");
     this.phaseBarEl = box.createDiv({ cls: "flowkit-loading-bar" });
     this.phaseFillEl = this.phaseBarEl.createDiv({ cls: "flowkit-loading-fill" });
     this.paintPhase();
@@ -897,7 +954,10 @@ export class HealthDashboardView extends ItemView {
       const btn = box.createEl("button", { cls: "mod-cta", text: "Show disabled plugins" });
       btn.onclick = () => {
         this.plugin.settings.showDisabled = true;
-        void this.plugin.saveSettings().then(() => this.refresh(false, false));
+        this.act(
+          this.plugin.saveSettings().then(() => this.refresh(false, false)),
+          "Couldn't save that setting"
+        );
       };
       return;
     }
@@ -989,7 +1049,18 @@ export class HealthDashboardView extends ItemView {
     // off by default, so the normal case is reading day-old numbers under a
     // green "Online" label — the one place left where the product, whose whole
     // differentiator is honest provenance, overstated itself.
-    const cachedAt = this.plugin.settings.cache?.at;
+    //
+    // Dated by the OLDER of the two feeds, not by the last time either of them
+    // answered. They fail and merge independently, so a run of stats-only
+    // successes kept refreshing one shared timestamp while the community list
+    // — where delisting, repository links and sideload detection come from —
+    // aged silently underneath it. The honest headline age is the age of the
+    // stalest thing being shown.
+    const cache = this.plugin.settings.cache;
+    const feedAges = [cache?.statsAt, cache?.listAt].filter(
+      (v): v is number => typeof v === "number"
+    );
+    const cachedAt = feedAges.length ? Math.min(...feedAges) : cache?.at;
     const age = cachedAt ? ` · community data from ${describeWhen(cachedAt)}` : "";
     // Two different ages, and they are genuinely different: the scan is local
     // and current, the community data behind it may be a day old. Saying only
@@ -1013,9 +1084,11 @@ export class HealthDashboardView extends ItemView {
       // "Share" reads as social. Everything behind this button writes a file or
       // fills the clipboard.
       exportBtn.createSpan({ text: " Export" });
-      if (!this.plugin.isPro && this.plugin.settings.usedFreeExport) {
-        setIcon(exportBtn.createSpan({ cls: "flowkit-lock" }), "lock");
-      }
+      // No padlock here. It used to appear for a free user who had exported
+      // once, and it gated nothing: the Markdown report is free and unlimited
+      // by design — it is the diagnosis, and the diagnosis is what stays free.
+      // A lock on a door that isn't locked is worse than either a real gate or
+      // no gate at all, because the reader stops believing the other locks.
       exportBtn.onclick = (evt) => this.onExportClick(evt);
     }
 
@@ -1176,7 +1249,10 @@ export class HealthDashboardView extends ItemView {
     const dismiss = head.createEl("button", { cls: "flowkit-changes-dismiss", text: "×" });
     dismiss.setAttr("aria-label", "Mark these as seen");
     dismiss.onclick = () => {
-      void this.plugin.markChangesSeen().then(() => this.render());
+      this.act(
+        this.plugin.markChangesSeen().then(() => this.render()),
+        "Couldn't mark those as seen"
+      );
     };
 
     // Newest first, and the ones that matter before the merely informational.
@@ -1213,6 +1289,14 @@ export class HealthDashboardView extends ItemView {
     if (!state) return;
 
     const box = root.createDiv({ cls: "flowkit-bisect" });
+    // Announced, not merely repainted. This panel is the whole interface for an
+    // operation that switches plugins off — its round, its progress, its
+    // failures and its result all arrive by replacing DOM, so without a live
+    // region a screen-reader user starts a search that rearranges their vault
+    // and is then told nothing at all about what it is doing.
+    box.setAttr("role", "region");
+    box.setAttr("aria-live", "polite");
+    box.setAttr("aria-label", "Plugin search");
     const head = box.createDiv({ cls: "flowkit-bisect-head" });
     setIcon(head.createSpan({ cls: "flowkit-bisect-icon" }), "search-check");
     head.createSpan({
@@ -1317,6 +1401,31 @@ export class HealthDashboardView extends ItemView {
     gone.onclick = () => void this.answerBisect(true);
     const still = actions.createEl("button", { text: "Still happening" });
     still.onclick = () => void this.answerBisect(false);
+    // The way back from a mis-click.
+    //
+    // Both buttons above are irreversible and each throws away half the
+    // remaining suspects — so pressing one before you had actually checked
+    // produces a search that finishes normally and names the wrong plugin, with
+    // nothing anywhere to suggest it went wrong. This is the cheapest possible
+    // guard against the most likely mistake in the feature. Placed before Stop,
+    // which is pushed to the far end of the row.
+    if (this.plugin.bisectCanUndo) {
+      const back = actions.createEl("button", {
+        cls: "flowkit-bisect-undo",
+        text: "Undo last answer",
+      });
+      back.setAttr(
+        "aria-label",
+        "Take back the previous answer and put your plugins into the round it was asked about"
+      );
+      back.disabled = busy;
+      back.onclick = () =>
+        void this.runBisectAction(async () => {
+          const restored = await this.plugin.undoBisectAnswer();
+          if (restored) new Notice("Went back a step — test this round again.");
+        });
+    }
+
     const stop = actions.createEl("button", { cls: "flowkit-bisect-stop", text: "Stop and restore" });
     stop.onclick = () => void this.runBisectAction(() => this.plugin.cancelBisect());
     for (const btn of [gone, still]) btn.disabled = busy || blocked != null;
@@ -1387,12 +1496,37 @@ export class HealthDashboardView extends ItemView {
   private renderUnreadable(root: HTMLElement): void {
     if (!this.plugin.settingsUnreadable) return;
     const box = root.createDiv({ cls: "flowkit-coverage-note is-bad" });
+    box.setAttr("role", "alert");
     setIcon(box.createSpan({ cls: "flowkit-coverage-icon" }), "file-warning");
-    box.createDiv({ cls: "flowkit-coverage-body" }).setText(
-      "FlowKit couldn't read its settings file, so it is running on defaults and will not " +
-        "save anything this session — your licence, history and saved sets are untouched on " +
-        "disk. Restart Obsidian to try again."
-    );
+    const body = box.createDiv({ cls: "flowkit-coverage-body" });
+    body.createDiv({
+      text:
+        "FlowKit couldn't read its settings file, so it is running on defaults and will not " +
+        "save anything this session — your licence, history and saved sets are untouched on disk.",
+    });
+    // "Restart Obsidian" was the only advice offered, and for the case this
+    // banner actually describes it is not advice at all: a file that is
+    // malformed is still malformed after a restart, so the user restarts,
+    // sees the same banner, and has been sent in a circle. A restart is worth
+    // trying once — the file may only have been locked by a sync client — but
+    // the way out of the other case is knowing which file to go and look at.
+    body.createDiv({
+      cls: "flowkit-detail-muted",
+      text:
+        `If it was only locked — a sync client mid-write, say — restarting Obsidian clears it. ` +
+        `If the banner comes back, the file itself is damaged: close Obsidian and rename ` +
+        `${this.plugin.dataFilePath()} to keep a copy, and FlowKit will start fresh. You lose ` +
+        `your history and saved sets; your licence key can be pasted back in.`,
+    });
+    const copy = box.createEl("button", { text: "Copy the file path" });
+    copy.onclick = () => {
+      this.act(
+        navigator.clipboard
+          .writeText(this.plugin.dataFilePath())
+          .then(() => new Notice("Path copied.")),
+        "Couldn't copy the path"
+      );
+    };
   }
 
   /** Set while this view is driving a bisect transition. */
@@ -1406,8 +1540,16 @@ export class HealthDashboardView extends ItemView {
     try {
       await fn();
     } catch (err) {
+      // Deliberately not "the search is where it was". It may not be: a round
+      // is persisted before it is applied, so a failure part-way through leaves
+      // the recorded round ahead of the vault — which is exactly the state the
+      // drift prompt and the pause exist to handle. Claiming nothing moved
+      // would talk the user past both.
       console.error("FlowKit: bisect step failed", err);
-      new Notice("That step didn't finish — the search is where it was.");
+      new Notice(
+        "That step didn't finish. FlowKit has re-read your plugins — check the search panel before answering.",
+        8000
+      );
     } finally {
       this.bisectBusy = false;
       await this.refresh(false, false);
@@ -1500,7 +1642,10 @@ export class HealthDashboardView extends ItemView {
     });
     dismiss.setAttr("aria-label", "Mark this as seen");
     dismiss.onclick = () => {
-      void this.plugin.markChangesSeen().then(() => this.render());
+      this.act(
+        this.plugin.markChangesSeen().then(() => this.render()),
+        "Couldn't mark those as seen"
+      );
     };
 
     const body = box.createDiv({ cls: "flowkit-appupdate-body" });
@@ -1569,7 +1714,7 @@ export class HealthDashboardView extends ItemView {
     const done = intro.createEl("button", { text: "Got it" });
     done.onclick = () => {
       this.plugin.settings.seenIntro = true;
-      void this.plugin.saveSettings();
+      this.act(this.plugin.saveSettings(), "Couldn't save that");
       intro.remove();
     };
   }
@@ -1608,7 +1753,10 @@ export class HealthDashboardView extends ItemView {
       const btn = note.createEl("button", { text: "Turn on" });
       btn.onclick = () => {
         this.plugin.settings.enableOnlineEnrichment = true;
-        void this.plugin.saveSettings().then(() => this.refresh(true));
+        this.act(
+          this.plugin.saveSettings().then(() => this.refresh(true)),
+          "Couldn't turn on online enrichment"
+        );
       };
       return;
     }
@@ -1679,7 +1827,14 @@ export class HealthDashboardView extends ItemView {
     if (enabled.length === 0) return;
 
     const cost = startupCost(
-      enabled.map((r) => ({ id: r.id, enabled: true, bytes: r.bundleBytes })),
+      enabled.map((r) => ({
+        id: r.id,
+        enabled: true,
+        bytes: r.bundleBytes,
+        // So a load timed against an older build is left out of the total
+        // rather than quoted as current — the same rule Footprint applies.
+        version: r.version,
+      })),
       Object.fromEntries(enabled.map((r) => [r.id, r.runtime ?? {}]))
     );
 
@@ -1888,7 +2043,7 @@ export class HealthDashboardView extends ItemView {
       text:
         `FlowKit can find it by elimination — switching off half your plugins, asking whether the problem is still there, ` +
         `and halving until one is left. That's ${roundsNeeded(enabled)} questions to search your ${enabled} enabled plugins, ` +
-        `instead of an evening of it. Your exact setup is restored afterwards. Pro, ${PRO_PRICE}.`,
+        `instead of an evening of it. Everything it switches off goes back on afterwards. Pro, ${PRO_PRICE}.`,
     });
     const btn = lock.createEl("button", { cls: "flowkit-health-btn flowkit-upgrade-btn" });
     btn.setText("See how it works");
@@ -2333,9 +2488,18 @@ export class HealthDashboardView extends ItemView {
     // Free sees the last 30 days; Pro sees the full retained window.
     const windowDays = this.plugin.isPro ? 90 : 30;
     const cutoff = Date.now() - windowDays * 86_400_000;
-    const history = this.plugin.settings.history
-      .filter((h) => h.at >= cutoff)
+    // Two exclusions, both about comparability:
+    //  - offline readings, where a missing signal looked like an improvement;
+    //  - readings from an older scoring model, which are a different scale.
+    // Applied before the window is cut, so the upsell below can count what the
+    // window actually costs the reader rather than what these filters removed.
+    const comparable = this.plugin.settings.history
+      .filter(
+        (h): h is HealthSnapshot & { avg: number } =>
+          h.avg != null && h.online !== false && h.model === SCORING_MODEL
+      )
       .sort((a, b) => a.at - b.at);
+    const history = comparable.filter((h) => h.at >= cutoff);
 
     const section = root.createDiv({ cls: "flowkit-trends" });
     const head = section.createDiv({ cls: "flowkit-section-head" });
@@ -2345,13 +2509,7 @@ export class HealthDashboardView extends ItemView {
       text: `Vault health trend · ${windowDays} days`,
     });
 
-    // Two exclusions, both about comparability:
-    //  - offline readings, where a missing signal looked like an improvement;
-    //  - readings from an older scoring model, which are a different scale.
-    const usable = history.filter(
-      (h): h is HealthSnapshot & { avg: number } =>
-        h.avg != null && h.online !== false && h.model === SCORING_MODEL
-    );
+    const usable = history;
 
     if (usable.length === 0) {
       section.createDiv({
@@ -2396,10 +2554,20 @@ export class HealthDashboardView extends ItemView {
       });
     }
 
-    if (!this.plugin.isPro && this.plugin.settings.history.length > usable.length) {
+    // Only ask when the window is actually costing the reader something.
+    //
+    // This compared against the WHOLE history, including readings the chart
+    // dropped for being offline or scored on an older model — so a free user
+    // three weeks in, with two network hiccups behind them, was told they had
+    // five readings saved and offered ninety days to see them. The number in
+    // an upsell has to be a number the purchase would change.
+    const beyondWindow = comparable.length - usable.length;
+    if (!this.plugin.isPro && beyondWindow > 0) {
       const more = section.createDiv({ cls: "flowkit-trends-more" });
       more.appendText(
-        `You have ${this.plugin.settings.history.length} readings saved. `
+        `${beyondWindow} older reading${beyondWindow === 1 ? "" : "s"} sit${
+          beyondWindow === 1 ? "s" : ""
+        } outside this 30-day window. `
       );
       const link = more.createEl("button", { text: "See all 90 days with Pro" });
       link.onclick = () => this.openUpgrade("history");
@@ -2614,8 +2782,9 @@ export class HealthDashboardView extends ItemView {
     const runtime = r.runtime;
     const runtimeParts: string[] = [];
     if (r.bundleBytes) runtimeParts.push(`${formatBytes(r.bundleBytes)} on disk`);
-    if (runtime?.loadMs != null && runtime.loadVersion === r.version) {
-      runtimeParts.push(`loaded in ${Math.round(runtime.loadMs)} ms`);
+    const loadMs = currentLoadMs(runtime, r.version);
+    if (loadMs != null) {
+      runtimeParts.push(`loaded in ${Math.round(loadMs)} ms`);
     }
     if (runtime?.minIntervalMs != null) {
       const period = formatPeriod(runtime.minIntervalMs);
@@ -2632,10 +2801,18 @@ export class HealthDashboardView extends ItemView {
       runtimeParts.push(`${runtime.handlers} registered hooks`);
     }
     if (runtimeParts.length) facts.createDiv({ text: runtimeParts.join(" · ") });
-    if (r.enabled && this.plugin.runtimeTracking && runtime?.loadMs == null) {
+    // Keyed on whether there is a load time for THIS build, not on whether one
+    // was ever recorded. A plugin that updated since it was timed has a reading
+    // that Footprint correctly ignores — and the panel used to then show
+    // neither the time nor this hint, so the row simply went quiet about the
+    // one number the user came here for.
+    if (r.enabled && this.plugin.runtimeTracking && loadMs == null) {
       facts.createDiv({
         cls: "flowkit-detail-muted",
-        text: "Load time not measured — FlowKit only times loads it witnesses. Use “Measure load time” to get a real number.",
+        text:
+          runtime?.loadMs != null
+            ? `Load time was measured for v${runtime.loadVersion}, not the version you have installed. Use “Measure load time” for a current number.`
+            : "Load time not measured — FlowKit only times loads it witnesses. Use “Measure load time” to get a real number.",
       });
     }
 
@@ -2677,7 +2854,10 @@ export class HealthDashboardView extends ItemView {
       text: r.enabled ? "Disable" : "Enable",
     });
     toggle.onclick = () => {
-      void this.plugin.setPluginEnabled(r.id, !r.enabled).then(() => this.refresh(false, false));
+      this.act(
+        this.plugin.setPluginEnabled(r.id, !r.enabled).then(() => this.refresh(false, false)),
+        `Couldn't ${r.enabled ? "disable" : "enable"} ${r.name}`
+      );
     };
     if (r.enabled) {
       const settings = actions.createEl("button", { text: "Open its settings" });
@@ -2924,10 +3104,17 @@ export class HealthDashboardView extends ItemView {
       item
         .setTitle(r.enabled ? "Disable plugin" : "Enable plugin")
         .setIcon(r.enabled ? "power-off" : "power")
-        .onClick(async () => {
-          await this.plugin.setPluginEnabled(r.id, !r.enabled);
-          await this.refresh(false, false);
-        })
+        // Not an `async` menu callback: Obsidian's menu does not promise to
+        // handle a rejected one, so a plugin that refuses to switch produced
+        // nothing — no change, no message, no console line.
+        .onClick(() =>
+          this.act(
+            this.plugin
+              .setPluginEnabled(r.id, !r.enabled)
+              .then(() => this.refresh(false, false)),
+            `Couldn't ${r.enabled ? "disable" : "enable"} ${r.name}`
+          )
+        )
     );
 
     if (r.enabled) {
@@ -3115,17 +3302,20 @@ export class HealthDashboardView extends ItemView {
       count,
       existing: this.plugin.settings.profiles,
       onConfirm: (name) => {
-        void this.plugin.saveCurrentProfile(name).then((stored) => {
-          // Reporting a save that FlowKit refused to make is the small version
-          // of the same lie the banner exists to prevent.
-          new Notice(
-            stored
-              ? `Saved “${name}”.`
-              : `Couldn't save “${name}” — FlowKit can't write its settings file this session.`,
-            stored ? undefined : 8000
-          );
-          this.render();
-        });
+        this.act(
+          this.plugin.saveCurrentProfile(name).then((stored) => {
+            // Reporting a save that FlowKit refused to make is the small
+            // version of the same lie the banner exists to prevent.
+            new Notice(
+              stored
+                ? `Saved “${name}”.`
+                : `Couldn't save “${name}” — FlowKit can't write its settings file this session.`,
+              stored ? undefined : 8000
+            );
+            this.render();
+          }),
+          `Couldn't save “${name}”`
+        );
       },
     }).open();
   }
@@ -3360,10 +3550,6 @@ export class HealthDashboardView extends ItemView {
         path,
         format === "csv" ? String.fromCharCode(0xfeff) + content : content
       );
-      if (!this.plugin.isPro) {
-        this.plugin.settings.usedFreeExport = true;
-        await this.plugin.saveSettings();
-      }
       new Notice(`Exported health report to “${path}”.`);
     } catch (err) {
       console.error("FlowKit: export failed", err);
@@ -3381,8 +3567,9 @@ export class HealthDashboardView extends ItemView {
         new Notice(`Report saved to “${createdPath}”, but it couldn't be opened.`);
       }
     }
-    // The Export button's lock state depends on usedFreeExport.
-    this.render();
+    // No re-render. It existed only to repaint the Export button's padlock,
+    // and a full render throws the reader back to the top of the page — after
+    // an action that changed nothing on screen.
   }
 
   /**
@@ -3482,10 +3669,14 @@ export class HealthDashboardView extends ItemView {
         "load. A finished plugin can score badly for being finished.*"
     );
     lines.push("");
+    // What Pro actually is, as of 1.4.0. This footer still advertised bulk
+    // fixes and unlimited reports — both free for a year — which meant the one
+    // artefact that leaves the vault, into other people's issue trackers, was
+    // selling a version of the product that no longer exists.
     lines.push(
       this.plugin.isPro
         ? `Generated by ${PRODUCT_NAME}.`
-        : `Generated by ${PRODUCT_NAME}. Pro (${PRO_PRICE}) adds one-click bulk fixes with undo, background monitoring, unlimited reports, and 90 days of history.`
+        : `Generated by ${PRODUCT_NAME}. The diagnosis above is free. Pro (${PRO_PRICE}) adds the search for what's breaking your vault, full startup profiling, saved plugin sets, background monitoring, stack traces and CSV export.`
     );
     lines.push("");
     return lines.join("\n");

@@ -111,15 +111,21 @@ async function fetchMirrored<T>(pick: (s: (typeof SOURCES)[number]) => string): 
     return { ok: false, reason: "cooling-down" };
   }
   let last: FetchOutcome<T> = { ok: false, reason: "network" };
+  // Whether ANY host limited us, not merely the last one tried. Reading only
+  // the final outcome meant the commonest shape of this failure — GitHub says
+  // 403, the mirror then times out — set no cooldown at all, so the next scan
+  // went straight back to the host that had just told us to stop.
+  let sawRateLimit = false;
   for (const source of SOURCES) {
     const res = await fetchOnce<T>(pick(source));
     if (res.ok) return res;
     last = res;
+    if (res.reason === "rate-limited") sawRateLimit = true;
     // A parse failure means we reached the host and the payload was wrong;
     // another mirror of the same file won't be different.
     if (res.reason === "parse") break;
   }
-  if (!last.ok && last.reason === "rate-limited") {
+  if (sawRateLimit) {
     cooldownUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;
   }
   return last;

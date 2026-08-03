@@ -35,6 +35,7 @@ import {
   recordLoad,
   pruneProfiles,
   sizeScore,
+  currentLoadMs,
   startupCost,
 } from "../src/runtime";
 import { findConflicts, printChord, type CommandRow } from "../src/conflicts";
@@ -353,6 +354,54 @@ eq(
   eq("the surviving repo is kept", merged.plugins.a.repo, "own/a");
   eq("and the listing is still known", merged.hadList, true);
   eq("listed survives a stats-only refresh", classifyListing("a", merged), "listed");
+
+  // Each half keeps the time IT was fetched. Stamping the whole merged object
+  // with the successful feed's timestamp is how a community list that has not
+  // answered for days sat under a header saying the data was an hour old — and
+  // delisting, repository links and sideload detection are all read from that
+  // list.
+  eq("the feed that answered is dated now", merged.statsAt, NOW + 1000);
+  eq("the one that didn't keeps its own age", merged.listAt, NOW);
+
+  // …and it survives repetition. A run of stats-only successes must not walk
+  // the list's age forward one refresh at a time.
+  const again = mergeRemoteCache(
+    merged,
+    buildRemoteCache({ a: { downloads: 70, updated: NOW } }, null, NOW + 9999, installed)
+  );
+  eq("a second stats-only refresh still doesn't age the list", again.listAt, NOW);
+
+  // Uninstalling a plugin must drop its cache row. The merge unioned both key
+  // sets, so every plugin the vault had ever held survived every refresh —
+  // rewritten as an object of undefined fields on a full fetch, and carried
+  // through every clone and every whole-file write from then on.
+  const withGhost = buildRemoteCache(
+    { a: { downloads: 50, updated: NOW }, gone: { downloads: 5, updated: NOW } },
+    null,
+    NOW,
+    new Set(["a", "gone"])
+  );
+  const afterUninstall = mergeRemoteCache(
+    withGhost,
+    buildRemoteCache({ a: { downloads: 55, updated: NOW } }, null, NOW + 10, installed),
+    installed
+  );
+  eq(
+    "an uninstalled plugin's cache row is dropped",
+    Object.keys(afterUninstall.plugins).sort().join(),
+    "a"
+  );
+  // Without the installed set the old behaviour is preserved, so nothing that
+  // merges without one silently starts losing data.
+  const noScope = mergeRemoteCache(
+    withGhost,
+    buildRemoteCache({ a: { downloads: 55, updated: NOW } }, null, NOW + 10, installed)
+  );
+  eq(
+    "and only when the merge is told what is installed",
+    Object.keys(noScope.plugins).sort().join(),
+    "a,gone"
+  );
 }
 {
   // Delisted is a hard cap, not a chip: it outranks an otherwise perfect score.
@@ -953,6 +1002,39 @@ eq("prerelease vs prerelease", compareVersion("1.0.0-alpha", "1.0.0-beta"), -1);
   eq("startup cost counts only enabled plugins", cost.bytes, 3000);
   eq("and only measured load times", cost.measuredCount, 1);
   eq("and counts the pollers", cost.polling, 1);
+
+  // The vault total has to apply the same version rule the per-plugin
+  // Footprint does. It did not, so after an update the row ignored a stale
+  // reading while the headline went on adding it — two surfaces quoting
+  // different milliseconds for the same plugin on the same screen.
+  const mixed = startupCost(
+    [
+      { id: "a", enabled: true, bytes: 1000, version: "1.0.0" },
+      { id: "b", enabled: true, bytes: 1000, version: "2.0.0" },
+    ],
+    {
+      a: { loadMs: 100, loadVersion: "1.0.0" },
+      b: { loadMs: 900, loadVersion: "1.0.0" },
+    }
+  );
+  eq("a load timed against an older build leaves the total", mixed.measuredMs, 100);
+  eq("and leaves the measured count", mixed.measuredCount, 1);
+
+  eq(
+    "currentLoadMs returns nothing for a superseded build",
+    currentLoadMs({ loadMs: 900, loadVersion: "1.0.0" }, "2.0.0"),
+    undefined
+  );
+  eq(
+    "and the reading for the installed one",
+    currentLoadMs({ loadMs: 900, loadVersion: "2.0.0" }, "2.0.0"),
+    900
+  );
+  eq(
+    "an untagged reading is kept — it predates version tracking, not the build",
+    currentLoadMs({ loadMs: 900 }, "2.0.0"),
+    900
+  );
 }
 
 // --- conflicts ---------------------------------------------------------------

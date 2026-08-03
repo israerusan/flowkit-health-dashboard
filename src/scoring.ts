@@ -217,8 +217,9 @@ function scoreCompatibility(i: ScoreInput): MetricScore {
  * stats file: 56% of the whole directory scored below 50 (red) and only 4.5%
  * could reach 80 (green). A well-maintained, fully-compatible niche plugin was
  * dragged ~15 points below a sloppier mega-plugin for the crime of being niche.
- * A rank puts the median at 50, and popularity is weighted at only 10% because
- * download count measures marketing reach, not whether a plugin is safe to keep.
+ * A rank puts the median at 50, and popularity carries the smallest weight of
+ * any metric here (5%, see `WEIGHTS`) because download count measures marketing
+ * reach, not whether a plugin is safe to keep.
  */
 function scorePopularity(i: ScoreInput): MetricScore {
   const downloads = i.remote?.downloads;
@@ -531,7 +532,8 @@ function scoreFootprint(i: ScoreInput): MetricScore {
  *
  * `authorUrl` and `fundingUrl` are gone too — a donate link is not evidence of
  * software quality. What is left is four things a publisher either did or
- * didn't do, which is all this can honestly claim to measure. It is worth 10%.
+ * didn't do, which is all this can honestly claim to measure — hence the
+ * smallest weight the model has (5%, see `WEIGHTS`).
  */
 function scoreHygiene(i: ScoreInput): MetricScore {
   const m = i.manifest;
@@ -627,6 +629,9 @@ export function buildRemoteCache(
     distribution: quantiles(all),
     hadStats: stats != null,
     hadList: list != null,
+    // Dated per feed, so a merge can carry each half's real age forward.
+    statsAt: stats != null ? at : undefined,
+    listAt: list != null ? at : undefined,
   };
 }
 
@@ -656,7 +661,19 @@ function quantiles(sorted: number[], buckets = 100): number[] {
  */
 export function mergeRemoteCache(
   previous: RemoteCache | null,
-  fresh: RemoteCache
+  fresh: RemoteCache,
+  /**
+   * Installed plugin ids. Anything else is dropped.
+   *
+   * `buildRemoteCache` has always kept only installed plugins, and the merge
+   * then quietly put the rest back: it unioned both key sets, so every plugin
+   * the user had ever installed survived every refresh — rewritten on a full
+   * fetch as an object of `undefined` fields, and carried through every clone
+   * and every whole-file write for the life of the vault. `pruneStores` learned
+   * this for the error log, the runtime profiles and the repository readings;
+   * the cache was the one store it could not reach.
+   */
+  installed?: ReadonlySet<string>
 ): RemoteCache {
   if (!previous) return fresh;
   const merged: RemoteCache = {
@@ -665,12 +682,17 @@ export function mergeRemoteCache(
     distribution: fresh.hadStats ? fresh.distribution : previous.distribution,
     hadStats: fresh.hadStats || previous.hadStats,
     hadList: fresh.hadList || previous.hadList,
+    // Each half keeps the time IT was last fetched. Taking `fresh.at` for both
+    // is how a stale community list spent days wearing a fresh timestamp.
+    statsAt: fresh.hadStats ? fresh.statsAt : previous.statsAt,
+    listAt: fresh.hadList ? fresh.listAt : previous.listAt,
   };
   const ids = new Set([
     ...Object.keys(previous.plugins),
     ...Object.keys(fresh.plugins),
   ]);
   for (const id of ids) {
+    if (installed && !installed.has(id)) continue;
     const before = previous.plugins[id] ?? {};
     const now = fresh.plugins[id] ?? {};
     merged.plugins[id] = {

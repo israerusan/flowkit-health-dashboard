@@ -55,7 +55,13 @@ export interface FlowKitHealthSettings {
   cache: RemoteCache | null;
   /** Whether the first-run explainer has been dismissed. */
   seenIntro: boolean;
-  /** Free users get one full report; this records that it's been spent. */
+  /**
+   * Vestigial. It once recorded that a free user had spent their single
+   * report, back when Markdown export was rationed; it is neither written nor
+   * read now — the Markdown report is free and unlimited, and only CSV is Pro.
+   * Kept in the type so an existing `data.json` carrying it round-trips
+   * unchanged rather than being silently rewritten.
+   */
   usedFreeExport: boolean;
   /** Pro: check for newly-degraded plugins in the background once a day. */
   backgroundMonitoring: boolean;
@@ -111,6 +117,19 @@ export interface FlowKitHealthSettings {
    * than never having started.
    */
   bisect: BisectState | null;
+  /**
+   * The round as it stood before the last answer, so a mis-click is
+   * recoverable.
+   *
+   * Bisect asks a question with two buttons and no way back, and each answer
+   * permanently eliminates half the remaining candidates — so one slip means a
+   * search that runs to completion and confidently names the wrong plugin, with
+   * nothing on screen to suggest anything went wrong. One step is the whole
+   * requirement: people notice a wrong click immediately, not four rounds
+   * later, and a full history would invite unwinding into rounds whose vault
+   * state has long since been overwritten.
+   */
+  bisectUndo: BisectState | null;
   /** What each plugin looked like on the last scan, to notice it changing. */
   seenPlugins: SeenMap;
   /** Installs, updates, removals and toggles, newest last. Pruned to 90 days. */
@@ -150,20 +169,61 @@ export const DEFAULT_SETTINGS: FlowKitHealthSettings = {
   appVersionChange: null,
   lastScanAt: null,
   bisect: null,
+  bisectUndo: null,
   seenPlugins: {},
   events: [],
   eventBaselineSet: false,
   profiles: [],
 };
 
+/** How long typing a licence key runs ahead of the write to disk. */
+const LICENSE_SAVE_DEBOUNCE_MS = 600;
+
 export class FlowKitHealthSettingTab extends PluginSettingTab {
   plugin: FlowKitHealthPlugin;
   /** Live-updated so a rejected key can be explained without a full re-render. */
   private errorEl?: HTMLElement;
+  /**
+   * The pending licence-key write. Held on the tab rather than in the input's
+   * closure, for the same reason the dashboard's search timer is held on the
+   * view: `display()` replaces the input, and a timer captured in the old one
+   * would still fire afterwards.
+   */
+  private licenseSaveTimer: number | null = null;
 
   constructor(app: App, plugin: FlowKitHealthPlugin) {
     super(app, plugin);
     this.plugin = plugin;
+  }
+
+  hide(): void {
+    // Closing the settings window must not lose a key typed a moment ago.
+    this.flushLicenseSave();
+  }
+
+  private queueLicenseSave(): void {
+    if (this.licenseSaveTimer != null) window.clearTimeout(this.licenseSaveTimer);
+    this.licenseSaveTimer = window.setTimeout(() => {
+      this.licenseSaveTimer = null;
+      this.saveLicenseNow();
+    }, LICENSE_SAVE_DEBOUNCE_MS);
+  }
+
+  /** Write a pending licence edit now, if there is one. */
+  private flushLicenseSave(): void {
+    // Only when something is actually waiting — otherwise merely closing the
+    // settings window would rewrite the whole file for nothing.
+    if (this.licenseSaveTimer == null) return;
+    window.clearTimeout(this.licenseSaveTimer);
+    this.licenseSaveTimer = null;
+    this.saveLicenseNow();
+  }
+
+  private saveLicenseNow(): void {
+    void this.plugin.saveSettings().catch((err) => {
+      console.error("FlowKit: could not save the licence key", err);
+      new Notice("FlowKit couldn't save your licence key — see the console.", 8000);
+    });
   }
 
   display(): void {
@@ -475,22 +535,38 @@ export class FlowKitHealthSettingTab extends PluginSettingTab {
         text
           .setPlaceholder("payload.signature")
           .setValue(this.plugin.settings.licenseKey)
-          .onChange(async (value) => {
+          .onChange((value) => {
             this.plugin.settings.licenseKey = value.trim();
-            await this.plugin.saveSettings();
             // Verification is offline and takes microseconds, so re-check every
             // keystroke — but only rebuild the tab when Pro actually FLIPS.
             // display() empties containerEl, which would destroy the very input
             // being typed into and drop focus after the first character.
             const flipped = this.plugin.refreshLicense();
+            // The WRITE is debounced, and that is a different question from the
+            // check. Every save clones and rewrites the whole settings object —
+            // cache, history, error log, runtime readings, saved sets — so
+            // pasting a licence key character by character, or typing one out
+            // on a phone, meant a full `data.json` rewrite per keystroke, and
+            // one sync event each on a synced vault. A key that verifies is
+            // written immediately; everything else waits until the typing
+            // stops.
             if (flipped) {
+              // A key that just verified is written at once — this is the
+              // moment somebody has paid, and it must survive a crash.
+              this.flushLicenseSave();
+              this.saveLicenseNow();
               this.plugin.refreshViews(true);
               this.display();
-            } else {
-              this.renderLicenseError();
+              return;
             }
+            this.queueLicenseSave();
+            this.renderLicenseError();
           });
         text.inputEl.addClass("flowkit-license-input");
+        // Leaving the field is a commit: waiting out a timer to persist
+        // something the user has visibly finished typing is how a key looks
+        // accepted and isn't there after a restart.
+        text.inputEl.addEventListener("blur", () => this.flushLicenseSave());
       });
 
     this.errorEl = containerEl.createDiv({ cls: "flowkit-license-error" });
