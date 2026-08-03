@@ -1,7 +1,7 @@
 {
   "id": "flowkit-health-dashboard",
   "name": "FlowKit Health Dashboard",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "minAppVersion": "1.4.0",
   "description": "Scores every installed add-on on compatibility, maintenance, footprint, manifest hygiene, and popularity.",
   "author": "Israel Avila",

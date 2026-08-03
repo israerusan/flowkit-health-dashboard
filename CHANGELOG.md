@@ -3,6 +3,63 @@
 All notable changes to FlowKit Plugin Health Dashboard are documented here. This
 project follows [Semantic Versioning](https://semver.org/).
 
+## [1.2.0] - 2026-08-03
+
+A UX pass driven by an adversarial review — four independent critiques, each
+one opposed and then judged, plus an outside roundtable. Most of what follows
+are defects, not taste.
+
+### Fixed
+
+- **Findings lied about their contents.** Clicking "3 plugins score below 50"
+  opened a table of a dozen mostly-fine plugins, because the card mapped to a
+  nearby filter rather than to its own cohort. Every finding now scopes the
+  table to exactly what it counted.
+- **Muted plugins leaked into filtered views** even though they're excluded
+  from every count and every finding.
+- **The table opened best-first**, putting the single worst plugin — the reason
+  the product exists — at the bottom of the list, below the fold. It now opens
+  worst-first.
+- **Every click threw you back to the top of the page.** Filtering, muting,
+  enabling and disabling all rebuilt the whole view. They now update in place,
+  keeping your scroll position and keyboard focus.
+- **Muting a plugin could trigger a multi-megabyte download.** Single-plugin and
+  bulk actions no longer touch the network at all.
+- Column headers and plugin names are now real buttons — the table was
+  mouse-only.
+
+### New
+
+- **"Since you last looked."** FlowKit now remembers what changed between
+  visits — a plugin that started throwing errors, was pulled from the directory,
+  or went back to normal — and leads with it. Previously it computed exactly
+  this, showed a toast, and forgot it.
+- **Copy bug report.** One click turns a plugin's recorded errors into a
+  paste-ready issue: versions, platform, and each distinct error with counts and
+  recency. Stack traces included with Pro.
+- **Copy summary**, and **Markdown export is now free and unlimited** (CSV stays
+  Pro). It was rationed to one per install, which is a strange thing to do to
+  the only artefact that carries your name outward.
+- **The all-clear screen is designed.** A vault with nothing wrong used to show
+  four green words; it now states what was checked and found clean.
+- The header says **how old the community data is** — the normal case was
+  reading day-old numbers under a green "Online" label.
+
+### Changed
+
+- The hero loses its 116px ring, which drew one number four different ways and
+  could collapse into a giant "—". The score and grade stay, plus the worst
+  plugin by name — an average hides the one plugin you actually need to see.
+- Stat tiles are one line instead of four cards.
+- Healthy metrics recede; only exceptions carry colour. A row with one problem
+  now shows one coloured chip instead of seven competing ones.
+- **Popularity is no longer painted on the health scale.** Its own tooltip calls
+  it "context, not health", but a good niche plugin still showed red for being
+  niche.
+- Good state is silent: no more "Maintained" badge on every healthy row.
+- The locked bulk-fix button now shows you the exact set it would change, with
+  evidence, before anything mentions money.
+
 ## [1.1.0] - 2026-08-03
 
 ### Errors, traced back to the plugin that caused them

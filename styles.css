@@ -417,8 +417,29 @@
   gap: 6px;
   flex-wrap: wrap;
 }
+/* The disclosure control for the row. Styled as text, because it is the
+   plugin's name — but it is a real button, so it is reachable and announced. */
 .flowkit-plugin-name {
   font-weight: 600;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  padding: 0;
+  margin: 0;
+  height: auto;
+  font-size: inherit;
+  font-family: inherit;
+  color: var(--text-normal);
+  text-align: left;
+  cursor: pointer;
+}
+.flowkit-plugin-name:hover {
+  text-decoration: underline;
+}
+.flowkit-plugin-name:focus-visible {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: 2px;
+  border-radius: 3px;
 }
 .flowkit-plugin-meta {
   font-size: 0.82em;
@@ -1167,4 +1188,42 @@
   font-size: 0.85em;
   color: var(--text-muted);
   line-height: 1.6;
+}
+
+/* Healthy supporting metrics recede. Seven equally-loud coloured pills per row
+   meant nothing stood out; a row with one problem should show one problem. */
+.flowkit-chip.is-quiet {
+  background: transparent;
+  border-color: var(--background-modifier-border);
+  color: var(--text-muted);
+  font-weight: 500;
+}
+.flowkit-health-table tbody tr:hover .flowkit-chip.is-quiet {
+  border-color: color-mix(in srgb, var(--color-green, #2e7d32) 35%, transparent);
+  color: var(--text-normal);
+}
+
+/* Sortable column headers are real buttons, so they are keyboard-reachable. */
+.flowkit-sort-btn {
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  padding: 0;
+  margin: 0;
+  height: auto;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+.flowkit-health-table th.num .flowkit-sort-btn {
+  width: 100%;
+  text-align: center;
+}
+.flowkit-sort-btn:hover {
+  color: var(--text-normal);
+}
+.flowkit-sort-btn:focus-visible {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: 2px;
+  border-radius: 3px;
 }

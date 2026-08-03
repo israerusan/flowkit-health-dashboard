@@ -989,15 +989,40 @@ export class HealthDashboardView extends ItemView {
         btn.setText(ins.actionLabel ?? "Apply");
         btn.onclick = () => this.runBulk(ins);
       } else {
-        // Shown, not hidden: the user should be able to see the capability they
-        // would be buying, on their own vault's numbers.
+        // Shown, not hidden: the user should see the capability they would be
+        // buying, on their own vault's numbers — and pressing it shows them the
+        // exact set it would act on before anything mentions money. Bouncing
+        // straight to a checkout page from a button the user pressed to find
+        // out what it does is the interaction most likely to end in an
+        // uninstall.
         btn.addClass("is-locked");
         setIcon(btn.createSpan({ cls: "flowkit-lock-icon" }), "lock");
         btn.createSpan({ text: ` ${ins.actionLabel ?? "Apply"}` });
-        btn.setAttr("aria-label", `${ins.actionLabel ?? "Apply"} — a Pro feature`);
-        btn.onclick = () => this.openUpgrade("bulk");
+        btn.setAttr("aria-label", `${ins.actionLabel ?? "Apply"} — preview what Pro would change`);
+        btn.onclick = () => this.previewBulk(ins);
       }
     }
+  }
+
+  /** For free users: the same review screen, ending in the offer rather than the act. */
+  private previewBulk(ins: Insight): void {
+    const affected = this.results.filter((r) => ins.ids.includes(r.id));
+    const disabling = ins.action !== "mute-sideloaded";
+    const rows = disabling ? affected.filter((r) => r.enabled) : affected.filter((r) => !r.muted);
+    if (!rows.length) {
+      new Notice("Nothing to change — those plugins are already in that state.");
+      return;
+    }
+    new BulkConfirmModal(this.app, {
+      title: disabling ? "Pro would disable these" : "Pro would mute these",
+      intro: `These are the ${rows.length} plugin${rows.length === 1 ? "" : "s"} this fix would change, with the evidence for each. Pro applies it in one click, with undo.`,
+      rows: rows.map((r) => ({
+        name: r.name,
+        detail: this.bulkReason(r, ins.action ?? "disable-incompatible"),
+      })),
+      confirmLabel: `See Pro — ${PRO_PRICE}`,
+      onConfirm: () => this.openUpgrade("bulk"),
+    }).open();
   }
 
   /** Show what a bulk action will do, then do it — and keep a way back. */
@@ -1491,18 +1516,25 @@ export class HealthDashboardView extends ItemView {
   ): void {
     const th = tr.createEl("th", { cls: num ? "num sortable" : "sortable" });
     th.setAttr("scope", "col");
+    // The header sorts, so it must be a control — it was a bare <th> with an
+    // onclick, reachable only by mouse.
+    th.setAttr(
+      "aria-sort",
+      this.sortKey === key ? (this.sortDir === 1 ? "ascending" : "descending") : "none"
+    );
+    const btn = th.createEl("button", { cls: "flowkit-sort-btn", text: label });
     if (hint) {
-      th.setAttr("title", hint);
-      th.setAttr("aria-label", `${label} — ${hint}`);
+      btn.setAttr("title", hint);
+      btn.setAttr("aria-label", `${label} — ${hint}. Sort by this.`);
     }
-    th.createSpan({ text: label });
+    btn.onclick = () => this.toggleSort(key);
     if (this.sortKey === key) {
-      th.createSpan({
+      // Inside the button, so the arrow isn't announced as separate content.
+      btn.createSpan({
         cls: "flowkit-sort-arrow",
         text: this.sortDir === -1 ? " ▼" : " ▲",
       });
     }
-    th.onclick = () => this.toggleSort(key);
   }
 
   private renderRow(tbody: HTMLElement, r: PluginHealth): void {
@@ -1513,33 +1545,41 @@ export class HealthDashboardView extends ItemView {
     const expanded = this.expandedId === r.id;
     if (expanded) tr.addClass("is-expanded");
     tr.dataset.pluginId = r.id;
-    // Operable by keyboard, and announced as the disclosure control it is.
-    tr.setAttr("tabindex", "0");
-    tr.setAttr("role", "button");
-    tr.setAttr("aria-expanded", String(expanded));
-    tr.setAttr("aria-label", `${r.name} — show why it scores ${r.overall ?? "unknown"}`);
     const toggle = () => {
       this.expandedId = expanded ? null : r.id;
       this.renderRows();
     };
+    // A convenience target for the mouse only. The row is NOT given
+    // role="button": a button containing its own buttons and a ⋮ menu is a
+    // nested-interactive trap, and screen readers would announce the whole row
+    // as one control. The real control is the plugin name below.
     tr.onclick = (evt) => {
-      // Don't hijack the row menu button or the panel's own controls.
       if ((evt.target as HTMLElement).closest("button")) return;
-      toggle();
-    };
-    tr.onkeydown = (evt) => {
-      if (evt.key !== "Enter" && evt.key !== " ") return;
-      if ((evt.target as HTMLElement) !== tr) return;
-      evt.preventDefault();
       toggle();
     };
 
     const nameCell = tr.createEl("td", { cls: "flowkit-name" });
     const nameRow = nameCell.createDiv({ cls: "flowkit-name-row" });
-    nameRow.createSpan({ cls: "flowkit-plugin-name", text: r.name });
+    const nameBtn = nameRow.createEl("button", {
+      cls: "flowkit-plugin-name",
+      text: r.name,
+    });
+    nameBtn.setAttr("aria-expanded", String(expanded));
+    nameBtn.setAttr(
+      "aria-label",
+      `${r.name}${r.enabled ? "" : ", disabled"}${r.muted ? ", muted" : ""} — scores ${
+        r.overall ?? "unknown"
+      }. Show the reasoning.`
+    );
+    nameBtn.onclick = toggle;
 
+    // Good state is silent. Every healthy row used to carry a "Maintained"
+    // badge, so the badge system marked the normal case and nothing stood out.
+    // "Muted" is gone too — the row is already dimmed for it.
     const status = MAINTENANCE_META[r.maintenanceStatus];
-    this.badge(nameRow, status.label, status.tone, status.hint);
+    if (r.maintenanceStatus === "unmaintained") {
+      this.badge(nameRow, status.label, status.tone, status.hint);
+    }
     if (r.updateAvailable) {
       this.badge(
         nameRow,
@@ -1573,25 +1613,25 @@ export class HealthDashboardView extends ItemView {
         "Not in Obsidian's community list — installed manually or via BRAT, so it skipped community review."
       );
     }
-    if (r.muted) {
-      this.badge(nameRow, "Muted", "unknown", "Excluded from the at-risk counts.");
-    }
-
     const meta = nameCell.createDiv({ cls: "flowkit-plugin-meta" });
-    meta.setText(`${r.author} · v${r.version}${r.enabled ? "" : " · disabled"}`);
+    // Disabled is already carried by the row's own dimming; saying it again in
+    // text encoded one state twice. Muted likewise.
+    meta.setText(`${r.author} · v${r.version}`);
 
-    // Overall is a blend of measured and estimated inputs, so it is never itself
-    // "measured" — claiming so overstated confidence on the headline number.
+    // Overall is a blend, so it isn't "measured" — but marking it `estimated`
+    // put the ~ honesty mark on 100% of rows, which made it mean nothing. Every
+    // metric it blends is now measured; what varies is coverage, and that is
+    // already reported as confidence.
     this.scoreCell(
       tr,
       r.overall,
-      "estimated",
-      "Blended from the five metrics in this row.",
+      "measured",
+      `Weighted blend of the six metrics in this row · ${Math.round(r.confidence * 100)}% of signals available.`,
       "Overall"
     );
     for (const col of METRIC_COLUMNS) {
       const metric = r.metrics[col.key];
-      this.scoreCell(tr, metric.value, metric.source, metric.detail, col.label);
+      this.scoreCell(tr, metric.value, metric.source, metric.detail, col.label, col.key);
     }
 
     const actionCell = tr.createEl("td", { cls: "num flowkit-actions" });
@@ -1666,21 +1706,36 @@ export class HealthDashboardView extends ItemView {
     value: number | null,
     source: MetricScore["source"],
     detail?: string,
-    columnLabel?: string
+    columnLabel?: string,
+    metricKey?: MetricKey
   ): void {
     const td = tr.createEl("td", { cls: "num" });
     // Read by the narrow-width card layout, where the header row is hidden.
     if (columnLabel) td.setAttr("data-label", columnLabel);
-    const tone = band(value);
+    // Popularity is explicitly "context, not health" — in its own tooltip and
+    // in the legend — yet it was painted on the same red/amber/green scale as
+    // compatibility, so a good niche plugin showed a red chip for being niche.
+    const tone: Tone = metricKey === "popularity" ? "unknown" : band(value);
     const chip = td.createSpan({
-      cls: `flowkit-chip tone-${tone} src-${source}`,
+      cls: `flowkit-chip tone-${tone} src-${source}` +
+        // Healthy supporting metrics recede; only exceptions hold colour, so
+        // a row with one problem shows one coloured chip instead of seven.
+        (tone === "good" && metricKey && metricKey !== "compatibility" ? " is-quiet" : ""),
     });
     chip.setText(value == null ? "—" : String(value));
     if (source === "estimated") chip.createSpan({ cls: "flowkit-est", text: "~" });
     // Colour alone carried the good/warn/bad reading, which is invisible to
     // anyone colour-blind and to a screen reader. Name the band in the label.
     const bandWord =
-      tone === "good" ? "good" : tone === "warn" ? "needs a look" : tone === "bad" ? "poor" : "no data";
+      metricKey === "popularity"
+        ? "informational"
+        : tone === "good"
+          ? "good"
+          : tone === "warn"
+            ? "needs a look"
+            : tone === "bad"
+              ? "poor"
+              : "no data";
     const label = detail ? `${bandWord} — ${detail}` : bandWord;
     chip.setAttr("aria-label", label);
     if (detail) chip.setAttr("title", detail);
