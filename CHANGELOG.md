@@ -3,6 +3,129 @@
 All notable changes to FlowKit Plugin Health Dashboard are documented here. This
 project follows [Semantic Versioning](https://semver.org/).
 
+## [1.6.1] - 2026-08-03
+
+1.6.0 was reviewed by five specialists — robustness, performance, maintainability,
+security and UI — each with a skeptic behind it whose only job was to kill its
+findings, plus a critic asked what nobody had looked at. The verdict on 1.6.0 was
+fair and uncomfortable: it had fixed *instances* rather than *classes*. Every
+item in the first section below is the same bug as one 1.6.0 fixed, in the file
+1.6.0 didn't open.
+
+### Starting a second search could destroy the record of your real plugin set
+
+- **A search can no longer be started while one is running.** Nothing prevented
+  it. Starting a second search mid-first captures the *current* enabled set as
+  both the automatic snapshot and the new session's "put it back like this" —
+  and mid-search that set is missing every plugin the first search had switched
+  off. Both records of the real vault were overwritten in the same breath, under
+  a modal that had just promised "your current set is saved first", and nothing
+  else held it. Those plugins were simply orphaned. Switching plugin sets and
+  profiling startup are refused while a search is running too.
+- **Settings → Saved plugin sets → "Clear all" no longer deletes the search's
+  recovery snapshot.** It is an ordinary entry in that list, and it is the only
+  thing the salvage panel can offer when a search record turns out to be
+  unreadable. While a search is open it is now kept, and the description says so.
+
+### The error watcher could keep running after FlowKit was unloaded
+
+The exact defect fixed in the runtime watcher for 1.6.0, in its sibling.
+
+- **A `console.error` wrapper that survives unload is now inert.** FlowKit
+  declines to unhook a global another plugin has since wrapped, because pulling
+  its own layer out would take the other one with it — but the layer left behind
+  still held the watcher, the host, and through the host an unloaded plugin's
+  settings. Every logged error in the vault went on being attributed and written
+  into a dead instance's log, then flushed through a callback that saves
+  `data.json` and asks for a rescan. A disabled plugin quietly kept rewriting
+  its own settings file.
+- **The wrapper is removed by identity, not by the marker every FlowKit wrapper
+  carries** — so one instance can't restore over another's live wrapper.
+- **Restoring hands back the original, not a bound copy of it**, which had been
+  laminating another `.bind` onto a global on every disable/enable cycle.
+- **The detached repository lookups stop at unload.** Up to six sequential
+  network calls, each with its own timeout, easily outlive a disable — and they
+  finished by writing settings and asking every view to rescan.
+
+### Failures on the paid path, and other things that vanished
+
+- **A licence key that can't be saved now says so.** The Activate button's
+  promise had no rejection handler, so on a read-only or sync-locked vault the
+  click produced nothing at all: no notice, no status text, not even a console
+  line. Somebody who had just paid clicked it twice and got silence. Enter now
+  activates too, and the status line is announced.
+- **A failed Obsidian-version check no longer cancels the startup scan.**
+
+### Error text that leaves this machine is redacted
+
+- **File names and note titles are stripped from the issue search and the
+  clipboard bug report.** The old rules stripped *absolute* paths, and every path
+  Obsidian handles is vault-relative — so `Patients/Alice Nguyen HIV results.md`
+  and `[[Divorce settlement draft]]` went out whole, one to GitHub's search API
+  and one into a report the product tells you to paste into a stranger's issue
+  tracker. In a note-taking app the file name is the content. Ordinary error
+  messages are left untouched, so searches still match; the report now says what
+  it redacted.
+
+### Two shortcuts on the same key, reported as no conflict at all
+
+- **`Mod` is resolved to what it actually means before chords are compared.**
+  Obsidian's `Mod` is an alias — Ctrl on Windows and Linux, Meta on macOS — and
+  it was compared verbatim, so a plugin binding `Mod+T` and one binding `Ctrl+T`
+  were treated as two different chords and produced *no* conflict. On Windows
+  they are the same keystroke and one of them silently never fires, which is the
+  single case this feature exists to find. Every existing test used `Mod` on both
+  sides, so the suite could not see it.
+
+### Numbers and copy that disagreed with themselves
+
+- **"Profile the other 12" profiles those 12.** The count excluded muted and
+  already-measured plugins; the button passed every enabled one. It opened a
+  modal saying "Profile 38 plugins?" and then restarted all 38.
+- **A finished search that could not put your plugins back keeps the page.**
+  Every guard released the instant a search reached "done", including on the
+  path where the restore failed — so the full report rendered over a vault still
+  missing plugins, and the trend chart and change log recorded it. The result
+  sentence no longer says "everything else is back on" directly above the box
+  explaining that it isn't.
+- **The trend history is sorted before it is used.** Two things depended on it
+  being chronological — the same-day replace reads the last entry, the cap trims
+  the front — and one out-of-order entry from a sync merge made every later
+  reading append instead of replace, then start discarding the newest.
+- **Dismissing the Obsidian-update banner no longer marks your unread changes as
+  seen.** Both × buttons wrote the same timestamp, and the change log is read in
+  exactly one place, so they never came back.
+- **The hero stops telling you to enable a setting that is already on**, directly
+  above the notice explaining that GitHub couldn't be reached.
+- **The trend panel stops promising a chart "from tomorrow"** to someone with
+  enrichment off, for whom no reading will ever be plottable. It says why, and
+  what to change.
+- **CSV cells beginning `=`, `+`, `-` or `@` are defanged** so a spreadsheet
+  doesn't execute a plugin's manifest field as a formula.
+- **Undo works on the last answer too.** 1.6.0 added it to every round except the
+  one that produces the accusation — the answer given after the longest wait, on
+  the smallest difference, and the only one whose mistake has a name attached.
+
+### Tests
+
+Redaction is tested from both directions: six messages carrying private paths
+must not leak, five ordinary errors must survive verbatim or the search stops
+working. The error watcher now has the inertness and bind-lamination tests its
+sibling got. Conflicts are tested with the two spellings of the same chord, on
+both platforms. And a two-line contract test asserts `PRODUCT_ID` equals
+`manifest.id` — they are the same today, they are used interchangeably, and if
+they ever diverge FlowKit attributes every timer and every logged error in the
+vault to itself.
+
+### Known, not fixed
+
+`data.json` can be synced between devices while the installed plugins are not —
+a supported Obsidian configuration. `pruneStores` and `recordEvents` both assume
+"not installed here" means "gone", so two devices with different plugin sets will
+take turns deleting each other's stored readings and writing a flip-flopping
+install/uninstall timeline. It needs a design, not a patch, and it is the most
+likely place for the next serious bug in this codebase.
+
 ## [1.6.0] - 2026-08-03
 
 An adversarial-review release. Two outside models were asked to attack the

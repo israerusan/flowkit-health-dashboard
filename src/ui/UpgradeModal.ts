@@ -60,17 +60,46 @@ export class UpgradeModal extends Modal {
     });
     const apply = keyRow.createEl("button", { text: "Activate" });
     const status = contentEl.createDiv({ cls: "flowkit-upgrade-status" });
-    apply.addEventListener("click", () => {
+    // Announced: this div is the only feedback a rejected key produces, and it
+    // appears by being written into rather than by anything moving.
+    status.setAttr("role", "status");
+    status.setAttr("aria-live", "polite");
+
+    const activate = (): void => {
       const key = input.value.trim();
       if (!key) return;
-      void this.ctx.activate(key).then((ok) => {
-        if (ok) {
-          new Notice(`${PRO_NAME} activated. Thank you!`);
-          this.close();
-        } else {
-          status.setText("That key didn't verify. Check it was copied in full.");
-        }
-      });
+      // The `.catch` is the point. `activate` awaits `saveSettings()`, which
+      // genuinely rejects on a read-only or sync-locked vault — and without a
+      // handler the `.then` simply never ran: no notice, no status text, not
+      // even a console line. Somebody who had just paid clicked Activate and
+      // got nothing at all, twice, with no way to tell whether the key was bad
+      // or the disk was. This is the last screen before a refund request.
+      void this.ctx
+        .activate(key)
+        .then((ok) => {
+          if (ok) {
+            new Notice(`${PRO_NAME} activated. Thank you!`);
+            this.close();
+          } else {
+            status.setText("That key didn't verify. Check it was copied in full.");
+          }
+        })
+        .catch((err) => {
+          console.error("FlowKit: could not activate the licence key", err);
+          status.setText(
+            "Your key couldn't be saved — FlowKit can't write its settings file right now. " +
+              "The key itself may well be fine; try again, or restart Obsidian."
+          );
+        });
+    };
+
+    apply.addEventListener("click", activate);
+    // Pasting a key and pressing Enter is what everybody does.
+    input.addEventListener("keydown", (evt) => {
+      if (evt.key === "Enter") {
+        evt.preventDefault();
+        activate();
+      }
     });
 
     const actions = contentEl.createDiv({ cls: "flowkit-upgrade-actions" });

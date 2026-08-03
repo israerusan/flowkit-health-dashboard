@@ -358,14 +358,39 @@ export default class FlowKitHealthPlugin extends Plugin {
     }
 
     this.app.workspace.onLayoutReady(() => {
-      void this.checkAppVersion().then(() => this.backgroundScan());
+      // The catch matters more for what it lets through than for what it logs:
+      // without it a rejected version check skipped the startup scan entirely
+      // and escaped as an unhandled rejection. The scan is the part the user
+      // notices, so it runs either way.
+      void this.checkAppVersion()
+        .catch((err) => {
+          console.error("FlowKit: could not check the Obsidian version", err);
+        })
+        .then(() => this.backgroundScan());
     });
     this.registerInterval(
       window.setInterval(() => void this.backgroundScan(), MONITOR_INTERVAL_MS)
     );
   }
 
+  /**
+   * Set once Obsidian has torn this instance down.
+   *
+   * Read by the detached work that can still be in flight at that moment —
+   * the repository lookups, which are up to six sequential network calls with
+   * their own timeouts and can easily outlive a disable by half a minute. They
+   * finished by writing settings and asking every view to rescan, on behalf of
+   * a plugin that no longer exists.
+   *
+   * Deliberately NOT checked inside `saveSettings`. The settings tab flushes a
+   * debounced licence write when it closes, which can legitimately land just
+   * after a disable, and silently dropping the key somebody has just paid for
+   * would be a worse bug than the one this fixes.
+   */
+  private unloaded = false;
+
   onunload(): void {
+    this.unloaded = true;
     // Leaves of our view type are detached automatically by Obsidian, and the
     // error listeners went through registerDomEvent — but console.error,
     // setInterval and the plugin loader were monkey-patched, so those have to
@@ -430,7 +455,10 @@ export default class FlowKitHealthPlugin extends Plugin {
   recentAppUpdate(): typeof this.settings.appVersionChange {
     const change = this.settings.appVersionChange;
     if (!change) return null;
-    const seen = this.settings.lastSeenChangeAt ?? 0;
+    // Its own timestamp — see `appUpdateSeenAt`. Sharing `lastSeenChangeAt`
+    // meant dismissing this banner also silently swallowed the unread changes
+    // strip beside it.
+    const seen = this.settings.appUpdateSeenAt ?? 0;
     return change.at > seen ? change : null;
   }
 
@@ -605,6 +633,23 @@ export default class FlowKitHealthPlugin extends Plugin {
     return state != null && !state.done;
   }
 
+  /**
+   * The vault is not the user's own, whatever the search thinks it is doing.
+   *
+   * `bisectInProgress` goes false the instant a search reaches `done`, and
+   * every guard keyed on it releases together — which is right when the search
+   * finished cleanly and wrong on the one path where it didn't. `finishBisect`
+   * and `cancelBisect` deliberately leave the session on disk when a plugin
+   * refuses to switch back on, precisely because the vault is still missing
+   * plugins; but the moment `done` was set, the dashboard stopped treating the
+   * search as owning the page, and the trend chart and the change log both
+   * started recording a vault FlowKit had just written down that it could not
+   * put back.
+   */
+  private vaultUnrestored(): boolean {
+    return this.settings.bisect != null && this.bisectError != null;
+  }
+
   /** Depth of FlowKit-initiated plugin toggling currently in flight. */
   private vaultMutationDepth = 0;
 
@@ -632,7 +677,14 @@ export default class FlowKitHealthPlugin extends Plugin {
 
   /** Whether this scan should keep its observations out of the history. */
   recordingSuspended(): boolean {
-    return this.bisectInProgress() || this.vaultMutationDepth > 0;
+    return (
+      this.bisectInProgress() || this.vaultUnrestored() || this.vaultMutationDepth > 0
+    );
+  }
+
+  /** Whether the dashboard should still be showing the search rather than a report. */
+  bisectOwnsPage(): boolean {
+    return this.bisectInProgress() || this.vaultUnrestored();
   }
 
   async diffChanges(
@@ -694,6 +746,12 @@ export default class FlowKitHealthPlugin extends Plugin {
   /** Mark the "since you last looked" strip as read. */
   async markChangesSeen(): Promise<void> {
     this.settings.lastSeenChangeAt = Date.now();
+    await this.saveSettings();
+  }
+
+  /** Acknowledge the Obsidian-update banner, and only that. */
+  async markAppUpdateSeen(): Promise<void> {
+    this.settings.appUpdateSeenAt = Date.now();
     await this.saveSettings();
   }
 
@@ -1283,10 +1341,16 @@ export default class FlowKitHealthPlugin extends Plugin {
     // Sequential on purpose: six parallel requests to one API is how a soft
     // rate limit becomes a hard one, and nothing here is time-critical.
     for (const id of wanted) {
+      // Six calls with 10s timeouts each easily outlive a disable. Stop at the
+      // boundary rather than mid-write.
+      if (this.unloaded) return;
       const repo = byId.get(id)?.repo;
       if (!repo) continue;
       fetched[id] = await fetchRepoActivity(repo, now);
     }
+    // Checked again after the last await: everything below writes settings and
+    // asks every view to rescan, and by now this instance may be gone.
+    if (this.unloaded) return;
     // Merged into whatever the map is NOW, not into the copy taken before these
     // requests went out. Each of them takes seconds; a scan finishing in the
     // meantime prunes the entries for plugins that have since been uninstalled,
@@ -1333,6 +1397,9 @@ export default class FlowKitHealthPlugin extends Plugin {
       customKeys: internals.hotkeyManager?.customKeys ?? {},
       installed,
       names,
+      // `Mod` is an alias, and which key it aliases decides whether two
+      // bindings are the same physical chord.
+      mod: Platform.isMacOS ? "Meta" : "Ctrl",
     });
   }
 
@@ -1382,6 +1449,11 @@ export default class FlowKitHealthPlugin extends Plugin {
   }
 
   async startBisect(candidates: string[], symptom?: string): Promise<BisectState | null> {
+    // Enforced here as well as in the view, for the same reason FlowKit's own
+    // id is filtered here rather than at the call site: everything below
+    // overwrites the only two records of what the vault really looks like, so
+    // no future caller may be able to reach it with a search already open.
+    if (this.settings.bisect) return null;
     if (!this.canPersist) {
       new Notice(
         "FlowKit can't start a search while it can't save: the record of which plugins to " +
@@ -2078,7 +2150,14 @@ export default class FlowKitHealthPlugin extends Plugin {
     // appended to. Enforced here rather than at the two call sites, so the next
     // thing that records a snapshot cannot forget.
     if (this.recordingSuspended()) return;
-    const history = this.settings.history.slice();
+    // Sorted, for the same reason `previousSnapshot` sorts and says why:
+    // history survives in data.json across syncs and hand edits, so insertion
+    // order is not chronological order. Both things below depend on it being
+    // chronological — the same-day dedup reads the LAST entry, and the cap
+    // trims from the FRONT — so one out-of-order tail from a sync merge and
+    // today's reading is compared against a stale entry, appended instead of
+    // replaced, and the cap then starts discarding the newest readings.
+    const history = this.settings.history.slice().sort((a, b) => a.at - b.at);
     const last = history[history.length - 1];
     if (last && sameDay(last.at, snapshot.at)) {
       // Never let a degraded offline reading overwrite a full one from the same

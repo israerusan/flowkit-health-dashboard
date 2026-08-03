@@ -35,4 +35,25 @@ assert.ok(/^\d+\.\d+\.\d+$/.test(manifest.version), "manifest.version must be x.
 assert.equal(manifest.version, pkg.version, "manifest.json and package.json versions must match");
 assert.ok(versions[manifest.version], `versions.json must contain an entry for ${manifest.version}`);
 
+// --- PRODUCT_ID is also the plugin's own id ----------------------------------
+// `PRODUCT_ID` in src/product.ts is the licence-signing identity, and it is ALSO
+// the sole source of the "skip FlowKit's own frames" set in both watchers
+// (runtimeWatcher.ts, errorWatcher.ts) — while the same concept everywhere else
+// reads `this.manifest.id`. They are identical today and nothing is broken.
+//
+// But rotating a signed product id is a real operation in this portfolio (it has
+// been done once already, to move one plugin off another's key), and if these two
+// ever diverge the failure is silent and total: `attributeStack` stops skipping
+// FlowKit's own frames, so every timer and every logged error in the vault is
+// attributed to FlowKit and no other plugin is ever measured again. Two lines to
+// make that a failed build instead.
+const product = fs.readFileSync(path.join(root, "src", "product.ts"), "utf8");
+const declared = /export const PRODUCT_ID = "([^"]+)"/.exec(product);
+assert.ok(declared, "src/product.ts must declare PRODUCT_ID as a string literal");
+assert.equal(
+	declared[1],
+	manifest.id,
+	"PRODUCT_ID must equal manifest.id — both watchers use it to recognise FlowKit's own stack frames"
+);
+
 console.log("manifest contract tests passed");

@@ -26,24 +26,78 @@ export type IssueSearchOutcome =
 
 const TIMEOUT_MS = 10_000;
 
+/** What replaces anything that could name a note or a folder. */
+const REDACTED = "…";
+
+/**
+ * Remove anything from error text that could name the user's own content.
+ *
+ * Error messages routinely quote the file being touched, and in a note-taking
+ * app the FILE NAME IS THE CONTENT: "Patients/Alice Nguyen HIV results.md" and
+ * "[[Divorce settlement draft]]" are not incidental detail, they are the most
+ * sensitive strings on the machine. This text goes two places that leave it —
+ * a GitHub search URL, and a clipboard bug report the product tells the user to
+ * paste into somebody's issue tracker — so it is redacted before either.
+ *
+ * The rules that were here stripped absolute paths (`/Users/x/…`, `C:\…`) and
+ * stopped, which is exactly backwards for Obsidian: every path this app handles
+ * is vault-RELATIVE. `Patients/Alice Nguyen HIV results.md` survived all seven
+ * replaces intact.
+ *
+ * Deliberately aggressive. A search that misses a thread costs the user a
+ * click; a search that quietly puts a note title in somebody's server log
+ * cannot be undone.
+ */
+export function redactUserContent(text: string): string {
+  return (
+    text
+      .replace(/https?:\/\/\S+/g, REDACTED)
+      // Windows absolute paths.
+      .replace(/[A-Za-z]:\\[^\s"']+/g, REDACTED)
+      // Wiki links — the note title is the entire payload.
+      .replace(/\[\[[^\]]*\]\]/g, REDACTED)
+      // Vault-relative paths, which is what Obsidian actually deals in. The
+      // segment before the first slash may not contain spaces, so this cannot
+      // run backwards through the sentence the path is quoted in and swallow
+      // the error text itself — the ordinary messages that make a search worth
+      // running survive this rule untouched. Later segments may contain
+      // spaces, because note names do.
+      .replace(/[\w.\-()']+(?:\/[\w.\-()' ]*)+/g, REDACTED)
+      // POSIX absolute paths, AFTER the relative rule: run first, this matches
+      // from the leading slash and leaves the top folder name — "Patients" —
+      // sitting in the output, which is often the sensitive part.
+      .replace(/~?\/[\w.\-()' /]+/g, REDACTED)
+      // A bare file name with no folder in front of it. Bounded at five
+      // preceding words: a name can contain spaces and there is no way to know
+      // where it starts, so this errs towards taking too much. Losing a few
+      // words of an error message costs the user a search result; keeping a few
+      // words of a note title cannot be taken back.
+      .replace(
+        /(?:[\w.\-()']+ ){0,5}[\w.\-()']*\.(?:md|canvas|base|pdf|png|jpe?g|gif|webp|mp[34]|mov|docx?|xlsx?)\b/gi,
+        REDACTED
+      )
+      .replace(/\s+/g, " ")
+      .trim()
+  );
+}
+
 /**
  * Reduce an error message to something worth searching for.
  *
- * Paths, ids, hex and numbers are stripped: they are the parts unique to this
- * one machine, and leaving them in guarantees zero results from a search that
- * would otherwise have found the thread immediately.
+ * Everything that could name the user's own notes is redacted first; what is
+ * left is stripped of the parts unique to this one machine (hex, ids, numbers),
+ * because leaving those in guarantees zero results from a search that would
+ * otherwise have found the thread immediately.
  */
 export function searchTerms(message: string): string {
-  return message
-    .replace(/https?:\/\/\S+/g, " ")
-    .replace(/[A-Za-z]:\\[^\s"']+/g, " ")
-    .replace(/\/[\w.-]+\/[^\s"']+/g, " ")
+  return redactUserContent(message)
     .replace(/0x[0-9a-f]+/gi, " ")
     .replace(/\b\d[\w-]*\b/g, " ")
-    .replace(/["'`]/g, " ")
+    .replace(/["'`…]/g, " ")
     .replace(/\s+/g, " ")
     .trim()
     .split(" ")
+    .filter(Boolean)
     .slice(0, 12)
     .join(" ");
 }

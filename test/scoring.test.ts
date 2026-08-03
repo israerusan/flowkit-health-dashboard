@@ -67,7 +67,7 @@ import {
   saveProfile,
   type PluginProfile,
 } from "../src/profiles";
-import { searchTerms } from "../src/issueSearch";
+import { redactUserContent, searchTerms } from "../src/issueSearch";
 import { tickScore } from "../src/runtime";
 
 const DAY = 86_400_000;
@@ -1037,6 +1037,54 @@ eq("prerelease vs prerelease", compareVersion("1.0.0-alpha", "1.0.0-beta"), -1);
   );
 }
 
+// --- redaction: what leaves the machine --------------------------------------
+//
+// Two paths carry error text off this device: the GitHub issue search, and the
+// clipboard bug report the product tells the user to paste into somebody else's
+// issue tracker. In a note-taking app the FILE NAME IS THE CONTENT, and the old
+// rules only stripped ABSOLUTE paths — while every path Obsidian handles is
+// vault-relative, so a note title went out whole.
+{
+  const leaks = [
+    "ENOENT: no such file or directory, open 'Patients/Alice Nguyen HIV results.md'",
+    "Cannot read properties of undefined reading 'x' at Journal/2026/Therapy notes.md",
+    "failed to parse [[Divorce settlement draft]] in Legal/private.md",
+    "ENOENT open '/Users/someone/vault/Secret/thing.md'",
+    "EPERM operation not permitted, rename 'C:\\Users\\me\\Vault\\Taxes 2025.md'",
+    "Could not open Therapy notes.md",
+  ];
+  const forbidden = /Patients|Alice|Nguyen|Therapy|Divorce|Secret|Legal|Taxes|someone/i;
+  for (const message of leaks) {
+    check(
+      `redaction removes the private part of: ${message.slice(0, 40)}…`,
+      !forbidden.test(redactUserContent(message)),
+      `got ${redactUserContent(message)}`
+    );
+    check(
+      `…and so does the search query for: ${message.slice(0, 40)}…`,
+      !forbidden.test(searchTerms(message)),
+      `got ${searchTerms(message)}`
+    );
+  }
+
+  // Over-redaction would be its own failure: a search that matches nothing is a
+  // feature that does nothing. Ordinary error text has to survive intact.
+  const keep = [
+    "Cannot read properties of null (reading 'getBoundingClientRect')",
+    "TypeError: t.getFileCache is not a function",
+    "Templater Error: Template parsing error, aborting. ReferenceError: tp is not defined",
+    "Uncaught TypeError: Cannot read property 'children' of undefined",
+    "Dataview: Every date literal must be surrounded by parens",
+  ];
+  for (const message of keep) {
+    eq(`ordinary error text is untouched: ${message.slice(0, 34)}…`, redactUserContent(message), message);
+  }
+  check(
+    "and still yields searchable terms",
+    searchTerms(keep[1]).includes("getFileCache")
+  );
+}
+
 // --- conflicts ---------------------------------------------------------------
 {
   const installed = new Set(["alpha", "beta"]);
@@ -1047,8 +1095,57 @@ eq("prerelease vs prerelease", compareVersion("1.0.0-alpha", "1.0.0-beta"), -1);
     hotkeys,
   });
 
-  eq("chords print canonically", printChord({ modifiers: ["Shift", "Mod"], key: "t" }), "Mod+Shift+T");
+  eq("chords print canonically", printChord({ modifiers: ["Shift", "Mod"], key: "t" }), "Ctrl+Shift+T");
   eq("a chord with no key is nothing", printChord({ modifiers: ["Mod"] }), null);
+
+  // `Mod` is a platform ALIAS — Ctrl on Windows/Linux, Meta on macOS — and it
+  // was printed verbatim, so `Mod+T` and `Ctrl+T` were two different chords and
+  // two plugins bound to the same physical keystroke produced no conflict at
+  // all. That is the exact failure this file exists to detect, and every test
+  // here used `Mod` on both sides, so the suite could not see it.
+  eq("Mod resolves to Ctrl off macOS", printChord({ modifiers: ["Mod"], key: "t" }), "Ctrl+T");
+  eq("and to Meta on macOS", printChord({ modifiers: ["Mod"], key: "t" }, "Meta"), "Meta+T");
+  eq(
+    "so the two spellings are the same chord",
+    printChord({ modifiers: ["Mod"], key: "t" }),
+    printChord({ modifiers: ["Ctrl"], key: "t" })
+  );
+  eq(
+    "and a redundant Mod+Ctrl doesn't print twice",
+    printChord({ modifiers: ["Mod", "Ctrl"], key: "t" }),
+    "Ctrl+T"
+  );
+  {
+    const mixed = findConflicts({
+      commands: [
+        cmd("alpha:go", "Go A", [{ modifiers: ["Mod"], key: "T" }]),
+        cmd("beta:go", "Go B", [{ modifiers: ["Ctrl"], key: "T" }]),
+      ],
+      customKeys: {},
+      installed,
+      names,
+    });
+    eq(
+      "two plugins on the same physical chord, spelled differently, clash",
+      mixed.filter((c) => c.kind === "hotkey").length,
+      1
+    );
+    const mac = findConflicts({
+      commands: [
+        cmd("alpha:go", "Go A", [{ modifiers: ["Mod"], key: "T" }]),
+        cmd("beta:go", "Go B", [{ modifiers: ["Ctrl"], key: "T" }]),
+      ],
+      customKeys: {},
+      installed,
+      names,
+      mod: "Meta",
+    });
+    eq(
+      "…and on macOS, where Mod is Meta, they genuinely do not",
+      mac.filter((c) => c.kind === "hotkey").length,
+      0
+    );
+  }
 
   {
     const found = findConflicts({

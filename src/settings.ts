@@ -3,7 +3,7 @@ import type FlowKitHealthPlugin from "./main";
 import type { BisectState } from "./bisect";
 import type { MuteMap } from "./mutes";
 import { describeMute } from "./mutes";
-import type { PluginProfile } from "./profiles";
+import { AUTO_SNAPSHOT, type PluginProfile } from "./profiles";
 import type { PluginEvent, SeenMap } from "./timeline";
 import type { RepoActivityMap } from "./repoActivity";
 import type { RuntimeProfiles } from "./runtime";
@@ -75,6 +75,15 @@ export interface FlowKitHealthSettings {
   changeLog: HealthChange[];
   /** When the user last dismissed the "since you last looked" strip. */
   lastSeenChangeAt: number | null;
+  /**
+   * When the user last dismissed the Obsidian-update banner.
+   *
+   * Its own field. Both dismiss buttons used to write `lastSeenChangeAt`, which
+   * gates the changes strip as well — so closing the update banner silently
+   * marked every unread health change as seen, on the same render, and the
+   * change log is read in exactly one place so they never came back.
+   */
+  appUpdateSeenAt: number | null;
   /**
    * Whether the change baseline has been taken. The first scan after install or
    * upgrade records what is already wrong without reporting it as news.
@@ -156,6 +165,7 @@ export const DEFAULT_SETTINGS: FlowKitHealthSettings = {
   notified: {},
   changeLog: [],
   lastSeenChangeAt: null,
+  appUpdateSeenAt: null,
   changeBaselineSet: false,
   trackErrors: true,
   trackConsoleErrors: true,
@@ -401,11 +411,22 @@ export class FlowKitHealthSettingTab extends PluginSettingTab {
     new Setting(containerEl).setName("Saved plugin sets").setHeading();
 
     const profiles = this.plugin.settings.profiles;
+    // The automatic pre-search snapshot is an ordinary entry in this array, and
+    // it is the ONLY thing the salvage panel can offer when a persisted search
+    // turns out to be unreadable. "Clear all" deleted it like any other set,
+    // with no warning, while a search might have half the vault switched off —
+    // the same way to lose the record of the real plugin set that starting a
+    // second search used to be, reached from a different button.
+    const searchOpen = this.plugin.bisect != null || this.plugin.bisectSalvage != null;
     new Setting(containerEl)
       .setName("Profiles")
       .setDesc(
         profiles.length
-          ? `${profiles.length} saved. Switching between them from the dashboard turns the right plugins on and the rest off — the one thing here that genuinely can't be done by hand in half a minute.`
+          ? `${profiles.length} saved. Switching between them from the dashboard turns the right plugins on and the rest off — the one thing here that genuinely can't be done by hand in half a minute.${
+              searchOpen
+                ? ` A plugin search is open, so “${AUTO_SNAPSHOT}” is kept — it is how your vault gets put back.`
+                : ""
+            }`
           : "None yet. Save your current set from the dashboard, so there is always a recorded way back."
       )
       .addButton((btn) =>
@@ -413,7 +434,9 @@ export class FlowKitHealthSettingTab extends PluginSettingTab {
           .setButtonText("Clear all")
           .setDisabled(profiles.length === 0)
           .onClick(async () => {
-            this.plugin.settings.profiles = [];
+            this.plugin.settings.profiles = searchOpen
+              ? profiles.filter((p) => p.name === AUTO_SNAPSHOT)
+              : [];
             await this.plugin.saveSettings();
             this.display();
           })

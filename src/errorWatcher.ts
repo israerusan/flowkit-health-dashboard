@@ -46,8 +46,23 @@ export interface ErrorWatcherHost {
  */
 export class ErrorWatcher {
   private originalConsoleError: ConsoleErrorFn | null = null;
+  /** The exact function we installed, so we only ever remove our own. */
+  private myWrapper: ConsoleErrorFn | null = null;
   /** Guards against an error thrown *by* our handler re-entering it. */
   private handling = false;
+  /**
+   * Set once `stop()` has run.
+   *
+   * `RuntimeWatcher` learned this in 1.6.0 and this class did not, which is the
+   * whole of the bug: a `console.error` wrapper that somebody else has since
+   * wrapped cannot be removed, so it survives unload holding this watcher and,
+   * through the host, the unloaded plugin's settings. Every logged error in the
+   * vault then went on being attributed, written into a dead instance's error
+   * log, and flushed through `onChange()` — which saves `data.json` and asks
+   * for a rescan. A disabled plugin quietly kept rewriting its own settings
+   * file. The wrapper can't be unhooked, so it is made inert instead.
+   */
+  private stopped = false;
   /** Errors seen since the last flush, so a loop doesn't mean a write per iteration. */
   private dirty = false;
   private flushTimer: number | null = null;
@@ -59,6 +74,7 @@ export class ErrorWatcher {
 
   /** Attach the listeners. Safe to call once, from onload. */
   start(captureConsole: boolean): void {
+    this.stopped = false;
     this.plugin.registerDomEvent(window, "error", (evt: ErrorEvent) => {
       this.observe({
         kind: "uncaught",
@@ -90,13 +106,20 @@ export class ErrorWatcher {
    * that is most of the value, so it is worth the monkey-patch.
    */
   private wrapConsole(): void {
-    const original = console.error.bind(console) as ConsoleErrorFn;
-    this.originalConsoleError = original;
+    // Keep the RAW reference for restoring and a bound copy for calling. This
+    // stored the bound copy and restored *that*, so every disable/enable cycle
+    // laminated another `.bind` onto a global other plugins also use — the same
+    // defect `wrapTimers` was fixed for, in the sibling class, and left here.
+    const raw = console.error as ConsoleErrorFn;
+    this.originalConsoleError = raw;
+    const original = raw.bind(console);
 
     const wrapper = ((...args: unknown[]): void => {
       // Always pass through first: whatever we do next must not swallow the
       // user's own console output or the devtools experience.
       original(...args);
+      // Once stopped this is a pass-through and nothing more — see `stopped`.
+      if (this.stopped) return;
       const err = args.find((a): a is Error => a instanceof Error);
       const message = err
         ? err.message
@@ -112,28 +135,41 @@ export class ErrorWatcher {
     }) as ConsoleErrorFn & { [WRAPPED]?: true };
     wrapper[WRAPPED] = true;
 
+    this.myWrapper = wrapper;
     console.error = wrapper;
   }
 
   /** Restore console.error, but only if nobody has wrapped it since we did. */
   stop(): void {
+    // Set FIRST, and before anything is unwrapped: a wrapper that survives this
+    // call must already be inert by the time it can next be entered.
+    this.stopped = true;
     if (this.flushTimer != null) {
       window.clearTimeout(this.flushTimer);
       this.flushTimer = null;
     }
+    // Cleared too, or a flush that has already been armed fires for an
+    // observation that was written before we stopped.
+    this.dirty = false;
     if (!this.originalConsoleError) return;
-    const current = console.error as ConsoleErrorFn & { [WRAPPED]?: true };
-    if (current[WRAPPED]) {
+    // Identity, not the shared `WRAPPED` marker: that marker means "some
+    // FlowKit wrapper", so on the marker alone one instance could restore over
+    // another instance's live wrapper and leave the survivor blind.
+    if (console.error === this.myWrapper) {
       console.error = this.originalConsoleError;
     }
     // If another plugin wrapped console.error after us, restoring would undo
-    // their wrapper too. Leaving ours in place is the lesser harm: it delegates
-    // to the original and only appends to an object we're about to drop.
+    // their wrapper too. Leaving ours in place is the lesser harm — and
+    // `stopped` is what makes that true: the survivor now only calls through.
     this.originalConsoleError = null;
+    this.myWrapper = null;
   }
 
   private observe(partial: Omit<ObservedError, "pluginId" | "at">): void {
-    if (this.handling) return;
+    // The window listeners go through `registerDomEvent` and are removed for
+    // us, but a surviving console wrapper does not — so this is the choke point
+    // that has to refuse.
+    if (this.stopped || this.handling) return;
     this.handling = true;
     try {
       const installed = this.host.installedIds();
@@ -166,10 +202,13 @@ export class ErrorWatcher {
    * of times a second, and each one would otherwise rewrite data.json.
    */
   private scheduleFlush(): void {
-    if (this.flushTimer != null) return;
+    // Belt and braces: nothing should reach here after `stop()`, and arming a
+    // timeout that calls into an unloaded host is the outcome worth ruling out
+    // twice.
+    if (this.stopped || this.flushTimer != null) return;
     this.flushTimer = window.setTimeout(() => {
       this.flushTimer = null;
-      if (!this.dirty) return;
+      if (this.stopped || !this.dirty) return;
       this.dirty = false;
       this.host.onChange();
     }, 5000);

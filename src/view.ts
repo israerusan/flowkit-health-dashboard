@@ -48,7 +48,7 @@ import {
 } from "./bisect";
 import { describeEvent, describeGap } from "./timeline";
 import { AUTO_SNAPSHOT, isNoop, type PluginProfile } from "./profiles";
-import { findKnownIssues } from "./issueSearch";
+import { findKnownIssues, redactUserContent } from "./issueSearch";
 import { BulkConfirmModal } from "./ui/BulkConfirmModal";
 import { BisectStartModal } from "./ui/BisectModal";
 import { MuteModal } from "./ui/MuteModal";
@@ -227,6 +227,16 @@ const GRADE_MIN_CONFIDENCE = 0.6;
  * keystrokes is one rebuild rather than six.
  */
 const SEARCH_DEBOUNCE_MS = 90;
+
+/**
+ * Leading characters that make a spreadsheet read a CSV cell as a formula.
+ *
+ * Every value in the exported CSV is a plugin manifest field, which is
+ * attacker-controlled for anyone who sideloads — and `showDisabled` defaults
+ * on, so a plugin that has never been enabled, and whose code has therefore
+ * never run in the renderer, still reaches that file.
+ */
+const FORMULA_LEAD = /^[=+\-@\t\r]/;
 
 /** What is shown where a grade would be when there isn't the signal for one. */
 const GRADE_WITHHELD: { letter: string; tone: Tone; verdict: string } = {
@@ -829,8 +839,12 @@ export class HealthDashboardView extends ItemView {
     // search is finished the vault is real again, and the user needs the
     // evidence — the culprit's row, its errors, its history — to decide whether
     // to leave it off.
-    const running = this.plugin.bisect;
-    if (running && !running.done) {
+    // …and it keeps owning the page when the search is over but the vault has
+    // not actually been put back. That path sets `bisectError` and leaves the
+    // session on disk on purpose; rendering the full report over it would show
+    // a health score for a vault that is still missing plugins FlowKit has just
+    // said it could not restore, and bury the buttons that retry.
+    if (this.plugin.bisectOwnsPage()) {
       this.renderUnreadable(root);
       this.renderBisect(root);
       this.renderSalvage(root);
@@ -1219,7 +1233,12 @@ export class HealthDashboardView extends ItemView {
     if (watching > 0) parts.push(`watching ${describeWatched(watching)}`);
     text.createEl("p", { cls: "flowkit-hero-sub", text: parts.join(" · ") });
 
-    if (!graded) {
+    // Only advice the reader can act on. This said "turn on online enrichment"
+    // unconditionally — including to somebody who has it on and is offline or
+    // rate-limited, directly above the coverage notice explaining that GitHub
+    // couldn't be reached. When enrichment is already on, that notice owns the
+    // explanation and the Retry button, so say nothing here.
+    if (!graded && this.coverage.disabled) {
       text.createEl("p", {
         cls: "flowkit-hero-hint",
         text: "Turn on online enrichment for maintenance and popularity data, and a letter grade.",
@@ -1314,9 +1333,15 @@ export class HealthDashboardView extends ItemView {
       // one: a symptom can need two plugins together, disabling one can break
       // another, and some plugins don't fully unload without a restart. The
       // search narrows honestly; the sentence should too.
+      // The last clause is conditional, because on the failed-restore path it
+      // was a flat contradiction of the error box rendered directly beneath it:
+      // "everything else is back on", above "FlowKit couldn't switch X back on".
+      const restored = this.plugin.bisectError
+        ? " It is off now — but FlowKit could not switch everything else back on; see below."
+        : " It is off now; everything else is back on.";
       body.setText(
         culprit
-          ? `${culprit} is the one. With it switched off the problem went away, and with it on it came back — that is as close to proof as switching things off can get. It is off now; everything else is back on.`
+          ? `${culprit} is the one. With it switched off the problem went away, and with it on it came back — that is as close to proof as switching things off can get.${restored}`
           : "The problem survived with every candidate switched off, so no installed plugin is causing it. Worth looking at your theme, CSS snippets, or Obsidian itself."
       );
       if (this.plugin.bisectError) {
@@ -1335,6 +1360,27 @@ export class HealthDashboardView extends ItemView {
       if (culprit) {
         const restore = actions.createEl("button", { text: "Turn it back on too" });
         restore.onclick = () => void this.runBisectAction(() => this.plugin.finishBisect(false));
+      }
+      // Undo belongs here most of all, and this branch returned before ever
+      // offering it — so the search could be un-answered on every round except
+      // the one that produces the accusation. That is the answer people are
+      // likeliest to get wrong (it is given after the longest wait, on the
+      // smallest difference) and the only one whose mistake has a name attached
+      // to it. Going back re-establishes the round and asks again.
+      if (this.plugin.bisectCanUndo) {
+        const back = actions.createEl("button", {
+          cls: "flowkit-bisect-undo",
+          text: culprit ? "That's not it — go back" : "Go back a step",
+        });
+        back.setAttr(
+          "aria-label",
+          "Take back the last answer and test that round again"
+        );
+        back.onclick = () =>
+          void this.runBisectAction(async () => {
+            const restored = await this.plugin.undoBisectAnswer();
+            if (restored) new Notice("Went back a step — test this round again.");
+          });
       }
       for (const btn of Array.from(actions.querySelectorAll("button"))) {
         btn.disabled = this.bisectBusy || this.plugin.bisectBusy;
@@ -1643,8 +1689,11 @@ export class HealthDashboardView extends ItemView {
     dismiss.setAttr("aria-label", "Mark this as seen");
     dismiss.onclick = () => {
       this.act(
-        this.plugin.markChangesSeen().then(() => this.render()),
-        "Couldn't mark those as seen"
+        // Only this banner. It used to share `markChangesSeen` with the "since
+        // you last looked" strip, so closing one silently closed the other —
+        // permanently, because the change log is read in exactly one place.
+        this.plugin.markAppUpdateSeen().then(() => this.render()),
+        "Couldn't mark that as seen"
       );
     };
 
@@ -1854,16 +1903,22 @@ export class HealthDashboardView extends ItemView {
 
     // Say how partial the measurement is. "142 ms across 3" beside "38 plugins
     // enabled" invites the reading that the other 35 are free.
-    const unmeasured = enabled.length - cost.measuredCount;
-    if (this.plugin.runtimeTracking && unmeasured > 0) {
+    // The label and the action are now the SAME list. They were computed
+    // separately and differed by construction: the count excluded muted and
+    // already-measured plugins, the click passed every enabled one — so
+    // "Profile the other 12" opened a modal saying "Profile 38 plugins?" and
+    // then restarted all 38, including the 26 it had just said it would leave
+    // alone.
+    const unprofiled = this.unprofiledIds();
+    if (this.plugin.runtimeTracking && unprofiled.length > 0) {
       const profile = bar.createEl("button", {
-        text: `Profile the other ${unmeasured}`,
+        text: `Profile the other ${unprofiled.length}`,
       });
       profile.setAttr(
         "aria-label",
         "Restart each unmeasured plugin in turn and time how long it takes to load"
       );
-      profile.onclick = () => this.startProfileAll(this.profilableIds());
+      profile.onclick = () => this.startProfileAll(unprofiled);
     }
 
     // Named for what it does. As "Why is my vault slow?" it promised a
@@ -1893,7 +1948,37 @@ export class HealthDashboardView extends ItemView {
     );
   }
 
+  /**
+   * The plugins that still have no load time for the build now installed —
+   * exactly the set "Profile the other N" counts, so the button cannot promise
+   * one thing and do another.
+   *
+   * Distinct from `profilableIds`, which is every enabled plugin and is what
+   * the Diagnose menu's "Profile startup" uses: that entry promises nothing
+   * about a subset, and re-timing a plugin whose reading is old is the point
+   * of it.
+   */
+  private unprofiledIds(): string[] {
+    return searchableCandidates(
+      this.results
+        .filter(
+          (r) => r.enabled && !r.muted && currentLoadMs(r.runtime, r.version) == null
+        )
+        .map((r) => r.id),
+      this.plugin.manifest.id
+    );
+  }
+
   private startProfileAll(ids: string[]): void {
+    // Same guard, milder consequence: profiling restarts every plugin in turn
+    // and restores each to the state it found it in — which mid-search is the
+    // search's state, not the user's — so it doesn't destroy the record, but it
+    // does churn a vault that is deliberately half off and make the round's
+    // question meaningless while it runs.
+    if (this.plugin.bisect && !this.plugin.bisect.done) {
+      new Notice("Finish or stop the plugin search first — profiling would restart the plugins it has switched off.", 8000);
+      return;
+    }
     if (!this.plugin.isPro) {
       this.openUpgrade("profile");
       return;
@@ -2367,12 +2452,20 @@ export class HealthDashboardView extends ItemView {
       );
       lines.push("");
       for (const sig of [...rec.signatures].sort((a, b) => b.lastAt - a.lastAt).slice(0, 5)) {
-        lines.push(`- \`${sig.message}\` — seen ${sig.count}×, last ${describeWhen(sig.lastAt)}`);
-        // The stack is the Pro line: it is the part an author can act on.
+        // Redacted, because this is the text the product tells the user to
+        // paste into a stranger's issue tracker. Error messages quote the file
+        // being touched, and in a note-taking app the file name IS the content
+        // — "Patients/Alice Nguyen HIV results.md" is not incidental detail.
+        lines.push(
+          `- \`${redactUserContent(sig.message)}\` — seen ${sig.count}×, last ${describeWhen(sig.lastAt)}`
+        );
+        // The stack is the Pro line: it is the part an author can act on. It is
+        // also, by construction, a list of absolute paths carrying the OS
+        // username and the vault name on every frame.
         if (this.plugin.isPro && sig.stack) {
           lines.push("");
           lines.push("```");
-          lines.push(sig.stack);
+          lines.push(redactUserContent(sig.stack));
           lines.push("```");
         }
       }
@@ -2389,7 +2482,12 @@ export class HealthDashboardView extends ItemView {
 
     try {
       await navigator.clipboard.writeText(lines.join("\n"));
-      new Notice("Bug report copied — paste it into an issue.");
+      // Says what was included, because the user is about to publish it, and
+      // "paste it into an issue" was the whole of the previous disclosure.
+      new Notice(
+        "Bug report copied. File names and paths are redacted — check it before you post it.",
+        8000
+      );
     } catch (err) {
       console.error("FlowKit: clipboard write failed", err);
       new Notice("Couldn't copy to the clipboard — see the console.");
@@ -2512,9 +2610,19 @@ export class HealthDashboardView extends ItemView {
     const usable = history;
 
     if (usable.length === 0) {
+      // "From tomorrow" is only true if tomorrow's reading would be plottable.
+      // Snapshots carry `online: coverage.stats`, which is permanently false
+      // while enrichment is off, and the chart drops anything with
+      // `online === false` — so a privacy-minded user with ninety stored
+      // readings was told to come back tomorrow, every day, forever.
+      const stored = this.plugin.settings.history.length;
       section.createDiv({
         cls: "flowkit-trends-empty",
-        text: "FlowKit records one reading a day. Your trend appears here from tomorrow.",
+        text: this.coverage.disabled
+          ? stored > 0
+            ? `${stored} reading${stored === 1 ? "" : "s"} recorded, but none can be plotted: with online enrichment off, a score is built from local signals only and isn't comparable with one that wasn't. Turn enrichment on and the trend starts building.`
+            : "With online enrichment off, readings aren't comparable enough to plot. Turn it on and the trend starts building."
+          : "FlowKit records one reading a day. Your trend appears here from tomorrow.",
       });
       return;
     }
@@ -3249,6 +3357,26 @@ export class HealthDashboardView extends ItemView {
   }
 
   private startBisect(): void {
+    // A search already running is checked FIRST — before the Pro gate, so a
+    // free user isn't sent to a checkout page as the answer to "you already
+    // have one of these open".
+    //
+    // Starting a second search is the one action in this plugin that destroys
+    // user state irreversibly. `main.startBisect` captures the CURRENTLY
+    // enabled set as both the AUTO_SNAPSHOT profile and the new session's
+    // `originalEnabled` — and mid-search that set is missing every plugin the
+    // first search switched off. Both records of the real vault are overwritten
+    // in the same breath, and nothing else holds it: the timeline is suppressed
+    // while a search runs, so those plugins are simply orphaned, under a modal
+    // that has just promised "your current set is saved first".
+    if (this.plugin.bisect) {
+      new Notice(
+        "A search is already running — finish it or stop and restore before starting another.",
+        8000
+      );
+      this.render();
+      return;
+    }
     if (!this.plugin.isPro) {
       this.openUpgrade("bisect");
       return;
@@ -3322,6 +3450,13 @@ export class HealthDashboardView extends ItemView {
 
   /** Switch to a saved set, after showing exactly what it would change. */
   private applyProfile(profile: PluginProfile): void {
+    // Switching sets mid-search would silently replace the round's plugin set
+    // with a different one, and the next answer would then be about a vault the
+    // search never asked a question about.
+    if (this.plugin.bisect && !this.plugin.bisect.done) {
+      new Notice("Finish or stop the plugin search first — switching sets would change the plugins it is testing.", 8000);
+      return;
+    }
     if (!this.plugin.isPro) {
       this.openUpgrade("profiles");
       return;
@@ -3683,7 +3818,13 @@ export class HealthDashboardView extends ItemView {
   }
 
   private buildReportCsv(rows: PluginHealth[]): string {
-    const esc = (v: string) => `"${v.replace(/"/g, '""')}"`;
+    // Quoted AND defanged. A leading =, +, - or @ makes a spreadsheet treat the
+    // cell as a formula on open, and every value below is a plugin manifest
+    // field — attacker-controlled for anyone who sideloads. `showDisabled`
+    // defaults on, so a plugin that has never been enabled, and whose code has
+    // therefore never run, still reaches this file.
+    const esc = (v: string) =>
+      `"${(FORMULA_LEAD.test(v) ? `'${v}` : v).replace(/"/g, '""')}"`;
     const num = (v: number | null) => (v == null ? "" : String(v));
     const header = [
       "Plugin",

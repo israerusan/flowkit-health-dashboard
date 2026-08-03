@@ -33,6 +33,15 @@ export interface ConflictInput {
   installed: ReadonlySet<string>;
   /** Display names, for readable output. */
   names: Record<string, string>;
+  /**
+   * What `Mod` means on this machine — Ctrl on Windows/Linux, Meta on macOS.
+   *
+   * Passed in rather than read here, because this module is deliberately free
+   * of any Obsidian import so the Node suite drives it directly. Defaults to
+   * Ctrl, which is the majority platform and the one where the bug this fixes
+   * actually bites.
+   */
+  mod?: ModKey;
 }
 
 export type ConflictKind = "hotkey" | "command-name";
@@ -71,11 +80,39 @@ function ownerOf(
   return { pluginId: null, owner: "Obsidian" };
 }
 
-/** Modifier order varies by platform and by who registered it; sort it away. */
-export function printChord(hotkey: Hotkey): string | null {
+/**
+ * The concrete modifier `Mod` stands for on this machine.
+ *
+ * Obsidian's modifier union is `Mod | Ctrl | Meta | Shift | Alt`, where `Mod`
+ * is a platform alias: Ctrl on Windows and Linux, Meta on macOS.
+ */
+export type ModKey = "Ctrl" | "Meta";
+
+/**
+ * Modifier order varies by platform and by who registered it; sort it away —
+ * and resolve `Mod` to what it actually means here before doing so.
+ *
+ * Without the resolution this function reported `Mod+T` and `Ctrl+T` as two
+ * different chords, so two plugins bound to the same physical keystroke on
+ * Windows produced NO conflict. That is precisely the case this whole file
+ * exists to catch: the shortcut that silently never fires, which nothing in
+ * Obsidian's own UI will tell you about. Both spellings are common in the wild
+ * — `Mod` is the documented one, `Ctrl` is what plugins written on Windows
+ * tend to hard-code — so the miss was the likely case, not the exotic one.
+ *
+ * Deduplicated after resolving, so `Mod+Ctrl+T` doesn't print `Ctrl+Ctrl+T`.
+ */
+export function printChord(hotkey: Hotkey, mod: ModKey = "Ctrl"): string | null {
   const key = (hotkey.key ?? "").trim();
   if (!key) return null;
-  const mods = [...(hotkey.modifiers ?? [])].map((m) => m.trim()).filter(Boolean).sort();
+  const mods = [
+    ...new Set(
+      (hotkey.modifiers ?? [])
+        .map((m) => m.trim())
+        .filter(Boolean)
+        .map((m) => (m === "Mod" ? mod : m))
+    ),
+  ].sort();
   return [...mods, key.toUpperCase()].join("+");
 }
 
@@ -111,7 +148,7 @@ export function findConflicts(input: ConflictInput): Conflict[] {
     };
 
     for (const hotkey of effectiveHotkeys(cmd, input.customKeys)) {
-      const chord = printChord(hotkey);
+      const chord = printChord(hotkey, input.mod ?? "Ctrl");
       if (!chord) continue;
       const list = byChord.get(chord) ?? [];
       list.push(party);

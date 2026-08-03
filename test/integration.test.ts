@@ -22,6 +22,9 @@ import {
 } from "../src/bisect";
 import type { RuntimeProfiles } from "../src/runtime";
 import { SaveQueue, isUsableCache, mapWithConcurrency } from "../src/persistence";
+import { ErrorWatcher } from "../src/errorWatcher";
+import type { PluginErrorRecord } from "../src/types";
+import type { Plugin } from "obsidian";
 
 let passed = 0;
 const failures: string[] = [];
@@ -847,11 +850,94 @@ async function persistenceTests(): Promise<void> {
   }
 }
 
+// --- error watcher: the sibling that never went inert -----------------------
+//
+// 1.6.0 gave RuntimeWatcher a `stopped` flag and identity-based unwrapping, and
+// stopped there. ErrorWatcher has the same shape and the same compromise — it
+// declines to unhook a `console.error` somebody else has since wrapped — so its
+// wrapper could survive unload holding the watcher, the host, and through the
+// host an unloaded plugin's settings, and go on writing them.
+async function errorWatcherTests(): Promise<void> {
+  const app = new FakeApp();
+  app.install("alpha");
+  app.install("flowkit-health-dashboard");
+
+  const log: Record<string, PluginErrorRecord> = {};
+  let changes = 0;
+  // A minimal stand-in for Obsidian's Plugin: only `registerDomEvent` is used,
+  // and nothing in these assertions goes through the window listeners.
+  const fakePlugin = { registerDomEvent: () => undefined } as unknown as Plugin;
+  const watcher = new ErrorWatcher(fakePlugin, {
+    installedIds: () => new Set(Object.keys(app.manifests)),
+    log: () => log,
+    onChange: () => {
+      changes++;
+    },
+  });
+
+  const pristine = console.error;
+  // The wrapper's whole contract is that it calls through, so the messages
+  // below would land in the test output as real console errors. Swap the
+  // underlying function for a sink first: what is under test is attribution and
+  // inertness, not that console.error prints.
+  const sink = (() => undefined) as typeof console.error;
+  console.error = sink;
+  watcher.start(true);
+  check("start() wraps console.error", console.error !== sink);
+
+  asPlugin("alpha", () =>
+    asPlugin("flowkit-health-dashboard", () => console.error("alpha exploded"))
+  );
+  eq("a logged error is attributed to the plugin that logged it", log.alpha?.logged, 1);
+
+  // Somebody else wraps on top of us, exactly as another plugin would.
+  const ours = console.error;
+  const theirs = ((...args: unknown[]): void => {
+    (ours as (...a: unknown[]) => void)(...args);
+  }) as typeof console.error;
+  console.error = theirs;
+
+  watcher.stop();
+  eq("a later wrapper is not clobbered on unload", console.error, theirs);
+
+  const loggedBefore = log.alpha?.logged ?? 0;
+  changes = 0;
+  asPlugin("alpha", () =>
+    asPlugin("flowkit-health-dashboard", () => console.error("after unload"))
+  );
+  eq(
+    "a wrapper that survives unload records nothing",
+    log.alpha?.logged ?? 0,
+    loggedBefore
+  );
+  await sleep(30);
+  eq("and never calls back into the unloaded plugin", changes, 0);
+
+  console.error = sink;
+
+  // Restoration must hand back the ORIGINAL, not a bound copy of it — storing
+  // the bound copy laminated another `.bind` onto a global other plugins also
+  // use, once per disable/enable cycle.
+  const before = console.error;
+  const cycle = new ErrorWatcher(fakePlugin, {
+    installedIds: () => new Set(Object.keys(app.manifests)),
+    log: () => log,
+    onChange: () => undefined,
+  });
+  for (let i = 0; i < 3; i++) {
+    cycle.start(true);
+    cycle.stop();
+  }
+  eq("enable/disable cycles give back exactly what they took", console.error, before);
+  console.error = pristine;
+}
+
 // --- run --------------------------------------------------------------------
 await timerTests();
 await loadTests();
 bisectTests();
 await persistenceTests();
+await errorWatcherTests();
 clearAllTimers();
 
 if (failures.length) {
