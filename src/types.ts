@@ -1,5 +1,9 @@
 // Shared types for the FlowKit Health Dashboard.
 
+import type { ListingStatus } from "./scoring";
+
+export type { ListingStatus };
+
 /**
  * How much to trust a metric value.
  * - `measured`   — derived from a real, authoritative signal (e.g. app version,
@@ -19,16 +23,19 @@ export interface MetricScore {
 }
 
 /**
- * A plain, categorical read on whether a plugin is still being maintained —
- * easier to scan than the 0–100 maintenance score.
- * - `maintained`   — updated recently (≤6 months).
- * - `aging`        — no update in a while (6–18 months).
- * - `unmaintained` — likely abandoned (>18 months).
- * - `unknown`      — no update data (offline, or not a community plugin).
+ * A plain, categorical read on release activity — easier to scan than the 0–100
+ * maintenance score.
+ * - `maintained`   — released recently (≤6 months).
+ * - `aging`        — no release in a while (6–18 months).
+ * - `stable`       — no recent release, but many published versions and most
+ *                    users on the newest: finished rather than abandoned.
+ * - `unmaintained` — no release in over 18 months, and no sign of maturity.
+ * - `unknown`      — no release data (offline, or not a community plugin).
  */
 export type MaintenanceStatus =
   | "maintained"
   | "aging"
+  | "stable"
   | "unmaintained"
   | "unknown";
 
@@ -48,19 +55,27 @@ export interface PluginHealth {
   /** Latest published version, when known. */
   latestVersion?: string;
   /**
-   * Whether the plugin is absent from Obsidian's community list (a trust
-   * signal — sideloaded plugins skip community review). `null` when unknown
-   * (offline / enrichment off).
+   * Where the plugin stands relative to Obsidian's community directory.
+   * `delisted` (present in the stats file but pulled from the list) is a very
+   * different thing from `local` (never listed — a personal or BRAT install),
+   * and collapsing both into one "sideloaded" warning buried the more serious
+   * of the two.
    */
-  sideloaded: boolean | null;
+  listing: ListingStatus;
   /** User has muted this plugin from the at-risk / unmaintained counts. */
   muted: boolean;
-  /** Average of the available metric values, or `null` if none are available. */
+  /** Weighted blend of the available metrics, or `null` if none are available. */
   overall: number | null;
+  /**
+   * Share of the total metric weight that was actually available (0–1). Shown
+   * to the user so a score built on two of five signals doesn't read as
+   * confidently as one built on all five.
+   */
+  confidence: number;
   metrics: {
-    quality: MetricScore;
+    hygiene: MetricScore;
     maintenance: MetricScore;
-    performance: MetricScore;
+    footprint: MetricScore;
     popularity: MetricScore;
     compatibility: MetricScore;
   };
@@ -83,6 +98,23 @@ export interface RemotePluginStat {
 export type RemoteStats = Record<string, RemotePluginStat>;
 
 /**
+ * Which enrichment sources actually loaded for a scan. The two community files
+ * fail independently — stats drives Popularity/Maintenance, the list drives
+ * sideload detection and repo links — so "online" is not one boolean. Calling a
+ * half-loaded scan "full metrics" is the kind of small lie that costs trust.
+ */
+export interface DataCoverage {
+  /** community-plugin-stats.json loaded. */
+  stats: boolean;
+  /** community-plugins.json loaded. */
+  list: boolean;
+  /** Enrichment is deliberately switched off in settings. */
+  disabled: boolean;
+  /** Why enrichment is incomplete, when it failed rather than being off. */
+  error?: string;
+}
+
+/**
  * A point-in-time reading of overall vault health, used by the Pro trend
  * tracker. Stored in plugin data; the list is capped to a recent window.
  */
@@ -96,6 +128,52 @@ export interface HealthSnapshot {
   atRisk: number;
   unmaintained: number;
   updates: number;
+  /**
+   * Whether community data was available for this reading. Without it, a scan
+   * taken on a train (two of five signals) sat on the same polyline as a full
+   * one and fabricated a celebratory jump.
+   */
+  online?: boolean;
+  /** Share of metric weight available, mirroring PluginHealth.confidence. */
+  confidence?: number;
+  /**
+   * Which scoring model produced `avg`. Readings from different models are not
+   * comparable and must never share a trend line: 1.0.0 reweighted everything
+   * and added hard caps, so plotting a 0.2.3 reading beside a 1.0.0 one draws a
+   * cliff the user did not cause. Absent on pre-1.0.0 entries.
+   */
+  model?: number;
+}
+
+/** Bumped whenever a change to scoring makes old `avg` values incomparable. */
+export const SCORING_MODEL = 2;
+
+/**
+ * The scored fields of one community plugin, kept between sessions. Storing
+ * this rather than the raw feeds is what lets the dashboard paint immediately:
+ * the two source files are ~3.7 MB uncompressed, and re-fetching them was
+ * previously the first thing that happened on every open.
+ */
+export interface CachedPlugin {
+  downloads?: number;
+  updated?: number;
+  latest?: string;
+  /** Downloads sitting on the newest release, for the maturity signal. */
+  latestDownloads?: number;
+  releases?: number;
+  repo?: string;
+  listed?: boolean;
+}
+
+export interface RemoteCache {
+  /** When this projection was built. */
+  at: number;
+  plugins: Record<string, CachedPlugin>;
+  /** Sorted download counts across the directory, for percentile ranking. */
+  distribution: number[];
+  /** Which feeds contributed, so a cached scan reports coverage honestly. */
+  hadStats: boolean;
+  hadList: boolean;
 }
 
 /** One plugin's entry in Obsidian's community-plugins list. */

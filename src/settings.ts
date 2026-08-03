@@ -1,7 +1,13 @@
 import { App, PluginSettingTab, Setting } from "obsidian";
 import type FlowKitHealthPlugin from "./main";
-import type { HealthSnapshot } from "./types";
-import { PRO_FEATURES, PRO_PRICE, PURCHASE_URL } from "./product";
+import type { HealthSnapshot, RemoteCache } from "./types";
+import {
+  PRODUCT_NAME,
+  PRO_FEATURES,
+  PRO_PRICE,
+  PURCHASE_URL,
+  SUPPORT_EMAIL,
+} from "./product";
 
 export interface FlowKitHealthSettings {
   /** Fetch community download/maintenance stats. Off = fully local & offline. */
@@ -14,8 +20,23 @@ export interface FlowKitHealthSettings {
   licenseKey: string;
   /** Pro: recompute automatically whenever the dashboard is opened. */
   autoRefreshOnOpen: boolean;
-  /** Pro: rolling history of vault-health snapshots for the trend tracker. */
+  /** Rolling history of vault-health snapshots for the trend tracker. */
   history: HealthSnapshot[];
+  /**
+   * A slim projection of the last successful community-data fetch. The two
+   * source files total ~3.7 MB uncompressed and were re-downloaded on every
+   * session; this keeps only the handful of fields we actually score on, so the
+   * dashboard renders immediately and the network is a background upgrade.
+   */
+  cache: RemoteCache | null;
+  /** Whether the first-run explainer has been dismissed. */
+  seenIntro: boolean;
+  /** Free users get one full report; this records that it's been spent. */
+  usedFreeExport: boolean;
+  /** Pro: check for newly-degraded plugins in the background once a day. */
+  backgroundMonitoring: boolean;
+  /** Ids already reported by monitoring, so the same news isn't repeated. */
+  notified: string[];
 }
 
 export const DEFAULT_SETTINGS: FlowKitHealthSettings = {
@@ -25,10 +46,17 @@ export const DEFAULT_SETTINGS: FlowKitHealthSettings = {
   licenseKey: "",
   autoRefreshOnOpen: false,
   history: [],
+  cache: null,
+  seenIntro: false,
+  usedFreeExport: false,
+  backgroundMonitoring: true,
+  notified: [],
 };
 
 export class FlowKitHealthSettingTab extends PluginSettingTab {
   plugin: FlowKitHealthPlugin;
+  /** Live-updated so a rejected key can be explained without a full re-render. */
+  private errorEl?: HTMLElement;
 
   constructor(app: App, plugin: FlowKitHealthPlugin) {
     super(app, plugin);
@@ -56,6 +84,8 @@ export class FlowKitHealthSettingTab extends PluginSettingTab {
           .onChange(async (value) => {
             this.plugin.settings.enableOnlineEnrichment = value;
             await this.plugin.saveSettings();
+            // Changes which metrics are even computable — needs a rescan.
+            this.plugin.refreshViews(true);
           })
       );
 
@@ -68,26 +98,44 @@ export class FlowKitHealthSettingTab extends PluginSettingTab {
           .onChange(async (value) => {
             this.plugin.settings.showDisabled = value;
             await this.plugin.saveSettings();
+            this.plugin.refreshViews(true);
           })
       );
 
-    const autoRefresh = new Setting(containerEl)
-      .setName("Auto-refresh on open")
+    // Free, as of 1.0.0. It was a Pro bullet describing a preference checkbox,
+    // which made the other Pro features look equally thin.
+    new Setting(containerEl)
+      .setName("Re-download community data on open")
       .setDesc(
-        this.plugin.isPro
-          ? "Recompute every time the dashboard opens, instead of showing the last scan."
-          : "Pro — recompute automatically each time the dashboard opens."
+        "Fetch fresh popularity and maintenance data every time the dashboard " +
+          "opens. Off is faster and uses the cached scan; Refresh always refetches."
       )
       .addToggle((toggle) =>
         toggle
-          .setValue(this.plugin.settings.autoRefreshOnOpen && this.plugin.isPro)
-          .setDisabled(!this.plugin.isPro)
+          .setValue(this.plugin.settings.autoRefreshOnOpen)
           .onChange(async (value) => {
             this.plugin.settings.autoRefreshOnOpen = value;
             await this.plugin.saveSettings();
           })
       );
-    if (!this.plugin.isPro) autoRefresh.settingEl.addClass("flowkit-locked-setting");
+
+    const monitoring = new Setting(containerEl)
+      .setName("Background monitoring")
+      .setDesc(
+        this.plugin.isPro
+          ? "Check quietly for plugins that turn incompatible, go stale, or get pulled from the directory, and tell you when they do."
+          : `Pro — get told when a plugin turns incompatible, goes stale, or is removed from the community directory. ${PRO_PRICE}.`
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.backgroundMonitoring && this.plugin.isPro)
+          .setDisabled(!this.plugin.isPro)
+          .onChange(async (value) => {
+            this.plugin.settings.backgroundMonitoring = value;
+            await this.plugin.saveSettings();
+          })
+      );
+    if (!this.plugin.isPro) monitoring.settingEl.addClass("flowkit-locked-setting");
 
     const muted = this.plugin.settings.ignored;
     new Setting(containerEl)
@@ -104,6 +152,7 @@ export class FlowKitHealthSettingTab extends PluginSettingTab {
           .onClick(async () => {
             this.plugin.settings.ignored = [];
             await this.plugin.saveSettings();
+            this.plugin.refreshViews(true);
             this.display();
           })
       );
@@ -125,6 +174,10 @@ export class FlowKitHealthSettingTab extends PluginSettingTab {
       });
     } else {
       banner.createEl("strong", { text: `Unlock FlowKit Pro (${PRO_PRICE})` });
+      banner.createDiv({
+        cls: "flowkit-pro-lead",
+        text: "The full diagnosis is free, and stays free. Pro is for acting on it:",
+      });
       const list = banner.createEl("ul", { cls: "flowkit-pro-list" });
       for (const f of PRO_FEATURES) list.createEl("li", { text: f });
     }
@@ -143,30 +196,59 @@ export class FlowKitHealthSettingTab extends PluginSettingTab {
           .onChange(async (value) => {
             this.plugin.settings.licenseKey = value.trim();
             await this.plugin.saveSettings();
-            this.plugin.refreshLicense();
-            // Re-render so the banner/status reflect the new state.
-            this.display();
+            // Verification is offline and takes microseconds, so re-check every
+            // keystroke — but only rebuild the tab when Pro actually FLIPS.
+            // display() empties containerEl, which would destroy the very input
+            // being typed into and drop focus after the first character.
+            const flipped = this.plugin.refreshLicense();
+            if (flipped) {
+              this.plugin.refreshViews(true);
+              this.display();
+            } else {
+              this.renderLicenseError();
+            }
           });
         text.inputEl.addClass("flowkit-license-input");
       });
 
+    this.errorEl = containerEl.createDiv({ cls: "flowkit-license-error" });
+    this.renderLicenseError();
+
     if (!pro) {
       new Setting(containerEl)
         .setName("Get a license")
-        .setDesc("One-time purchase — supports ongoing development.")
+        .setDesc(
+          "Checkout is hosted on my Buy Me a Coffee page. Your key is emailed " +
+            "automatically within seconds — no account, no server, no subscription."
+        )
         .addButton((btn) =>
           btn
-            .setButtonText("Buy FlowKit Pro")
+            .setButtonText(`Unlock Pro — ${PRO_PRICE}`)
             .setCta()
             .onClick(() => window.open(PURCHASE_URL, "_blank"))
         );
 
-      if (this.plugin.settings.licenseKey && this.plugin.licenseError) {
-        containerEl.createDiv({
-          cls: "flowkit-license-error",
-          text: this.plugin.licenseError,
-        });
-      }
+      const trust = containerEl.createDiv({ cls: "flowkit-pro-trust" });
+      trust.createDiv({
+        text: "Verified offline. One payment, every device you own, forever.",
+      });
+      const lost = trust.createDiv();
+      lost.appendText("Lost your key or need a refund? ");
+      lost.createEl("a", {
+        text: SUPPORT_EMAIL,
+        href: `mailto:${SUPPORT_EMAIL}?subject=${encodeURIComponent(
+          `${PRODUCT_NAME} licence`
+        )}`,
+      });
     }
+  }
+
+  /** Show why a pasted key was rejected, without rebuilding the whole tab. */
+  private renderLicenseError(): void {
+    if (!this.errorEl) return;
+    this.errorEl.empty();
+    const key = this.plugin.settings.licenseKey;
+    if (!key || this.plugin.isPro || !this.plugin.licenseError) return;
+    this.errorEl.setText(this.plugin.licenseError);
   }
 }

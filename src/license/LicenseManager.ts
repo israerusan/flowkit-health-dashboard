@@ -1,5 +1,6 @@
 import { verifyLicense, type LicenseVerification } from "../shared/verifyLicense.mjs";
 import { LICENSE_PUBLIC_KEY } from "./publicKey";
+import { PRODUCT_ID } from "../product";
 
 export type { LicensePayload, LicenseVerification } from "../shared/verifyLicense.mjs";
 
@@ -9,7 +10,7 @@ export type { LicensePayload, LicenseVerification } from "../shared/verifyLicens
  * plugin portfolio.
  */
 export class LicenseManager {
-  private static readonly PRODUCT = "flowkit-health-dashboard";
+  private static readonly PRODUCT = PRODUCT_ID;
 
   static verify(licenseKey: string): LicenseVerification {
     return verifyLicense(licenseKey, LicenseManager.PRODUCT, LICENSE_PUBLIC_KEY);

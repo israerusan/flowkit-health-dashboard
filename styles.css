@@ -149,6 +149,11 @@
   font-size: 0.82em;
   color: var(--text-muted);
 }
+.flowkit-hero-hint {
+  margin: 4px 0 0;
+  font-size: 0.8em;
+  color: var(--text-accent, var(--interactive-accent));
+}
 
 /* Summary tiles ---------------------------------------------------------- */
 .flowkit-health-summary {
@@ -164,6 +169,19 @@
   border-radius: 8px;
   padding: 8px 12px;
   text-align: center;
+  /* It's a <button> now (it filters the table), so undo the button chrome. */
+  box-shadow: none;
+  cursor: pointer;
+  height: auto;
+  font-family: inherit;
+}
+.flowkit-stat:hover {
+  background: var(--background-modifier-hover);
+  border-color: var(--interactive-accent);
+}
+.flowkit-stat:focus-visible {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: 2px;
 }
 .flowkit-stat-value {
   font-size: 1.5em;
@@ -386,12 +404,14 @@
   text-align: center;
   white-space: nowrap;
 }
+/* Not sticky: the header above is itself sticky and its height varies with
+   wrapping (title, status, up to three buttons), so any fixed `top` offset here
+   was wrong at most widths — leaving a dead scrollport band or overlapping the
+   first row. */
 .flowkit-health-table th {
   color: var(--text-muted);
   font-weight: 600;
   background: var(--background-primary);
-  position: sticky;
-  top: 52px;
 }
 .flowkit-health-table th.sortable {
   cursor: pointer;
@@ -489,21 +509,31 @@
   border-radius: 999px;
   font-variant-numeric: tabular-nums;
   font-weight: 600;
-  color: var(--text-on-accent, #fff);
   cursor: help;
 }
+/* Tinted fill + a strong border and matching text, rather than a saturated
+   block of colour with white text on it. Yellow-on-white in particular never
+   cleared contrast, and a whole column of solid blocks read as an alarm. The
+   band is also named in each chip's aria-label, so colour is never the only
+   carrier of meaning. */
 .flowkit-chip.tone-good {
-  background: var(--color-green, #2e7d32);
+  background: color-mix(in srgb, var(--color-green, #2e7d32) 16%, transparent);
+  border: 1px solid color-mix(in srgb, var(--color-green, #2e7d32) 45%, transparent);
+  color: var(--color-green, #2e7d32);
 }
 .flowkit-chip.tone-warn {
-  background: var(--color-yellow, #b8860b);
-  color: #1a1a1a;
+  background: color-mix(in srgb, var(--color-yellow, #b8860b) 18%, transparent);
+  border: 1px solid color-mix(in srgb, var(--color-yellow, #b8860b) 50%, transparent);
+  color: var(--text-normal);
 }
 .flowkit-chip.tone-bad {
-  background: var(--color-red, #c62828);
+  background: color-mix(in srgb, var(--color-red, #c62828) 16%, transparent);
+  border: 1px solid color-mix(in srgb, var(--color-red, #c62828) 50%, transparent);
+  color: var(--color-red, #c62828);
 }
 .flowkit-chip.tone-unknown {
-  background: var(--background-modifier-border);
+  background: transparent;
+  border: 1px solid var(--background-modifier-border);
   color: var(--text-muted);
 }
 /* Estimated metrics get a subtle dashed outline vs measured. */
@@ -517,17 +547,24 @@
   margin-left: 1px;
 }
 
-/* Tone applied to plain text (summary tiles, gauge, deltas). */
-.tone-good {
+/* Tone applied to plain text (summary tiles, gauge, deltas). Scoped to our own
+   roots: `.tone-good` unscoped is a global class name, and styles.css is loaded
+   app-wide, so it would repaint any other plugin's element that happens to use
+   the same word. */
+.flowkit-health .tone-good,
+.flowkit-pro-banner .tone-good {
   color: var(--color-green, #2e7d32);
 }
-.tone-warn {
+.flowkit-health .tone-warn,
+.flowkit-pro-banner .tone-warn {
   color: var(--color-yellow, #b8860b);
 }
-.tone-bad {
+.flowkit-health .tone-bad,
+.flowkit-pro-banner .tone-bad {
   color: var(--color-red, #c62828);
 }
-.tone-unknown {
+.flowkit-health .tone-unknown,
+.flowkit-pro-banner .tone-unknown {
   color: var(--text-muted);
 }
 
@@ -552,6 +589,344 @@
   font-size: 0.78em;
   color: var(--text-muted);
   line-height: 1.5;
+}
+
+/* Screen-reader-only (the table caption). */
+.flowkit-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* First-run explainer ----------------------------------------------------- */
+.flowkit-intro {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 12px 14px;
+  margin: 0 0 12px;
+  border: 1px solid var(--interactive-accent);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--interactive-accent) 6%, transparent);
+  font-size: 0.86em;
+}
+.flowkit-intro-body {
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
+/* Result count in the toolbar. */
+.flowkit-result-count {
+  font-size: 0.8em;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+/* Per-plugin reasoning panel ---------------------------------------------- */
+.flowkit-health-table tr.is-expanded {
+  background: var(--background-modifier-hover);
+}
+.flowkit-health-table tbody tr:focus-visible {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: -2px;
+}
+.flowkit-detail-row td {
+  padding: 0;
+}
+.flowkit-detail {
+  padding: 12px 14px 14px;
+  background: var(--background-secondary);
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+.flowkit-detail-title {
+  font-weight: 600;
+}
+.flowkit-detail-sub {
+  font-size: 0.82em;
+  color: var(--text-muted);
+  margin-bottom: 10px;
+}
+.flowkit-detail-metric {
+  display: grid;
+  grid-template-columns: 130px 44px 44px 1fr;
+  gap: 8px;
+  align-items: baseline;
+  padding: 3px 0;
+  font-size: 0.84em;
+}
+.flowkit-detail-metric-name {
+  font-weight: 600;
+}
+.flowkit-detail-metric-weight,
+.flowkit-detail-metric-detail {
+  color: var(--text-muted);
+}
+.flowkit-detail-metric-value {
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.flowkit-detail-facts {
+  font-size: 0.82em;
+  color: var(--text-muted);
+  margin-top: 10px;
+}
+.flowkit-detail-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+/* Clickable insight cards. */
+.flowkit-insight.is-clickable {
+  cursor: pointer;
+}
+.flowkit-insight.is-clickable:hover {
+  background: var(--background-modifier-hover);
+}
+.flowkit-insight.is-clickable:focus-visible {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: 2px;
+}
+
+/* Scan error / coverage / undo ------------------------------------------- */
+.flowkit-health-error,
+.flowkit-coverage-note,
+.flowkit-undo-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  margin: 0 0 12px;
+  font-size: 0.85em;
+}
+.flowkit-health-error {
+  border: 1px solid var(--color-red, #c62828);
+  background: color-mix(in srgb, var(--color-red, #c62828) 8%, transparent);
+}
+.flowkit-error-icon {
+  display: inline-flex;
+  color: var(--color-red, #c62828);
+}
+.flowkit-error-detail {
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+.flowkit-coverage-note {
+  border: 1px dashed var(--background-modifier-border);
+  background: var(--background-secondary);
+  color: var(--text-muted);
+}
+.flowkit-coverage-icon {
+  display: inline-flex;
+  flex: 0 0 auto;
+}
+.flowkit-coverage-body {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.flowkit-undo-bar {
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-secondary);
+}
+.flowkit-undo-icon {
+  display: inline-flex;
+  color: var(--text-muted);
+}
+.flowkit-undo-label {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* Bulk confirmation modal ------------------------------------------------- */
+.flowkit-bulk-intro {
+  margin-bottom: 10px;
+}
+.flowkit-bulk-list {
+  max-height: 260px;
+  overflow-y: auto;
+  margin: 0 0 10px;
+  padding-left: 18px;
+}
+.flowkit-bulk-list li {
+  margin: 6px 0;
+}
+.flowkit-bulk-name {
+  font-weight: 600;
+}
+.flowkit-bulk-detail {
+  font-size: 0.85em;
+  color: var(--text-muted);
+}
+.flowkit-bulk-caveat {
+  font-size: 0.85em;
+  color: var(--text-muted);
+  border-left: 3px solid var(--color-yellow, #b8860b);
+  padding-left: 10px;
+  margin-bottom: 12px;
+}
+.flowkit-bulk-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+/* Narrow widths: sidebar and mobile --------------------------------------
+   The dashboard now opens in a main tab, but it can still be dragged into a
+   ~300px sidebar, and phones are narrower still. Below 620px the eight-column
+   matrix stops pretending to be a table: each plugin becomes a card with its
+   scores wrapped underneath, which is legible instead of a horizontal scroll
+   race. */
+@container flowkit-health (max-width: 620px) {
+  .flowkit-health-table thead {
+    display: none;
+  }
+  .flowkit-health-table,
+  .flowkit-health-table tbody,
+  .flowkit-health-table tr,
+  .flowkit-health-table td {
+    display: block;
+    width: auto;
+  }
+  .flowkit-health-table tbody tr {
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 8px;
+    margin-bottom: 8px;
+    padding: 8px 10px;
+    position: relative;
+  }
+  .flowkit-health-table td {
+    border-bottom: none;
+    padding: 2px 0;
+  }
+  .flowkit-health-table td.num {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    margin: 2px 6px 2px 0;
+    text-align: left;
+  }
+  /* Label each score, since the header row is gone. */
+  .flowkit-health-table td.num[data-label]::before {
+    content: attr(data-label);
+    font-size: 0.72em;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+  }
+  .flowkit-actions {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    width: auto;
+  }
+  .flowkit-detail-metric {
+    grid-template-columns: 1fr auto auto;
+  }
+  .flowkit-detail-metric-detail {
+    grid-column: 1 / -1;
+  }
+  .flowkit-hero {
+    flex-direction: column;
+    text-align: center;
+  }
+}
+
+.flowkit-health {
+  container: flowkit-health / inline-size;
+}
+
+/* Status bar -------------------------------------------------------------- */
+.flowkit-status-item {
+  cursor: pointer;
+}
+.flowkit-status-item.is-alert {
+  color: var(--color-red, #c62828);
+  font-weight: 600;
+}
+
+/* Upgrade modal ----------------------------------------------------------- */
+.flowkit-upgrade-headline {
+  font-size: 1.05em;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+.flowkit-upgrade-lead {
+  color: var(--text-muted);
+  margin-bottom: 10px;
+}
+.flowkit-upgrade-list {
+  margin: 0 0 12px;
+  padding-left: 18px;
+  font-size: 0.9em;
+  line-height: 1.6;
+}
+.flowkit-upgrade-tagline {
+  font-size: 0.85em;
+  color: var(--text-muted);
+  margin-bottom: 14px;
+}
+.flowkit-upgrade-key {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.flowkit-upgrade-key input {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: var(--font-monospace);
+}
+.flowkit-upgrade-status {
+  font-size: 0.82em;
+  color: var(--text-error, var(--color-red));
+  min-height: 1em;
+  margin-bottom: 10px;
+}
+.flowkit-upgrade-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 12px;
+}
+.flowkit-upgrade-footer {
+  font-size: 0.8em;
+  color: var(--text-muted);
+  line-height: 1.6;
+  border-top: 1px solid var(--background-modifier-border);
+  padding-top: 10px;
+}
+
+/* A Pro action shown, but locked. */
+.flowkit-insight-action.is-locked {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  opacity: 0.75;
+}
+.flowkit-insight-action.is-locked .flowkit-lock-icon {
+  transform: scale(0.8);
+}
+
+.flowkit-trends-more {
+  font-size: 0.8em;
+  color: var(--text-muted);
+  margin-top: 8px;
+}
+.flowkit-trends-more button {
+  font-size: inherit;
+  padding: 2px 8px;
+}
+
+.flowkit-pro-lead {
+  font-size: 0.88em;
+  margin-top: 6px;
 }
 
 /* Settings: Pro section -------------------------------------------------- */
@@ -587,6 +962,12 @@
   font-size: 0.82em;
   margin: -4px 0 12px;
 }
-.flowkit-locked-setting {
-  opacity: 0.7;
+.flowkit-license-error:empty {
+  margin: 0;
+}
+.flowkit-pro-trust {
+  font-size: 0.82em;
+  color: var(--text-muted);
+  margin: -4px 0 14px;
+  line-height: 1.6;
 }

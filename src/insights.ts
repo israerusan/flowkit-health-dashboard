@@ -30,6 +30,33 @@ const names = (rows: PluginHealth[], max = 3): string => {
   return extra > 0 ? `${shown.join(", ")} +${extra} more` : shown.join(", ");
 };
 
+// --- shared predicates ------------------------------------------------------
+// The dashboard's filter dropdown and this insight builder must agree about what
+// "incompatible" or "at risk" means. They used to carry separate copies, which
+// let a row appear under a filter but not in the matching insight (and vice
+// versa). One definition each, exported, used by both.
+
+/** Declares a minimum Obsidian version we don't meet, or is desktop-only on mobile. */
+export function isIncompatible(r: PluginHealth): boolean {
+  return r.metrics.compatibility.value === 0;
+}
+
+/** Scores below the "needs a look" line. */
+export function isAtRisk(r: PluginHealth): boolean {
+  return r.overall != null && r.overall < 50;
+}
+
+/** Worth the user's attention — excluding anything they've explicitly muted. */
+export function needsAttention(r: PluginHealth): boolean {
+  if (r.muted) return false;
+  return (
+    isAtRisk(r) ||
+    r.maintenanceStatus === "unmaintained" ||
+    isIncompatible(r) ||
+    r.updateAvailable
+  );
+}
+
 /**
  * Build the ranked insight list. Muted plugins are ignored throughout so a user
  * who has acknowledged a plugin doesn't keep getting nagged about it. Returned
@@ -39,9 +66,22 @@ export function buildInsights(results: PluginHealth[]): Insight[] {
   const live = results.filter((r) => !r.muted);
   const insights: Insight[] = [];
 
-  const incompatible = live.filter(
-    (r) => r.enabled && r.metrics.compatibility.value === 0
-  );
+  // Ranked first, above even "won't load": a plugin Obsidian has pulled from
+  // the directory may have been pulled for a security or policy reason, and the
+  // user has it installed right now. Deliberately carries no mute action.
+  const delisted = live.filter((r) => r.listing === "delisted");
+  if (delisted.length) {
+    insights.push({
+      id: "delisted",
+      tone: "bad",
+      icon: "shield-x",
+      title: `${delisted.length} plugin${delisted.length > 1 ? "s are" : " is"} no longer in the community directory`,
+      detail: `${names(delisted)} ${delisted.length > 1 ? "were" : "was"} listed once but ${delisted.length > 1 ? "have" : "has"} since been removed. Worth checking why before keeping ${delisted.length > 1 ? "them" : "it"}.`,
+      ids: delisted.map((r) => r.id),
+    });
+  }
+
+  const incompatible = live.filter((r) => r.enabled && isIncompatible(r));
   if (incompatible.length) {
     insights.push({
       id: "incompatible",
@@ -55,23 +95,27 @@ export function buildInsights(results: PluginHealth[]): Insight[] {
     });
   }
 
-  const unmaintained = live.filter((r) => r.maintenanceStatus === "unmaintained");
+  // Enabled-only, like every other cohort here. Offering to "disable" plugins
+  // that are already disabled inflated the count and did nothing.
+  const unmaintained = live.filter(
+    (r) => r.enabled && r.maintenanceStatus === "unmaintained"
+  );
   if (unmaintained.length) {
     insights.push({
       id: "unmaintained",
       tone: "bad",
       icon: "clock-alert",
-      title: `${unmaintained.length} plugin${unmaintained.length > 1 ? "s look" : " looks"} abandoned`,
-      detail: `No update in 18+ months: ${names(unmaintained)}. Consider replacing them.`,
+      title: `${unmaintained.length} plugin${unmaintained.length > 1 ? "s have" : " has"} no recent release`,
+      // Deliberately an observation, not a verdict. Release age alone cannot
+      // establish abandonment — plenty of good plugins are simply finished.
+      detail: `No recorded update in 18+ months: ${names(unmaintained)}. Worth checking whether they still work for you.`,
       ids: unmaintained.map((r) => r.id),
       action: "disable-unmaintained",
-      actionLabel: "Disable these",
+      actionLabel: "Review and disable",
     });
   }
 
-  const atRisk = live.filter(
-    (r) => r.enabled && r.overall != null && r.overall < 50
-  );
+  const atRisk = live.filter((r) => r.enabled && isAtRisk(r));
   if (atRisk.length) {
     insights.push({
       id: "at-risk",
@@ -95,15 +139,15 @@ export function buildInsights(results: PluginHealth[]): Insight[] {
     });
   }
 
-  const sideloaded = live.filter((r) => r.sideloaded === true);
-  if (sideloaded.length) {
+  const local = live.filter((r) => r.listing === "local");
+  if (local.length) {
     insights.push({
       id: "sideloaded",
       tone: "warn",
       icon: "shield-alert",
-      title: `${sideloaded.length} sideloaded plugin${sideloaded.length > 1 ? "s" : ""} skipped review`,
-      detail: `Not in Obsidian's community list: ${names(sideloaded)}.`,
-      ids: sideloaded.map((r) => r.id),
+      title: `${local.length} plugin${local.length > 1 ? "s were" : " was"} installed outside the directory`,
+      detail: `Not in Obsidian's community list, so ${local.length > 1 ? "they" : "it"} skipped community review: ${names(local)}.`,
+      ids: local.map((r) => r.id),
       action: "mute-sideloaded",
       actionLabel: "Mute these",
     });
