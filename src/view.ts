@@ -1035,10 +1035,14 @@ export class HealthDashboardView extends ItemView {
     for (const c of found.slice(0, 3)) {
       const line = box.createDiv({ cls: "flowkit-correlation-line" });
       line.createSpan({ cls: "flowkit-change-name", text: c.name });
+      // "2 hours after" is a claim about ordering. When the errors began inside
+      // the window the change happened in, that ordering isn't known, and
+      // asserting it would be the kind of confident wrongness this product is
+      // supposed to be the opposite of.
       line.createSpan({
-        text: ` started throwing errors ${describeGap(c.gapMs)} after it ${describeEvent(
-          c.event
-        )}.`,
+        text: c.approximate
+          ? ` started throwing errors around the time it ${describeEvent(c.event)}.`
+          : ` started throwing errors ${describeGap(c.gapMs)} after it ${describeEvent(c.event)}.`,
       });
     }
     box.createDiv({

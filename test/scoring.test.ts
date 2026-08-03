@@ -1430,6 +1430,39 @@ eq("prerelease vs prerelease", compareVersion("1.0.0-alpha", "1.0.0-beta"), -1);
     );
     eq("errors soon after an update correlate", hit.length, 1);
     eq("naming that update", hit[0].event.to, "2");
+    eq("and the ordering is known", hit[0].approximate, false);
+
+    // The case a real vault produced: FlowKit does not scan the instant a
+    // plugin updates, so the moment it NOTICES can land after the errors have
+    // already started. Anchoring to `at` alone silently discards exactly the
+    // correlation the feature exists to make.
+    const noticedLate: PluginEvent[] = [
+      {
+        at: NOW,
+        since: NOW - 4 * 3_600_000,
+        id: "a",
+        name: "A",
+        kind: "updated",
+        from: "1",
+        to: "2",
+      },
+    ];
+    const late = correlate(
+      noticedLate,
+      [{ id: "a", name: "A", firstAt: NOW - 2 * 3_600_000, uncaught: 5 }],
+      NOW
+    );
+    eq("an update noticed late still correlates", late.length, 1);
+    eq("but says the ordering is uncertain", late[0].approximate, true);
+    eq("and never reports a negative gap", late[0].gapMs, 0);
+
+    // Before the window opened is still not evidence about the change.
+    const tooEarly = correlate(
+      noticedLate,
+      [{ id: "a", name: "A", firstAt: NOW - 5 * 3_600_000, uncaught: 5 }],
+      NOW
+    );
+    eq("errors predating the window still don't correlate", tooEarly.length, 0);
 
     const old = correlate(
       events,

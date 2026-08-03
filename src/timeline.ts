@@ -10,7 +10,21 @@
 export type PluginEventKind = "installed" | "updated" | "removed" | "enabled" | "disabled";
 
 export interface PluginEvent {
+  /** When FlowKit NOTICED the change — an upper bound, not when it happened. */
   at: number;
+  /**
+   * When FlowKit last confirmed the previous state, so the change is known to
+   * have happened somewhere in `(since, at]`.
+   *
+   * The distinction matters more than it looks. A plugin updates, breaks
+   * thirty seconds later, and FlowKit does not scan until the error itself
+   * triggers a rescan — so `at` lands *after* the errors started and a
+   * strictly-ordered comparison concludes the update cannot be responsible.
+   * Anchoring to the start of the window is what lets the correlation fire in
+   * the one case people actually care about. Absent on the first event
+   * recorded for a plugin.
+   */
+  since?: number;
   id: string;
   name: string;
   kind: PluginEventKind;
@@ -73,6 +87,9 @@ export function diffInstalled(
     if (before.version !== plugin.version) {
       events.push({
         at,
+        // The old version was still there at `before.at`, so the update landed
+        // somewhere between then and now.
+        since: before.at,
         id: plugin.id,
         name: plugin.name,
         kind: "updated",
@@ -83,6 +100,7 @@ export function diffInstalled(
     if (before.enabled !== plugin.enabled) {
       events.push({
         at,
+        since: before.at,
         id: plugin.id,
         name: plugin.name,
         kind: plugin.enabled ? "enabled" : "disabled",
@@ -120,8 +138,14 @@ export interface Correlation {
   event: PluginEvent;
   /** When the errors started. */
   errorsFrom: number;
-  /** Gap between the change and the first error. */
+  /** Gap between noticing the change and the first error, floored at zero. */
   gapMs: number;
+  /**
+   * The errors began inside the window in which the change happened, so the
+   * order of the two is genuinely unknown. Reported rather than smoothed over:
+   * "two hours after" is a claim, and this is the case where we cannot make it.
+   */
+  approximate: boolean;
 }
 
 /** One plugin's error history, reduced to what the correlation needs. */
@@ -153,14 +177,16 @@ export function correlate(
     if (onset.firstAt == null || onset.uncaught === 0) continue;
     // The most recent qualifying change, so an old install doesn't outrank
     // yesterday's update.
+    const firstAt = onset.firstAt;
     const candidates = events
-      .filter(
-        (e) =>
-          e.id === onset.id &&
-          (e.kind === "updated" || e.kind === "installed") &&
-          e.at <= onset.firstAt! &&
-          onset.firstAt! - e.at <= windowMs
-      )
+      .filter((e) => {
+        if (e.id !== onset.id) return false;
+        if (e.kind !== "updated" && e.kind !== "installed") return false;
+        // Anchored to the START of the window the change happened in, not to
+        // the moment we noticed it — see PluginEvent.since.
+        const from = e.since ?? e.at;
+        return firstAt >= from && firstAt - from <= windowMs;
+      })
       .sort((a, b) => b.at - a.at);
     const event = candidates[0];
     if (!event) continue;
@@ -168,8 +194,9 @@ export function correlate(
       id: onset.id,
       name: onset.name,
       event,
-      errorsFrom: onset.firstAt,
-      gapMs: onset.firstAt - event.at,
+      errorsFrom: firstAt,
+      gapMs: Math.max(0, firstAt - event.at),
+      approximate: firstAt < event.at,
     });
   }
   // Most recent first — the one still fresh in the user's memory.
