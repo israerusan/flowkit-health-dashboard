@@ -166,6 +166,18 @@ export interface HealthSnapshot {
    * cliff the user did not cause. Absent on pre-1.0.0 entries.
    */
   model?: number;
+  /**
+   * Which device took this reading.
+   *
+   * The third condition that makes two readings incomparable, alongside
+   * `online` and `model`, and for exactly the same reason. A desktop with forty
+   * plugins and a phone with six do not have the same vault health, and when
+   * `data.json` is synced but the plugins are not, both were writing into one
+   * history — so the trend line zigzagged between two machines' scores, and
+   * whichever device scanned last silently overwrote the other's reading for
+   * the day. Absent on entries recorded before devices were told apart.
+   */
+  device?: string;
 }
 
 /**

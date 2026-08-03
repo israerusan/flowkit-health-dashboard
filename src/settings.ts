@@ -4,7 +4,8 @@ import type { BisectState } from "./bisect";
 import type { MuteMap } from "./mutes";
 import { describeMute } from "./mutes";
 import { AUTO_SNAPSHOT, type PluginProfile } from "./profiles";
-import type { PluginEvent, SeenMap } from "./timeline";
+import type { PluginEvent } from "./timeline";
+import { deviceCount, type DeviceSeen } from "./devices";
 import type { RepoActivityMap } from "./repoActivity";
 import type { RuntimeProfiles } from "./runtime";
 import type {
@@ -139,8 +140,18 @@ export interface FlowKitHealthSettings {
    * state has long since been overwritten.
    */
   bisectUndo: BisectState | null;
-  /** What each plugin looked like on the last scan, to notice it changing. */
-  seenPlugins: SeenMap;
+  /**
+   * What each plugin looked like on the last scan, PER DEVICE.
+   *
+   * Was one flat map, which is correct for exactly one machine. Obsidian syncs
+   * plugin settings and installed plugins as separate options, so a vault whose
+   * `data.json` is shared between a desktop and a phone with different plugin
+   * sets had the two devices diffing against each other's view — each emitting
+   * an "uninstalled" event for every plugin it did not have, then overwriting
+   * the map so the other could do the same back. Migrated on load; see
+   * `migrateSeen`.
+   */
+  seenPlugins: DeviceSeen;
   /** Installs, updates, removals and toggles, newest last. Pruned to 90 days. */
   events: PluginEvent[];
   /** Whether the install baseline has been taken; the first scan is silent. */
@@ -470,6 +481,37 @@ export class FlowKitHealthSettingTab extends PluginSettingTab {
             this.display();
           })
       );
+
+    // Only shown once a second device has actually recorded something. On the
+    // overwhelmingly common single-device vault this is a setting about a
+    // problem the user does not have, and saying nothing is the right amount.
+    const devices = deviceCount(this.plugin.settings.seenPlugins);
+    if (devices > 1) {
+      new Setting(containerEl)
+        .setName("Other devices")
+        .setDesc(
+          `This vault's settings are shared with ${devices - 1} other device${
+            devices === 2 ? "" : "s"
+          }. FlowKit keeps each one's plugin list, errors and measurements apart, so a device ` +
+            `doesn't delete readings for plugins it doesn't have — and the trend chart shows only ` +
+            `this device's own readings. A device that stops syncing is forgotten after 90 days.`
+        )
+        .addButton((btn) =>
+          btn.setButtonText("Forget the others").onClick(async () => {
+            const mine = this.plugin.settings.seenPlugins[this.plugin.deviceId];
+            this.plugin.settings.seenPlugins = mine ? { [this.plugin.deviceId]: mine } : {};
+            // The readings go with them: keeping snapshots from a device whose
+            // plugin list has just been dropped would leave a series nothing
+            // can be compared against.
+            this.plugin.settings.history = this.plugin.settings.history.filter((h) =>
+              this.plugin.isThisDevice(h)
+            );
+            await this.plugin.saveSettings();
+            this.plugin.refreshViews(true);
+            this.display();
+          })
+        );
+    }
 
     new Setting(containerEl).setName("Muted and watched").setHeading();
 

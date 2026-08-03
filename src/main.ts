@@ -45,6 +45,13 @@ import {
   type PluginEvent,
 } from "./timeline";
 import {
+  DEVICE_RETENTION_MS,
+  migrateSeen,
+  pluginsKnownToAnyDevice,
+  pruneDevices,
+  SHARED_DEVICE,
+} from "./devices";
+import {
   AUTO_SNAPSHOT,
   deleteProfile,
   profileDelta,
@@ -243,6 +250,18 @@ export default class FlowKitHealthPlugin extends Plugin {
    */
   settingsUnreadable = false;
 
+  /**
+   * Which device this is.
+   *
+   * Deliberately NOT stored in `data.json`: that file is the thing being
+   * synced, so an id kept in it would be the same on every machine and answer
+   * nothing. It lives in `localStorage`, which Obsidian does not sync, and it
+   * is the only piece of FlowKit's state that is per-device by design.
+   *
+   * Resolved once in `onload`, before anything reads the stores.
+   */
+  deviceId: string = SHARED_DEVICE;
+
   /** A bisect record that survived to disk in a shape we can't act on. */
   bisectSalvage: unknown = null;
 
@@ -258,7 +277,39 @@ export default class FlowKitHealthPlugin extends Plugin {
    */
   lapsedMutes: string[] = [];
 
+  /**
+   * This device's id, from `localStorage`, minted on first run.
+   *
+   * `localStorage` is per-device and not synced, which is the whole
+   * requirement. It is reached directly because Obsidian's own per-device
+   * helpers are not in the public typings, and it is wrapped because a webview
+   * with storage disabled must degrade rather than fail: every such device
+   * shares one bucket, which is precisely how FlowKit behaved before device
+   * identity existed. Worse than the ideal, no worse than the past.
+   */
+  private resolveDeviceId(): string {
+    const key = "flowkit-health-dashboard:device";
+    try {
+      const stored = window.localStorage.getItem(key);
+      if (stored) return stored;
+      // `typeof crypto`, not `crypto?.` — optional chaining does not protect
+      // against an undeclared identifier, it only guards a null value.
+      const minted =
+        typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+          ? crypto.randomUUID()
+          : `d${Date.now().toString(36)}${Math.floor(Math.random() * 1e9).toString(36)}`;
+      window.localStorage.setItem(key, minted);
+      return minted;
+    } catch (err) {
+      console.error("FlowKit: no per-device storage available", err);
+      return SHARED_DEVICE;
+    }
+  }
+
   async onload(): Promise<void> {
+    // Before loadSettings: the migration of the old single-device record files
+    // it under this device, so the id has to exist first.
+    this.deviceId = this.resolveDeviceId();
     await this.loadSettings();
     this.refreshLicense();
 
@@ -811,9 +862,10 @@ export default class FlowKitHealthPlugin extends Plugin {
     if (!Array.isArray(this.settings.watched)) this.settings.watched = [];
     if (!Array.isArray(this.settings.events)) this.settings.events = [];
     if (!Array.isArray(this.settings.profiles)) this.settings.profiles = [];
-    if (!this.settings.seenPlugins || typeof this.settings.seenPlugins !== "object") {
-      this.settings.seenPlugins = {};
-    }
+    // Upgraded in place from the pre-1.7 flat map — see `migrateSeen`. Also the
+    // guard against a hand-edited or sync-mangled value, since it validates the
+    // shape of every bucket it keeps.
+    this.settings.seenPlugins = migrateSeen(this.settings.seenPlugins, this.deviceId);
     // A half-written bisect can't be acted on: it would claim a set of plugins
     // to restore that it can't actually name. But it must not simply be
     // deleted, because the vault it describes may right now be half switched
@@ -1158,7 +1210,7 @@ export default class FlowKitHealthPlugin extends Plugin {
 
     // Uninstalling a plugin should also drop everything recorded about it,
     // rather than leaving it to accumulate in data.json indefinitely.
-    if (this.pruneStores(installedIds)) dirty = true;
+    if (this.pruneStores(installedIds, now)) dirty = true;
 
     if (
       this.settings.checkRepoActivity &&
@@ -1244,8 +1296,24 @@ export default class FlowKitHealthPlugin extends Plugin {
    * Returns whether anything changed, so the caller can fold the write into the
    * scan's single save.
    */
-  private pruneStores(installed: Set<string>): boolean {
+  private pruneStores(installedHere: Set<string>, now: number): boolean {
     let dirty = false;
+    // "Not installed on this machine" is not "uninstalled".
+    //
+    // This deleted every stored reading for every plugin the current device
+    // happened not to have — which, on a vault whose settings are synced but
+    // whose plugins are not, is most of them. A phone would wipe the desktop's
+    // error history, measured load times and repository readings on its first
+    // scan; the desktop would wipe the phone's on its next. Nothing was ever
+    // kept long enough to be worth having.
+    //
+    // The question that actually decides whether a record is dead is whether
+    // ANY device has seen the plugin lately, and that is what is asked now.
+    // Anything genuinely uninstalled everywhere still ages out, because the
+    // device that had it stops listing it and its bucket eventually expires.
+    const keep = pluginsKnownToAnyDevice(this.settings.seenPlugins, now);
+    for (const id of installedHere) keep.add(id);
+    const installed = keep;
     const errors = pruneErrorLog(this.settings.errorLog, installed);
     if (Object.keys(errors).length !== Object.keys(this.settings.errorLog).length) {
       this.settings.errorLog = errors;
@@ -1276,6 +1344,18 @@ export default class FlowKitHealthPlugin extends Plugin {
         this.settings.cache = { ...cache, plugins };
         dirty = true;
       }
+    }
+    // `notified` was never pruned at all. It is now carried forward for plugins
+    // this scan couldn't see — which is what stops another device's trouble
+    // state being forgotten and then re-announced — so it needs the same
+    // expiry as everything else or it only ever grows.
+    const notified = this.settings.notified;
+    const liveIds = Object.keys(notified).filter((id) => installed.has(id));
+    if (liveIds.length !== Object.keys(notified).length) {
+      const next: Record<string, HealthChangeKind[]> = {};
+      for (const id of liveIds) next[id] = notified[id];
+      this.settings.notified = next;
+      dirty = true;
     }
     return dirty;
   }
@@ -1744,8 +1824,25 @@ export default class FlowKitHealthPlugin extends Plugin {
     // change tracking indefinitely.
     if (this.recordingSuspended()) return false;
 
+    // Diffed against what THIS device last saw, never against the shared union.
+    //
+    // The record used to be one flat map with no notion of whose view it was,
+    // which is correct for exactly one device. With settings synced and plugins
+    // not — a supported and common Obsidian configuration — a phone with six
+    // plugins would diff against a desktop's forty, emit thirty-four
+    // "uninstalled" events, and overwrite the map with its own six; the desktop
+    // would then emit thirty-four "installed" events and overwrite it back.
+    // A vault's change history would be nothing but that, forever.
+    const everyDevice = this.settings.seenPlugins;
+    const mine = everyDevice[this.deviceId];
+    // A device that has never scanned this vault has no baseline of its own,
+    // and every plugin on it would otherwise read as newly installed — the
+    // fabricated-events mistake, one machine at a time. Its first pass records
+    // silently, exactly as the very first pass on the first device did.
+    const firstScanHere = mine == null;
+
     const { events, seen } = diffInstalled(
-      this.settings.seenPlugins,
+      mine ?? {},
       // Built from every installed manifest, not from the scored rows: with
       // "show disabled plugins" off, the rows exclude disabled ones, and every
       // plugin the user switched off would be recorded as uninstalled.
@@ -1756,13 +1853,20 @@ export default class FlowKitHealthPlugin extends Plugin {
         enabled: enabledSet.has(m.id),
       })),
       now,
-      this.settings.eventBaselineSet
+      this.settings.eventBaselineSet && !firstScanHere
     );
-    this.settings.seenPlugins = seen;
+    // Other devices' views are carried through untouched; only stale ones go.
+    this.settings.seenPlugins = pruneDevices(
+      { ...everyDevice, [this.deviceId]: seen },
+      now
+    );
     if (!this.settings.eventBaselineSet) {
       this.settings.eventBaselineSet = true;
       return true;
     }
+    // Worth a write on its own: this device's baseline is what stops the next
+    // scan announcing its whole plugin list.
+    if (firstScanHere) return true;
     if (!events.length) return false;
     this.settings.events = pruneEvents([...this.settings.events, ...events], now);
     return true;
@@ -2158,20 +2262,65 @@ export default class FlowKitHealthPlugin extends Plugin {
     // today's reading is compared against a stale entry, appended instead of
     // replaced, and the cap then starts discarding the newest readings.
     const history = this.settings.history.slice().sort((a, b) => a.at - b.at);
-    const last = history[history.length - 1];
-    if (last && sameDay(last.at, snapshot.at)) {
+    const stamped: HealthSnapshot = { ...snapshot, device: this.deviceId };
+
+    // Scoped to this device, because a reading from another one is not a
+    // reading about this vault as this machine sees it. With settings synced
+    // and plugins not, the desktop's forty-plugin score and the phone's
+    // six-plugin score were landing in one series — and, being on the same day,
+    // silently overwriting each other. `online` and `model` already exist to
+    // keep incomparable readings off one line; the device is the third such
+    // condition and was the only one unguarded.
+    const mine = (h: HealthSnapshot): boolean => this.isThisDevice(h);
+    let replaced = false;
+    for (let i = history.length - 1; i >= 0; i--) {
+      const entry = history[i];
+      if (!mine(entry)) continue;
+      if (!sameDay(entry.at, stamped.at)) break;
       // Never let a degraded offline reading overwrite a full one from the same
       // day — that turned a network hiccup into an apparent health event.
-      if (last.online && !snapshot.online) return;
-      history[history.length - 1] = snapshot;
-    } else {
-      history.push(snapshot);
+      if (entry.online && !stamped.online) return;
+      history[i] = stamped;
+      replaced = true;
+      break;
     }
-    if (history.length > MAX_HISTORY) {
-      history.splice(0, history.length - MAX_HISTORY);
+    if (!replaced) history.push(stamped);
+
+    // Capped per device, so a second machine cannot halve the window the first
+    // one keeps. The cap was a flat count over a series that now interleaves.
+    //
+    // Also aged out, which a flat count never needed to do: entries from a
+    // device that has stopped syncing — and entries written before devices were
+    // told apart — are added to by nothing, so a count-based cap alone would
+    // hold its last ninety of them for the life of the vault. Nothing shows a
+    // reading older than the 90-day Pro window anyway.
+    const oldest = stamped.at - DEVICE_RETENTION_MS;
+    const kept = new Map<string, HealthSnapshot[]>();
+    for (const entry of history) {
+      if (entry.at < oldest) continue;
+      const key = entry.device ?? "";
+      const bucket = kept.get(key) ?? [];
+      bucket.push(entry);
+      kept.set(key, bucket);
     }
-    this.settings.history = history;
+    const trimmed: HealthSnapshot[] = [];
+    for (const bucket of kept.values()) {
+      trimmed.push(...bucket.slice(-MAX_HISTORY));
+    }
+    this.settings.history = trimmed.sort((a, b) => a.at - b.at);
     await this.saveSettings();
+  }
+
+  /**
+   * Whether a stored reading was taken by this machine.
+   *
+   * Readings written before devices were told apart carry no id. They are
+   * counted as this device's rather than discarded: they are almost certainly
+   * from the machine that has been scanning all along, and dropping them would
+   * blank an existing trend chart on upgrade to prove a point.
+   */
+  isThisDevice(snapshot: HealthSnapshot): boolean {
+    return snapshot.device == null || snapshot.device === this.deviceId;
   }
 }
 

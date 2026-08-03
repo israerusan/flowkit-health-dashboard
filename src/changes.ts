@@ -68,6 +68,26 @@ export function diffTrouble(
       fresh.push({ at, id: r.id, name: r.name, kind: "resolved" });
     }
   }
+
+  // Plugins this scan never looked at keep the state they had.
+  //
+  // `current` was built only from the rows it was given, so anything absent
+  // from them was silently forgotten — and this map is the memory that stops a
+  // problem being re-announced. Two ways that bites: with settings synced and
+  // plugins not, each device drops the other's plugins every scan and both
+  // re-report everything as newly wrong on the next; and with "show disabled
+  // plugins" off, a plugin switched off loses its record and re-announces its
+  // old trouble as fresh the day it comes back.
+  //
+  // Not judging what it cannot see is the same principle as `evaluable` above,
+  // one level up: there it is a kind this scan couldn't assess, here it is a
+  // whole plugin. Expiry is the caller's job — see `pruneStores`.
+  const judged = new Set(rows.map((r) => r.id));
+  for (const [id, kinds] of Object.entries(previous)) {
+    if (judged.has(id) || !kinds.length) continue;
+    current[id] = kinds;
+  }
+
   return { fresh, current };
 }
 

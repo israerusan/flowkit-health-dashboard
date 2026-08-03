@@ -2591,10 +2591,17 @@ export class HealthDashboardView extends ItemView {
     //  - readings from an older scoring model, which are a different scale.
     // Applied before the window is cut, so the upsell below can count what the
     // window actually costs the reader rather than what these filters removed.
+    // …and a third: readings taken on another device. Where `data.json` is
+    // synced and the installed plugins are not, a phone with six plugins and a
+    // desktop with forty were drawing one polyline between two different
+    // vaults' health.
     const comparable = this.plugin.settings.history
       .filter(
         (h): h is HealthSnapshot & { avg: number } =>
-          h.avg != null && h.online !== false && h.model === SCORING_MODEL
+          h.avg != null &&
+          h.online !== false &&
+          h.model === SCORING_MODEL &&
+          this.plugin.isThisDevice(h)
       )
       .sort((a, b) => a.at - b.at);
     const history = comparable.filter((h) => h.at >= cutoff);

@@ -68,6 +68,12 @@ import {
   type PluginProfile,
 } from "../src/profiles";
 import { redactUserContent, searchTerms } from "../src/issueSearch";
+import {
+  DEVICE_RETENTION_MS,
+  migrateSeen,
+  pluginsKnownToAnyDevice,
+  pruneDevices,
+} from "../src/devices";
 import { tickScore } from "../src/runtime";
 
 const DAY = 86_400_000;
@@ -942,6 +948,34 @@ eq("prerelease vs prerelease", compareVersion("1.0.0-alpha", "1.0.0-beta"), -1);
     const unmuted = diffTrouble(muted.current, [row("a", ["error-started"])], ALL, 2);
     eq("unmuting doesn't re-announce it", unmuted.fresh.length, 0);
   }
+
+  // A plugin this scan never looked at keeps the state it had.
+  //
+  // `current` was built only from the rows it was given, so anything absent was
+  // silently forgotten — and this map is the memory that stops a problem being
+  // announced twice. Two ways that bites: a second device, whose rows are its
+  // own smaller plugin list, drops the first device's plugins on every scan so
+  // both re-report everything as newly wrong; and with "show disabled plugins"
+  // off, a plugin switched off loses its record and re-announces its old
+  // trouble the day it comes back.
+  {
+    const before = { a: ["error-started" as const], b: ["delisted" as const] };
+    // This device only has `a`.
+    const partial = diffTrouble(before, [row("a", ["error-started"])], ALL, 2);
+    eq("a plugin this scan couldn't see keeps its state", partial.current.b?.join(), "delisted");
+    eq("and generates no news", partial.fresh.length, 0);
+
+    // The other device scans, sees only `b`, and must not re-announce `a`.
+    const other = diffTrouble(partial.current, [row("b", ["delisted"])], ALL, 3);
+    eq("…so the other device doesn't re-announce it either", other.fresh.length, 0);
+    eq("and both states survive the round trip", Object.keys(other.current).sort().join(), "a,b");
+
+    // A plugin that really is in the rows and really has recovered still
+    // resolves — carrying state forward must not swallow good news.
+    const recovered = diffTrouble(other.current, [row("a", [])], ALL, 4);
+    eq("a plugin that recovered is still reported", recovered.fresh.length, 1);
+    eq("as resolved", recovered.fresh[0].kind, "resolved");
+  }
 }
 
 // --- runtime footprint -------------------------------------------------------
@@ -1035,6 +1069,115 @@ eq("prerelease vs prerelease", compareVersion("1.0.0-alpha", "1.0.0-beta"), -1);
     currentLoadMs({ loadMs: 900 }, "2.0.0"),
     900
   );
+}
+
+// --- two devices, one data.json ---------------------------------------------
+//
+// Obsidian syncs plugin SETTINGS and installed PLUGINS as separate options, so a
+// desktop with four plugins and a phone with two can share one `data.json`.
+// Every per-plugin store here was written as though "not installed" meant
+// "gone", which under that configuration made the two devices take turns
+// deleting each other's data and filling the timeline with events that never
+// happened. This walks the exact alternation.
+{
+  const DESKTOP = "device-desktop";
+  const PHONE = "device-phone";
+  const desktopPlugins = ["dataview", "templater", "calendar", "tasks"];
+  const phonePlugins = ["dataview", "templater"];
+  const observed = (ids: string[]) =>
+    ids.map((id) => ({ id, name: id, version: "1.0.0", enabled: true }));
+
+  // The desktop has been running for a while; the phone has never scanned.
+  let seen = migrateSeen({}, DESKTOP);
+  const desktopFirst = diffInstalled(seen[DESKTOP] ?? {}, observed(desktopPlugins), NOW, false);
+  seen = { ...seen, [DESKTOP]: desktopFirst.seen };
+  eq("the first pass on a device records a baseline silently", desktopFirst.events.length, 0);
+
+  // The phone syncs and scans for the first time. It has never had a bucket, so
+  // it takes its own baseline — it must NOT announce two installs, and it must
+  // not report the desktop's other two as uninstalled.
+  const phoneFirst = diffInstalled(seen[PHONE] ?? {}, observed(phonePlugins), NOW + 1000, false);
+  seen = { ...seen, [PHONE]: phoneFirst.seen };
+  eq("a second device's first scan announces nothing", phoneFirst.events.length, 0);
+  eq(
+    "and does not erase the first device's view",
+    Object.keys(seen[DESKTOP]).sort().join(),
+    desktopPlugins.slice().sort().join()
+  );
+
+  // Now both devices scan repeatedly with nothing actually changing.
+  let churn = 0;
+  for (let round = 0; round < 3; round++) {
+    const d = diffInstalled(seen[DESKTOP], observed(desktopPlugins), NOW + 2000 + round * 20, true);
+    seen = { ...seen, [DESKTOP]: d.seen };
+    churn += d.events.length;
+    const p = diffInstalled(seen[PHONE], observed(phonePlugins), NOW + 2010 + round * 20, true);
+    seen = { ...seen, [PHONE]: p.seen };
+    churn += p.events.length;
+  }
+  eq("neither device invents an event about the other's plugins", churn, 0);
+
+  // A plugin genuinely uninstalled ON THE PHONE is still reported, by the phone.
+  const removedOnPhone = diffInstalled(seen[PHONE], observed(["dataview"]), NOW + 5000, true);
+  seen = { ...seen, [PHONE]: removedOnPhone.seen };
+  eq("a real uninstall is still noticed", removedOnPhone.events.length, 1);
+  eq("and named correctly", removedOnPhone.events[0].kind, "removed");
+  eq("and attributed to the right plugin", removedOnPhone.events[0].id, "templater");
+
+  // …and the desktop, which still has it, says nothing and keeps it.
+  const desktopAfter = diffInstalled(seen[DESKTOP], observed(desktopPlugins), NOW + 6000, true);
+  eq("the other device does not re-announce it", desktopAfter.events.length, 0);
+
+  // The store-pruning question is "has ANY current device seen this", not "is it
+  // installed here". Before this, the phone's scan deleted the error history,
+  // measured load times and repository readings for calendar and tasks.
+  const known = pluginsKnownToAnyDevice(seen, NOW + 6000);
+  check("a plugin only the desktop has is still known", known.has("calendar"));
+  check("…and so is the other one", known.has("tasks"));
+  check("a plugin uninstalled on the phone but kept on the desktop survives", known.has("templater"));
+
+  // A device that stops syncing is eventually forgotten, or the record only ever
+  // grows: every machine the vault was ever opened on would pin storage forever.
+  const stale = pruneDevices(seen, NOW + 6000 + DEVICE_RETENTION_MS + 1);
+  eq("a device that stopped syncing is dropped", Object.keys(stale).length, 0);
+  const fresh = pruneDevices(seen, NOW + 6000);
+  eq("a device that is still syncing is kept", Object.keys(fresh).sort().join(), [DESKTOP, PHONE].sort().join());
+  check(
+    "and its plugins stop being known once it is gone",
+    !pluginsKnownToAnyDevice(seen, NOW + 6000 + DEVICE_RETENTION_MS + 1).has("calendar")
+  );
+}
+
+// --- migrating the single-device record --------------------------------------
+{
+  const flat = {
+    dataview: { version: "1.0.0", enabled: true, at: NOW },
+    templater: { version: "2.0.0", enabled: false, at: NOW },
+  };
+  const migrated = migrateSeen(flat, "device-a");
+  eq("a pre-1.7 flat map becomes this device's view", Object.keys(migrated).join(), "device-a");
+  eq(
+    "with nothing lost",
+    Object.keys(migrated["device-a"]).sort().join(),
+    "dataview,templater"
+  );
+  // Which matters because the alternative is announcing the whole plugin list
+  // as newly installed the day the upgrade lands.
+  const after = diffInstalled(
+    migrated["device-a"],
+    [
+      { id: "dataview", name: "Dataview", version: "1.0.0", enabled: true },
+      { id: "templater", name: "Templater", version: "2.0.0", enabled: false },
+    ],
+    NOW + 1000,
+    true
+  );
+  eq("so the first scan after upgrading announces nothing", after.events.length, 0);
+
+  const already = migrateSeen({ "device-a": flat }, "device-b");
+  eq("an already-migrated record is left alone", Object.keys(already).join(), "device-a");
+  eq("junk is discarded", Object.keys(migrateSeen("nonsense", "device-a")).length, 0);
+  eq("as is a mangled bucket", Object.keys(migrateSeen({ "device-a": 7 }, "device-b")).length, 0);
 }
 
 // --- redaction: what leaves the machine --------------------------------------

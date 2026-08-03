@@ -3,6 +3,67 @@
 All notable changes to FlowKit Plugin Health Dashboard are documented here. This
 project follows [Semantic Versioning](https://semver.org/).
 
+## [1.7.0] - 2026-08-03
+
+The known issue 1.6.1 shipped with, fixed.
+
+Obsidian syncs your plugin **settings** and your installed **plugins** as two
+separate options, and plenty of people turn on the first without the second — a
+desktop with forty plugins and a phone with six, sharing one `data.json`. Every
+per-plugin store FlowKit keeps was written on the assumption that "not installed"
+means "gone", and under that configuration the assumption is false in the most
+damaging way available.
+
+What actually happened: the phone scanned, concluded that thirty-four plugins had
+been uninstalled, deleted their error history, their measured load times and
+their repository readings, and wrote thirty-four "uninstalled" events into the
+vault's change history. The desktop then scanned, concluded the same about the
+phone's six, and put its own thirty-four back as fresh installs. The two devices
+took turns erasing each other's data and filling the timeline with events that
+never happened, and nothing was ever kept long enough to be worth having.
+
+### What each device saw is now recorded under that device
+
+- **A plugin missing from this machine is absent, not uninstalled.** Whether a
+  stored reading is still worth keeping is now decided by whether *any* current
+  device has seen the plugin lately, not by whether this one has it installed.
+  Anything genuinely gone everywhere still ages out.
+- **The change history only reports what happened on the device that saw it.**
+  Each machine diffs against its own previous view, so a plugin you don't have
+  is simply not your business — while a plugin you really did uninstall is still
+  reported, by you, immediately.
+- **A device's first scan of a shared vault records a baseline silently**, the
+  same way the very first scan on the very first device always has. Otherwise a
+  phone joining the vault would announce its whole plugin list as newly
+  installed — the fabricated-events mistake, one machine at a time.
+- **Trouble state survives a scan that couldn't see the plugin.** The map that
+  remembers which plugins are currently in trouble was rebuilt from only the
+  rows each scan looked at, so each device forgot the other's plugins every pass
+  and both re-announced everything as newly wrong on the next. This also fixes a
+  single-device case: with "show disabled plugins" off, a plugin you switched
+  off used to re-announce its old trouble as fresh the day it came back.
+- **The trend chart shows this device's own readings.** Two machines with
+  different plugin sets do not have the same vault health, and they were drawing
+  one polyline between them — each silently overwriting the other's reading for
+  the day. `online` and `model` already exist to keep incomparable readings off
+  one line; the device was the third such condition and the only one unguarded.
+  The 90-reading cap is now per device, so a second machine can't halve the
+  window the first one keeps.
+- **A device that stops syncing is forgotten after 90 days.** Without it the
+  record only ever grows: every machine the vault has ever been opened on would
+  pin storage in every other machine's settings forever. Settings → **Other
+  devices** shows how many are sharing this vault and forgets the rest on demand;
+  it stays hidden entirely until there is more than one.
+
+The device identity lives in local storage, which Obsidian does not sync — the
+only place it could mean anything. A device without durable local storage shares
+one identity with any others in the same position, which is exactly how FlowKit
+behaved before any of this existed: worse than the ideal, no worse than the past.
+
+**Upgrading changes nothing on a single-device vault.** The existing record is
+filed under this device, so the first scan afterwards diffs against exactly the
+same data it would have before, and announces nothing.
+
 ## [1.6.1] - 2026-08-03
 
 1.6.0 was reviewed by five specialists — robustness, performance, maintainability,
@@ -125,6 +186,8 @@ a supported Obsidian configuration. `pruneStores` and `recordEvents` both assume
 take turns deleting each other's stored readings and writing a flip-flopping
 install/uninstall timeline. It needs a design, not a patch, and it is the most
 likely place for the next serious bug in this codebase.
+
+*(Fixed in 1.7.0.)*
 
 ## [1.6.0] - 2026-08-03
 

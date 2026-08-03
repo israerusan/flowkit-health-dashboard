@@ -451,6 +451,33 @@ look up, and only when you press the button.
   list here.
 - **Watched plugins** — the ones FlowKit leads with and never recommends for a
   bulk disable.
+- **Other devices** *(only shown when there is more than one)* — how many
+  machines share this vault's settings, and a way to forget the ones you no
+  longer use.
+
+## More than one device
+
+Obsidian syncs your plugin **settings** and your installed **plugins** as two
+separate options, so a desktop with forty plugins and a phone with six can share
+one settings file. FlowKit keeps each device's view apart:
+
+- **A plugin missing from this machine is absent, not uninstalled.** Its error
+  history, measured load times and repository readings are kept as long as any
+  device still has it — so your phone can't delete what your desktop recorded.
+- **The change history only reports what happened on the device that saw it.**
+  Without this, each machine reported every plugin the other had as
+  "uninstalled" on every scan, forever.
+- **The trend chart shows this device's own readings.** Two machines with
+  different plugin sets do not have the same vault health, and averaging them
+  into one line is the same mistake as plotting an offline reading beside a full
+  one — which FlowKit already refuses to do.
+- **A device that stops syncing is forgotten after 90 days**, or immediately
+  from Settings → Other devices.
+
+The device identity lives in local storage, not in the synced settings file —
+which is the only place it could mean anything. If a device has no local storage
+available, it shares one identity with any others in the same position, which is
+exactly how FlowKit behaved before any of this existed.
 
 ## Development
 
