@@ -1,6 +1,6 @@
 {
   "name": "flowkit-health-dashboard",
-  "version": "1.7.0",
+  "version": "1.7.1",
   "description": "FlowKit Plugin Health Dashboard for Obsidian.",
   "main": "main.js",
   "type": "module",

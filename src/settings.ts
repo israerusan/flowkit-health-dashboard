@@ -96,7 +96,10 @@ export interface FlowKitHealthSettings {
   trackConsoleErrors: boolean;
   /** When error watching started, so "no errors" only counts once it means something. */
   watchingSince: number | null;
-  /** Errors observed, keyed by plugin id. Local only; never transmitted. */
+  /**
+   * Errors observed, keyed by plugin id. Written locally; only ever sent
+   * anywhere by an explicit user action, and redacted when it is.
+   */
   errorLog: Record<string, PluginErrorRecord>;
   /**
    * Measure what plugins cost while running — load time and repeating timers.
@@ -352,14 +355,22 @@ export class FlowKitHealthSettingTab extends PluginSettingTab {
       .setName("Watch for plugin errors")
       .setDesc(
         "Attribute runtime errors to the plugin that threw them. Everything " +
-          "stays on this device — error messages and stack traces are never sent anywhere."
+          "stays on this device. Nothing is transmitted by scanning; the only thing that " +
+          "ever sends error text is the “Is this a known issue?” button, which searches that " +
+          "plugin's own tracker and redacts your file and note names first."
       )
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.trackErrors).onChange(async (value) => {
           this.plugin.settings.trackErrors = value;
-          if (value && this.plugin.settings.watchingSince == null) {
-            this.plugin.settings.watchingSince = Date.now();
-          }
+          // Cleared on the way OUT, not only stamped on the way in.
+          //
+          // It was left at its old value, and only re-stamped when null — so a
+          // user who switched watching off in January and back on in July got
+          // an observation window of six months, instantly, for a period when
+          // the watcher provably was not running. Every clean plugin then
+          // scored a fully measured Reliability 100 on the first scan, and the
+          // hero read "watching 6 months".
+          this.plugin.settings.watchingSince = value ? Date.now() : null;
           await this.plugin.saveSettings();
           new Notice("Reload Obsidian for this to take effect.");
           this.display();
@@ -492,9 +503,11 @@ export class FlowKitHealthSettingTab extends PluginSettingTab {
         .setDesc(
           `This vault's settings are shared with ${devices - 1} other device${
             devices === 2 ? "" : "s"
-          }. FlowKit keeps each one's plugin list, errors and measurements apart, so a device ` +
+          }. FlowKit keeps each one's plugin list apart, so a device ` +
             `doesn't delete readings for plugins it doesn't have — and the trend chart shows only ` +
-            `this device's own readings. A device that stops syncing is forgotten after 90 days.`
+            `this device's own readings. A device that stops syncing is forgotten after 90 days. ` +
+            `Recorded errors and measured load times are still shared between devices, so a ` +
+            `plugin's Reliability and Footprint can include what another machine saw.`
         )
         .addButton((btn) =>
           btn.setButtonText("Forget the others").onClick(async () => {

@@ -443,6 +443,28 @@ function scoreReliability(i: ScoreInput): MetricScore {
   const observed = i.observedMs ?? 0;
   const record = i.errors;
 
+  // No window at all means no rate, whatever was recorded.
+  //
+  // With error watching switched off `observedMs` is 0, and `errorRatePerDay`
+  // divides nothing by nothing and returns 0 — which `reliabilityScore` reads
+  // as a perfect record. So a plugin with thirteen recorded errors scored
+  // Reliability 100, printed "13 unhandled errors" in the same cell, and came
+  // out TEN POINTS HIGHER overall than the same plugin with watching switched
+  // on. Turning off the feature that finds errors improved the score of a
+  // plugin that was throwing them.
+  //
+  // This is the same self-contradiction the window below was rewritten to
+  // remove, in the one case that rewrite didn't cover: it fixed "watching, but
+  // not for long enough" and left "not watching at all".
+  if (observed <= 0) {
+    const seen = record?.uncaught ?? 0;
+    return UNAVAILABLE(
+      seen > 0
+        ? `${seen} unhandled error${seen === 1 ? " was" : "s were"} recorded before error watching was switched off. Without a watching period there is nothing to measure them against.`
+        : "Error watching is switched off, so there is nothing to judge this on."
+    );
+  }
+
   // The observation window exists so that SILENCE means something: a plugin
   // that hasn't thrown in ninety seconds is not thereby reliable. It was
   // applied to failures too, which is the opposite mistake — errors already

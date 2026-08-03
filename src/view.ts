@@ -48,7 +48,7 @@ import {
 } from "./bisect";
 import { describeEvent, describeGap } from "./timeline";
 import { AUTO_SNAPSHOT, isNoop, type PluginProfile } from "./profiles";
-import { findKnownIssues, redactUserContent } from "./issueSearch";
+import { buildRedactor, findKnownIssues } from "./issueSearch";
 import { BulkConfirmModal } from "./ui/BulkConfirmModal";
 import { BisectStartModal } from "./ui/BisectModal";
 import { MuteModal } from "./ui/MuteModal";
@@ -351,6 +351,25 @@ export class HealthDashboardView extends ItemView {
 
   async onClose(): Promise<void> {
     this.cancelSearchFlush();
+  }
+
+  /**
+   * A redactor that knows this vault's own file and folder names.
+   *
+   * Built per action rather than cached: it is used by two buttons a user
+   * presses occasionally, and a cached copy would go stale the moment somebody
+   * renamed the note the error is about — which is exactly the note whose name
+   * must not be published.
+   */
+  private redactor(): (text: string) => string {
+    const names = new Set<string>();
+    for (const file of this.app.vault.getAllLoadedFiles()) {
+      if (file.name) names.add(file.name);
+      if (file.path) names.add(file.path);
+      const basename = (file as { basename?: string }).basename;
+      if (basename) names.add(basename);
+    }
+    return buildRedactor(names);
   }
 
   /** Re-render from the results already in hand, without rescanning. */
@@ -2385,7 +2404,7 @@ export class HealthDashboardView extends ItemView {
   ): Promise<void> {
     trigger.disabled = true;
     trigger.setText("Looking…");
-    const result = await findKnownIssues(r.repo, message);
+    const result = await findKnownIssues(r.repo, message, this.redactor());
     trigger.remove();
 
     if (!result.ok) {
@@ -2394,7 +2413,9 @@ export class HealthDashboardView extends ItemView {
         text:
           result.reason === "rate-limited"
             ? "GitHub is rate-limiting searches right now — try again in a minute."
-            : "Couldn't search that repository.",
+            : result.reason === "nothing-searchable"
+              ? "Nothing in this message can be searched without sending your own file names, so FlowKit didn't send it."
+              : "Couldn't search that repository.",
       });
       return;
     }
@@ -2436,6 +2457,7 @@ export class HealthDashboardView extends ItemView {
    * power users reading their issue trackers.
    */
   private async copyBugReport(r: PluginHealth): Promise<void> {
+    const redact = this.redactor();
     const lines: string[] = [];
     lines.push(`**${r.name}** v${r.version}`);
     if (r.latestVersion && r.latestVersion !== r.version) {
@@ -2457,7 +2479,7 @@ export class HealthDashboardView extends ItemView {
         // being touched, and in a note-taking app the file name IS the content
         // — "Patients/Alice Nguyen HIV results.md" is not incidental detail.
         lines.push(
-          `- \`${redactUserContent(sig.message)}\` — seen ${sig.count}×, last ${describeWhen(sig.lastAt)}`
+          `- \`${redact(sig.message)}\` — seen ${sig.count}×, last ${describeWhen(sig.lastAt)}`
         );
         // The stack is the Pro line: it is the part an author can act on. It is
         // also, by construction, a list of absolute paths carrying the OS
@@ -2465,7 +2487,7 @@ export class HealthDashboardView extends ItemView {
         if (this.plugin.isPro && sig.stack) {
           lines.push("");
           lines.push("```");
-          lines.push(redactUserContent(sig.stack));
+          lines.push(redact(sig.stack));
           lines.push("```");
         }
       }
@@ -2622,7 +2644,14 @@ export class HealthDashboardView extends ItemView {
       // while enrichment is off, and the chart drops anything with
       // `online === false` — so a privacy-minded user with ninety stored
       // readings was told to come back tomorrow, every day, forever.
-      const stored = this.plugin.settings.history.length;
+      // THIS device's readings. Counting the whole shared history and then
+      // blaming enrichment for none of them being plottable was wrong twice on
+      // a synced vault: most of those readings belong to the other machine and
+      // are excluded by the device filter, not by enrichment — so turning
+      // enrichment on would not plot a single one of the ninety it named.
+      const stored = this.plugin.settings.history.filter((h) =>
+        this.plugin.isThisDevice(h)
+      ).length;
       section.createDiv({
         cls: "flowkit-trends-empty",
         text: this.coverage.disabled

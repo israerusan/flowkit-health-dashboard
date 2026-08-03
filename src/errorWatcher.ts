@@ -40,9 +40,11 @@ export interface ErrorWatcherHost {
 /**
  * Watches for runtime errors and attributes them to the plugin that threw.
  *
- * Nothing here leaves the machine: the log lives in this plugin's own data and
- * is never transmitted. That matters because stack traces and error messages
- * can quote file paths and note titles.
+ * Nothing here transmits anything: the log lives in this plugin's own data.
+ * Two user-initiated actions DO send parts of it — the "Is this a known issue?"
+ * button and the clipboard bug report — and both run it through
+ * `redactUserContent` first, because stack traces and error messages quote file
+ * paths and note titles, and in a note-taking app the file name is the content.
  */
 export class ErrorWatcher {
   private originalConsoleError: ConsoleErrorFn | null = null;

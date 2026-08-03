@@ -37,6 +37,19 @@ export interface BisectState {
    * it points at a theme, a CSS snippet, Obsidian itself, or the vault.
    */
   exonerated?: boolean;
+  /**
+   * Plugins that would not switch back on when the search tried to restore them.
+   *
+   * PERSISTED, which is the entire point. This lived only in memory, while the
+   * state it qualifies — a `done` session deliberately left on disk because the
+   * vault is still missing plugins — did not. So the guard worked until the
+   * user restarted, and a restart is exactly what somebody with a half-restored
+   * vault does: on the next launch the finished panel said "everything else is
+   * back on" over a vault that plainly wasn't, the search stopped owning the
+   * page, and the scan recorded a depressed trend reading plus a fabricated
+   * "disabled" event for every plugin still switched off.
+   */
+  restoreFailed?: string[];
 }
 
 /**

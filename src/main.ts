@@ -585,11 +585,29 @@ export default class FlowKitHealthPlugin extends Plugin {
     // Obsidian mid-search and their tab didn't come back. That is the person
     // most in need of being told: their vault is missing plugins, there is a
     // reason, and here is the way back.
+    // Via the helper, not a hand-rolled test. `bisectOwnsPage()` was introduced
+    // in 1.6.1 for precisely this question and this surface was left reading
+    // `!search.done` directly — so the always-visible strip reported an
+    // ordinary health score for a vault FlowKit had just recorded that it could
+    // not put back.
     const search = this.settings.bisect;
-    if (search && !search.done) {
-      const off = search.disabled.length;
+    if (search && this.bisectOwnsPage()) {
+      // Two different situations, and the stranded one is the more urgent:
+      // a search still running has a way forward on screen, whereas a vault
+      // whose plugins could not be put back is waiting on the user and says so
+      // nowhere else once the dashboard is closed.
+      const stranded = search.restoreFailed ?? [];
       this.statusBarEl.empty();
       this.statusBarEl.toggleClass("is-alert", true);
+      if (stranded.length) {
+        this.statusBarEl.setText(`Plugins not restored · ${stranded.length}`);
+        this.statusBarEl.setAttr(
+          "aria-label",
+          `FlowKit could not switch ${stranded.join(", ")} back on after a plugin search. Open FlowKit to try again.`
+        );
+        return;
+      }
+      const off = search.disabled.length;
       this.statusBarEl.setText(`Plugin search · ${off} off`);
       this.statusBarEl.setAttr(
         "aria-label",
@@ -866,6 +884,17 @@ export default class FlowKitHealthPlugin extends Plugin {
     // guard against a hand-edited or sync-mangled value, since it validates the
     // shape of every bucket it keeps.
     this.settings.seenPlugins = migrateSeen(this.settings.seenPlugins, this.deviceId);
+    // Claim the pre-device trend series for whichever machine upgrades first.
+    //
+    // Without this, `isThisDevice` had to accept unstamped readings to avoid
+    // blanking the chart — and accepting them is what disabled the device
+    // filter on every synced vault. Stamping once at migration lets the
+    // predicate be strict, which is what makes the filter mean anything.
+    if (Array.isArray(this.settings.history)) {
+      for (const snapshot of this.settings.history) {
+        if (snapshot && snapshot.device == null) snapshot.device = this.deviceId;
+      }
+    }
     // A half-written bisect can't be acted on: it would claim a set of plugins
     // to restore that it can't actually name. But it must not simply be
     // deleted, because the vault it describes may right now be half switched
@@ -881,6 +910,14 @@ export default class FlowKitHealthPlugin extends Plugin {
     ) {
       this.bisectSalvage = bisect;
       this.settings.bisect = null;
+    }
+    // Rebuild the "couldn't put your plugins back" state from disk. Without
+    // this the message, the page ownership and the recording suspension all
+    // survived only until the user restarted — which is what somebody with a
+    // half-restored vault does first.
+    const live = this.settings.bisect;
+    if (live && Array.isArray(live.restoreFailed) && live.restoreFailed.length) {
+      this.bisectError = restoreFailureMessage(live.restoreFailed);
     }
     // The undo record is a convenience, not a recovery record: `bisect` itself
     // holds the way back. A malformed one is dropped rather than salvaged.
@@ -1159,6 +1196,15 @@ export default class FlowKitHealthPlugin extends Plugin {
     const manifests = Object.values(api.manifests ?? {});
     const enabledSet = api.enabledPlugins ?? new Set<string>();
 
+    // Every plugin any current device knows about, resolved ONCE, here.
+    //
+    // Two places decide which plugins' stored data is worth keeping, and in
+    // 1.7.0 only one of them was taught that a synced vault has more than one
+    // device's plugins in it. Resolving the set in a single place is the point:
+    // the two sites cannot drift apart again because there is only one.
+    const knownIds = pluginsKnownToAnyDevice(this.settings.seenPlugins, Date.now());
+    for (const m of manifests) knownIds.add(m.id);
+
     const coverage: DataCoverage = {
       stats: false,
       list: false,
@@ -1171,10 +1217,18 @@ export default class FlowKitHealthPlugin extends Plugin {
       const stale = !cache || Date.now() - cache.at > CACHE_TTL_MS;
       if (allowFetch && (force || stale)) {
         phase("Downloading the community plugin directory…");
-        const fetched = await this.fetchRemoteCache(
-          coverage,
-          new Set(manifests.map((m) => m.id))
-        );
+        // The SAME id set `pruneStores` uses, not this device's manifests.
+        //
+        // `pruneStores` learned in 1.7.0 that "not installed here" isn't
+        // "uninstalled"; the fetch path 140 lines away did not, and passed only
+        // this machine's plugins into `buildRemoteCache`'s keep-set and
+        // `mergeRemoteCache`'s scope. So every refresh on the desktop deleted
+        // the phone's rows from the shared cache — and the phone, which does
+        // not refetch for 24h by default, then read a cache with its own
+        // plugins missing: `classifyListing` returns "local" with no entry, so
+        // each one got a "Local install — skipped community review" badge and a
+        // one-click "Mute these", and every pending update silently vanished.
+        const fetched = await this.fetchRemoteCache(coverage, knownIds);
         // Keep serving the previous projection when a refresh fails, rather
         // than dropping two of five columns because GitHub had a bad minute.
         if (fetched) cache = fetched;
@@ -1185,7 +1239,6 @@ export default class FlowKitHealthPlugin extends Plugin {
 
     const now = Date.now();
     const rank = rankerFromDistribution(cache?.distribution);
-    const installedIds = new Set(manifests.map((m) => m.id));
 
     // A mute with an expiry has to actually expire, and the user has to be able
     // to find out that it did — otherwise a plugin silently rejoins the counts
@@ -1210,7 +1263,7 @@ export default class FlowKitHealthPlugin extends Plugin {
 
     // Uninstalling a plugin should also drop everything recorded about it,
     // rather than leaving it to accumulate in data.json indefinitely.
-    if (this.pruneStores(installedIds, now)) dirty = true;
+    if (this.pruneStores(knownIds)) dirty = true;
 
     if (
       this.settings.checkRepoActivity &&
@@ -1296,7 +1349,7 @@ export default class FlowKitHealthPlugin extends Plugin {
    * Returns whether anything changed, so the caller can fold the write into the
    * scan's single save.
    */
-  private pruneStores(installedHere: Set<string>, now: number): boolean {
+  private pruneStores(installed: ReadonlySet<string>): boolean {
     let dirty = false;
     // "Not installed on this machine" is not "uninstalled".
     //
@@ -1311,9 +1364,6 @@ export default class FlowKitHealthPlugin extends Plugin {
     // ANY device has seen the plugin lately, and that is what is asked now.
     // Anything genuinely uninstalled everywhere still ages out, because the
     // device that had it stops listing it and its bucket eventually expires.
-    const keep = pluginsKnownToAnyDevice(this.settings.seenPlugins, now);
-    for (const id of installedHere) keep.add(id);
-    const installed = keep;
     const errors = pruneErrorLog(this.settings.errorLog, installed);
     if (Object.keys(errors).length !== Object.keys(this.settings.errorLog).length) {
       this.settings.errorLog = errors;
@@ -1637,7 +1687,8 @@ export default class FlowKitHealthPlugin extends Plugin {
       const { enable } = restoreState(current);
       const result = await this.enableMany(enable);
       if (result.failed.length) {
-        this.bisectError = restoreFailureMessage(result.failed);
+        // Written to the session, not just to a field: see `restoreFailed`.
+        await this.noteRestoreFailure(current, result.failed);
         return;
       }
       this.settings.bisect = null;
@@ -1673,7 +1724,7 @@ export default class FlowKitHealthPlugin extends Plugin {
         : { changed: [], failed: [] };
       const failed = [...on.failed, ...off.failed];
       if (failed.length) {
-        this.bisectError = restoreFailureMessage(failed);
+        await this.noteRestoreFailure(current, failed);
         return;
       }
       this.settings.bisect = null;
@@ -1747,6 +1798,22 @@ export default class FlowKitHealthPlugin extends Plugin {
     const state = this.settings.bisect;
     if (!state || state.done) return false;
     return this.applyBisectState(state);
+  }
+
+  /**
+   * Record that the vault could not be put back, durably.
+   *
+   * The message is rebuilt from the persisted ids on load, so a restart no
+   * longer erases the one fact the user most needs on the screen in front of
+   * them.
+   */
+  private async noteRestoreFailure(
+    state: BisectState,
+    failed: LifecycleFailure[]
+  ): Promise<void> {
+    this.bisectError = restoreFailureMessage(failed);
+    this.settings.bisect = { ...state, restoreFailed: failed.map((f) => f.id) };
+    await this.saveSettings();
   }
 
   /** Whether a bisect transition is in flight, so the UI can lock its controls. */
@@ -2314,19 +2381,32 @@ export default class FlowKitHealthPlugin extends Plugin {
   /**
    * Whether a stored reading was taken by this machine.
    *
-   * Readings written before devices were told apart carry no id. They are
-   * counted as this device's rather than discarded: they are almost certainly
-   * from the machine that has been scanning all along, and dropping them would
-   * blank an existing trend chart on upgrade to prove a point.
+   * Strict. It used to accept an unstamped reading as this device's, on the
+   * reasoning that pre-1.7 readings came from the machine that had been
+   * scanning all along and discarding them would blank a chart to prove a
+   * point. That reasoning holds for one device and is exactly wrong for the
+   * case the device split exists to fix: on a synced vault EVERY pre-1.7
+   * reading is unstamped, so both machines claimed all of them and the filter
+   * did nothing at all on precisely the vaults it was written for — for up to
+   * ninety days. Three separate symptoms came out of that one predicate: a
+   * fabricated cliff in the delta line, a second device that could never record
+   * its own first reading because the other's same-day entry suppressed it, and
+   * "Forget the others" deleting the stamped readings while keeping the
+   * unstamped ones causing the mess.
+   *
+   * The chart is not blanked, because `loadSettings` stamps the legacy series
+   * for whichever device upgrades first — which is the intended semantics.
    */
   isThisDevice(snapshot: HealthSnapshot): boolean {
-    return snapshot.device == null || snapshot.device === this.deviceId;
+    return snapshot.device === this.deviceId;
   }
 }
 
 /** What to say when plugins wouldn't go back the way they were. */
-function restoreFailureMessage(failed: LifecycleFailure[]): string {
-  const names = failed.map((f) => f.id).join(", ");
+function restoreFailureMessage(failed: LifecycleFailure[] | string[]): string {
+  const names = failed
+    .map((f) => (typeof f === "string" ? f : f.id))
+    .join(", ");
   return (
     `FlowKit couldn't switch ${names} back on. Your original setup is still ` +
     `recorded, so nothing is lost — try again, or turn ${

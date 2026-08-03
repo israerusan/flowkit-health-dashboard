@@ -67,7 +67,7 @@ import {
   saveProfile,
   type PluginProfile,
 } from "../src/profiles";
-import { redactUserContent, searchTerms } from "../src/issueSearch";
+import { buildRedactor, redactUserContent, searchTerms } from "../src/issueSearch";
 import {
   DEVICE_RETENTION_MS,
   migrateSeen,
@@ -1197,16 +1197,41 @@ eq("prerelease vs prerelease", compareVersion("1.0.0-alpha", "1.0.0-beta"), -1);
     "Could not open Therapy notes.md",
   ];
   const forbidden = /Patients|Alice|Nguyen|Therapy|Divorce|Secret|Legal|Taxes|someone/i;
+  // Built from the vault's REAL names, which is the whole design. The question
+  // was never "does this look like a path" — it is "is this one of the user's
+  // own notes", and FlowKit can answer that exactly by enumerating the vault.
+  const redact = buildRedactor([
+    "Alice Nguyen HIV results",
+    "Alice Nguyen HIV results.md",
+    "Patients",
+    "Divorce settlement draft",
+    "Divorce settlement draft.md",
+    "Legal",
+    "private.md",
+    "Therapy notes",
+    "Therapy notes.md",
+    "Journal",
+    "Secret",
+    "thing.md",
+    "Medical Records",
+    "Alice Nguyen",
+    "Taxes 2025",
+    // Non-Latin, because every previous rule used `\w` — which is ASCII, so a
+    // Japanese or Cyrillic note title matched no rule whatsoever.
+    "診断結果",
+    "診断結果.md",
+    "Медицинская карта",
+  ]);
   for (const message of leaks) {
     check(
       `redaction removes the private part of: ${message.slice(0, 40)}…`,
-      !forbidden.test(redactUserContent(message)),
-      `got ${redactUserContent(message)}`
+      !forbidden.test(redact(message)),
+      `got ${redact(message)}`
     );
     check(
       `…and so does the search query for: ${message.slice(0, 40)}…`,
-      !forbidden.test(searchTerms(message)),
-      `got ${searchTerms(message)}`
+      !forbidden.test(searchTerms(message, redact)),
+      `got ${searchTerms(message, redact)}`
     );
   }
 
@@ -1220,11 +1245,59 @@ eq("prerelease vs prerelease", compareVersion("1.0.0-alpha", "1.0.0-beta"), -1);
     "Dataview: Every date literal must be surrounded by parens",
   ];
   for (const message of keep) {
-    eq(`ordinary error text is untouched: ${message.slice(0, 34)}…`, redactUserContent(message), message);
+    eq(`ordinary error text is untouched: ${message.slice(0, 34)}…`, redact(message), message);
   }
   check(
     "and still yields searchable terms",
-    searchTerms(keep[1]).includes("getFileCache")
+    searchTerms(keep[1], redact).includes("getFileCache")
+  );
+
+  // The cases the shape-based rules got wrong, in BOTH directions at once.
+  const leakedBefore = [
+    // No slash, no drive letter, no extension — nothing matched these at all.
+    `Failed to open note "Alice Nguyen HIV results"`,
+    `Note Divorce settlement draft could not be resolved`,
+    String.raw`Failed reading Patients\Alice Nguyen HIV results`,
+    // The Windows rule stopped at the first space and published the rest.
+    String.raw`Failed to open C:\Users\me\Vault\Medical Records\Alice Nguyen HIV results`,
+    // ASCII-only `\w` meant a non-Latin note title matched no rule at all.
+    "ファイルを開けません 診断結果.md",
+    "Не удалось открыть Медицинская карта",
+  ];
+  const nonLatin = /診断結果|Медицинская/;
+  for (const message of leakedBefore) {
+    const out = redact(message);
+    check(
+      `no longer leaks: ${message.slice(0, 38)}…`,
+      !forbidden.test(out) && !nonLatin.test(out),
+      `got ${out}`
+    );
+  }
+
+  const destroyedBefore = [
+    // A module path is the entire searchable signal; the slash rule ate it.
+    "Cannot find module markdown-it/lib/token",
+    "Expected 1/2 but got 3/4",
+    "Cannot read properties of undefined image.png",
+  ];
+  for (const message of destroyedBefore) {
+    eq(`no longer destroys: ${message.slice(0, 34)}…`, redact(message), message);
+  }
+
+  // A stack trace has to survive with its LINE STRUCTURE intact. Collapsing
+  // whitespace turned the Pro "full stack traces" feature into one line of
+  // mush with its module paths removed — the opposite of the point.
+  const stack = [
+    "TypeError: Cannot read properties of undefined (reading 'file')",
+    "    at Object.eval (plugin:dataview:1042:9)",
+    "    at markdown-it/lib/renderer.js:210:15",
+  ].join("\n");
+  eq("a stack trace is untouched", redact(stack), stack);
+
+  // With no vault to consult, the machine-path rules still apply on their own.
+  check(
+    "absolute paths go even without vault names",
+    !redactUserContent("ENOENT open '/Users/someone/vault/Secret/thing.md'").includes("someone")
   );
 }
 

@@ -3,6 +3,110 @@
 All notable changes to FlowKit Plugin Health Dashboard are documented here. This
 project follows [Semantic Versioning](https://semver.org/).
 
+## [1.7.1] - 2026-08-03
+
+A third adversarial review — two outside models and a twelve-agent pass with a
+skeptic behind every reader — went at 1.7.0. Two of its findings are defects in
+1.7.0's own fixes, and one is the plainest self-contradiction this scoring model
+has ever shipped.
+
+### Turning off the error watcher raised the score of a plugin throwing errors
+
+- **Reliability no longer scores a plugin with no observation window.** With
+  error watching switched off, the observed window is zero, the error *rate* is
+  zero-divided-by-zero, and the score came out **100** — printed in the same
+  cell as "13 unhandled errors", ten points *above* the same plugin with
+  watching switched on. It now reports itself unavailable and says why. This is
+  the same contradiction the window logic was rewritten to remove in 1.5.0, in
+  the one case that rewrite didn't cover: it fixed "watching, but not long
+  enough" and left "not watching at all".
+- **Switching error watching off now clears the observation clock.** It was
+  left at its old value and only re-stamped when null, so switching off in
+  January and on again in July bought a six-month observation window instantly —
+  for a period when the watcher provably was not running. Every clean plugin
+  scored a fully measured Reliability 100 on the first scan afterwards.
+
+### The redaction is rebuilt around knowing the vault instead of guessing
+
+The 1.6.1 redactor enumerated what a path *looks like*, and was wrong in both
+directions at once — which a shape-based rule eventually always is.
+
+- **It leaked the commonest way a note is named.** `Failed to open note "Alice
+  Nguyen HIV results"` has no slash, no drive letter and no extension, so no
+  rule touched it. Nor did a backslash path. The Windows rule stopped at the
+  first space, so `C:\…\Medical Records\Alice Nguyen HIV results` published
+  everything after "Medical". And every rule used `\w`, which is ASCII — so
+  Japanese, Cyrillic, Greek and Hangul note titles matched nothing whatsoever.
+- **It destroyed the diagnosis it exists to let people share.** `Cannot find
+  module markdown-it/lib/token` became `Cannot find module …`; `Expected 1/2 but
+  got 3/4` became `Expected …`; stack traces lost their module paths *and* their
+  line structure — gutting the Pro feature that ships them.
+
+The question was never "does this look like a path". It is "is this one of the
+user's own notes", and FlowKit can answer that exactly by enumerating the vault.
+Names are now matched literally, longest first; a much smaller set of shape
+rules is kept only for things that name the *machine*. Both corpora are in the
+test suite: every leak case must be redacted, every ordinary error must survive
+verbatim.
+
+- **A search with nothing left to search now says so**, instead of reporting
+  "Nothing matching in their tracker" — a claim about somebody's issue tracker
+  that FlowKit had never actually queried.
+- **The in-app copy no longer says error text is "never sent anywhere".** The
+  "Is this a known issue?" button sends it. It says that, and says it is
+  redacted first.
+
+### Two of 1.7.0's own fixes did not survive contact
+
+- **`isThisDevice` is strict, and the pre-1.7 trend is stamped on upgrade.** It
+  accepted an unstamped reading as this device's — so on a synced vault, where
+  *every* pre-1.7 reading is unstamped, both machines claimed all of them and
+  the device filter did nothing at all on precisely the vaults it was written
+  for. Three symptoms came from that one predicate: a fabricated cliff in the
+  delta line, a second device that could never record its own first reading
+  because the other's same-day entry suppressed it, and "Forget the others"
+  deleting the stamped readings while keeping the unstamped ones causing the
+  mess.
+- **The community cache is scoped to the same plugin set everything else is.**
+  `pruneStores` learned in 1.7.0 that "not installed here" isn't "uninstalled";
+  the fetch path 140 lines away did not, so every refresh on one device deleted
+  the other's rows from the shared cache. The other device — which does not
+  refetch for 24 hours by default — then read a cache with its own plugins
+  missing, and badged each of them "Local install — skipped community review"
+  with a one-click "Mute these", while every pending update silently vanished.
+  Both paths now resolve the id set once, in one place.
+
+### A failed restore no longer forgets itself
+
+- **"FlowKit couldn't switch these back on" is persisted.** It lived in memory
+  while the state it qualifies — a finished search deliberately left on disk
+  because the vault is still missing plugins — did not. So the 1.6.1 guard held
+  until the user restarted, which is exactly what somebody with a half-restored
+  vault does: on the next launch the panel said "everything else is back on"
+  over a vault that plainly wasn't, and the scan recorded a depressed trend
+  reading plus a fabricated "disabled" event per stranded plugin.
+- **The status bar asks the helper instead of re-deriving the answer**, and
+  names the stranded plugins when there are any — it is the only surface left
+  once the dashboard is closed.
+
+### Still to do, and named precisely
+
+The review's central charge is that each release fixes instances and not
+classes, and it stands. Nine things in the synced `data.json` are properties of
+a machine rather than of the vault; 1.7.0 made two of them device-aware. The
+remaining seven — `errorLog`, `watchingSince`, `runtimeProfiles`,
+`lastApiVersion`/`appVersionChange`, `mutes[].untilAppVersion`, `events`, and
+`bisect` — are not, and the consequences are real: Reliability and Footprint are
+40% of every score and both are computed partly from other machines'
+measurements, and a search running on a desktop will offer a phone the chance to
+apply the desktop's disabled list to its own plugins.
+
+That is one enumerable question — *which fields describe a machine rather than a
+vault* — and it deserves to be answered once, in one container, with tests,
+rather than two more fields at a time. It is the next release, not a footnote in
+this one. Until then the Settings copy no longer claims errors and measurements
+are kept per device, because they are not.
+
 ## [1.7.0] - 2026-08-03
 
 The known issue 1.6.1 shipped with, fixed.

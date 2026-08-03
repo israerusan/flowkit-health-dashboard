@@ -22,63 +22,111 @@ export interface KnownIssue {
 
 export type IssueSearchOutcome =
   | { ok: true; issues: KnownIssue[] }
-  | { ok: false; reason: "rate-limited" | "error" | "no-repo" };
+  | { ok: false; reason: "rate-limited" | "error" | "no-repo" | "nothing-searchable" };
 
 const TIMEOUT_MS = 10_000;
 
 /** What replaces anything that could name a note or a folder. */
 const REDACTED = "…";
 
+/** Characters that can appear in a name. Unicode, not `\w` — see below. */
+const NAME_CHARS = "[\\p{L}\\p{N}\\p{M}_.\\-()']";
+
+/** Regex metacharacters, escaped so a note called `C++ (2024)` matches literally. */
+function escapeLiteral(value: string): string {
+  return value.replace(/[-.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 /**
- * Remove anything from error text that could name the user's own content.
+ * Redact by KNOWING the vault, not by guessing what a path looks like.
  *
- * Error messages routinely quote the file being touched, and in a note-taking
- * app the FILE NAME IS THE CONTENT: "Patients/Alice Nguyen HIV results.md" and
- * "[[Divorce settlement draft]]" are not incidental detail, they are the most
- * sensitive strings on the machine. This text goes two places that leave it —
- * a GitHub search URL, and a clipboard bug report the product tells the user to
- * paste into somebody's issue tracker — so it is redacted before either.
+ * The previous version enumerated shapes — absolute paths, slash paths, a
+ * closed list of extensions — and was wrong in both directions at once, which
+ * is what a shape-based rule is always eventually wrong in:
  *
- * The rules that were here stripped absolute paths (`/Users/x/…`, `C:\…`) and
- * stopped, which is exactly backwards for Obsidian: every path this app handles
- * is vault-RELATIVE. `Patients/Alice Nguyen HIV results.md` survived all seven
- * replaces intact.
+ *   - It LEAKED the commonest way a note is named. `Failed to open note "Alice
+ *     Nguyen HIV results"` has no slash, no drive letter and no extension, so
+ *     no rule touched it. Nor did `Patients\Alice Nguyen HIV results`. The
+ *     Windows rule stopped at the first space, so `C:\…\Medical Records\Alice
+ *     Nguyen HIV results` published everything after "Medical". And every rule
+ *     used `\w`, which is ASCII — so a Japanese, Cyrillic, Greek or Hangul note
+ *     title matched nothing at all.
+ *   - It DESTROYED the diagnosis it exists to let people share. `Cannot find
+ *     module markdown-it/lib/token` became `Cannot find module …`; `Expected
+ *     1/2 but got 3/4` became `Expected …`; stack frames lost their module
+ *     paths and their line structure — gutting the Pro feature that ships them.
  *
- * Deliberately aggressive. A search that misses a thread costs the user a
- * click; a search that quietly puts a note title in somebody's server log
- * cannot be undone.
+ * The question was never "does this look like a path". It is "is this one of
+ * the user's own notes", and FlowKit can answer that exactly, because it can
+ * enumerate the vault. So the names are matched literally, longest first, and
+ * a much smaller set of shape rules is kept only for things that identify the
+ * machine rather than the vault — absolute paths, URLs, and wiki links.
+ *
+ * @param names every file and folder name in the vault: basenames with and
+ *   without extension, and full paths. Longest first so
+ *   "Alice Nguyen HIV results" is replaced before "results".
  */
-export function redactUserContent(text: string): string {
+export function buildRedactor(
+  names: Iterable<string>
+): (text: string) => string {
+  const patterns = [...new Set(names)]
+    .map((name) => name.trim())
+    // A single short token is too collision-prone to redact on sight — a note
+    // called "and" would gut every message in the vault. Names containing a
+    // space are inherently specific, so they are matched at any length.
+    .filter((name) => name.length >= 4 || /\s/.test(name))
+    .sort((a, b) => b.length - a.length)
+    .map((name) => new RegExp(escapeLiteral(name), "giu"));
+
+  return (text: string): string => {
+    let out = text;
+    for (const pattern of patterns) out = out.replace(pattern, REDACTED);
+    return redactMachinePaths(out);
+  };
+}
+
+/**
+ * The rules that survive the rewrite: things naming the MACHINE, not the vault.
+ *
+ * Deliberately few, and each anchored so it cannot run away through the
+ * sentence around it. Anything that identifies the user's own content is the
+ * vault-name matcher's job above.
+ */
+function redactMachinePaths(text: string): string {
   return (
     text
-      .replace(/https?:\/\/\S+/g, REDACTED)
-      // Windows absolute paths.
-      .replace(/[A-Za-z]:\\[^\s"']+/g, REDACTED)
-      // Wiki links — the note title is the entire payload.
-      .replace(/\[\[[^\]]*\]\]/g, REDACTED)
-      // Vault-relative paths, which is what Obsidian actually deals in. The
-      // segment before the first slash may not contain spaces, so this cannot
-      // run backwards through the sentence the path is quoted in and swallow
-      // the error text itself — the ordinary messages that make a search worth
-      // running survive this rule untouched. Later segments may contain
-      // spaces, because note names do.
-      .replace(/[\w.\-()']+(?:\/[\w.\-()' ]*)+/g, REDACTED)
-      // POSIX absolute paths, AFTER the relative rule: run first, this matches
-      // from the leading slash and leaves the top folder name — "Patients" —
-      // sitting in the output, which is often the sensitive part.
-      .replace(/~?\/[\w.\-()' /]+/g, REDACTED)
-      // A bare file name with no folder in front of it. Bounded at five
-      // preceding words: a name can contain spaces and there is no way to know
-      // where it starts, so this errs towards taking too much. Losing a few
-      // words of an error message costs the user a search result; keeping a few
-      // words of a note title cannot be taken back.
+      .replace(/https?:\/\/\S+/gu, REDACTED)
+      // Windows and UNC absolute paths, INCLUDING spaces inside segments —
+      // stopping at the first space is what published the tail of every path
+      // with a "Medical Records" in it.
       .replace(
-        /(?:[\w.\-()']+ ){0,5}[\w.\-()']*\.(?:md|canvas|base|pdf|png|jpe?g|gif|webp|mp[34]|mov|docx?|xlsx?)\b/gi,
+        new RegExp(`(?:[A-Za-z]:|\\\\\\\\)[\\\\/]${NAME_CHARS}*(?:[\\\\/ ]${NAME_CHARS}+)*`, "gu"),
         REDACTED
       )
-      .replace(/\s+/g, " ")
+      // POSIX absolute paths, likewise allowing spaces — and anchored to the
+      // START of a path. Unanchored, the leading `/` matched the one inside
+      // `markdown-it/lib/token` and `1/2`, so a module path and a fraction were
+      // redacted as though they were somebody's filesystem.
+      .replace(
+        new RegExp(`(?:^|(?<=[\\s"'(\\[]))~?/${NAME_CHARS}+(?:[/ ]${NAME_CHARS}+)*`, "gu"),
+        REDACTED
+      )
+      // Wiki links: the target is the entire payload.
+      .replace(/\[\[[^\]]*\]\]/gu, REDACTED)
+      // Email addresses.
+      .replace(new RegExp(`${NAME_CHARS}+@${NAME_CHARS}+\\.${NAME_CHARS}+`, "gu"), REDACTED)
       .trim()
   );
+}
+
+/**
+ * Redaction with no vault to consult.
+ *
+ * The machine-path rules only. Used where the vault genuinely isn't reachable;
+ * every real call site passes the names.
+ */
+export function redactUserContent(text: string): string {
+  return redactMachinePaths(text);
 }
 
 /**
@@ -89,8 +137,11 @@ export function redactUserContent(text: string): string {
  * because leaving those in guarantees zero results from a search that would
  * otherwise have found the thread immediately.
  */
-export function searchTerms(message: string): string {
-  return redactUserContent(message)
+export function searchTerms(
+  message: string,
+  redact: (text: string) => string = redactUserContent
+): string {
+  return redact(message)
     .replace(/0x[0-9a-f]+/gi, " ")
     .replace(/\b\d[\w-]*\b/g, " ")
     .replace(/["'`…]/g, " ")
@@ -132,11 +183,16 @@ async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T | null
  */
 export async function findKnownIssues(
   repo: string | undefined,
-  message: string
+  message: string,
+  redact: (text: string) => string = redactUserContent
 ): Promise<IssueSearchOutcome> {
   if (!repo || !/^[\w.-]+\/[\w.-]+$/.test(repo)) return { ok: false, reason: "no-repo" };
-  const terms = searchTerms(message);
-  if (!terms) return { ok: true, issues: [] };
+  const terms = searchTerms(message, redact);
+  // Distinct from "searched and found none". Returning an empty success made
+  // the UI say "Nothing matching in their tracker" about a search that was
+  // never run, which is a statement about the plugin's issue tracker that
+  // FlowKit had no basis for.
+  if (!terms) return { ok: false, reason: "nothing-searchable" };
 
   const query = `repo:${repo} is:issue ${terms}`;
   const url = `https://api.github.com/search/issues?q=${encodeURIComponent(query)}&per_page=5&sort=updated`;
