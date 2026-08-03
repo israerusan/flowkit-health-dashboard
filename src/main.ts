@@ -435,10 +435,32 @@ export default class FlowKitHealthPlugin extends Plugin {
    * away — so the product knew exactly what had changed and kept none of it.
    * Recorded for everyone; only the Notice stays Pro.
    */
+  /**
+   * A search is in progress — as opposed to finished and waiting to be
+   * acknowledged, which is an ordinary vault the user can be told about again.
+   */
+  private bisectInProgress(): boolean {
+    const state = this.settings.bisect;
+    return state != null && !state.done;
+  }
+
   async diffChanges(
     all: PluginHealth[],
     coverage: DataCoverage
   ): Promise<HealthChange[]> {
+    // A vault with half its plugins deliberately switched off is not a vault
+    // whose health changed. Without this, every plugin the search turns off
+    // loses its trouble kinds and is reported as having RECOVERED — "FlowKit
+    // Canary A is back to normal", about a plugin that is only quiet because
+    // we silenced it — and every plugin it turns back on re-announces whatever
+    // was already wrong with it. A search over forty plugins would manufacture
+    // dozens of these and bury a month of real history.
+    //
+    // Worse than the noise: `notified` would be left describing the mid-search
+    // vault, so restoring everything at the end re-reports the original trouble
+    // as newly started.
+    if (this.bisectInProgress()) return [];
+
     const previous = this.settings.notified;
     const { fresh, current } = diffTrouble(
       previous,
@@ -1068,7 +1090,12 @@ export default class FlowKitHealthPlugin extends Plugin {
     // A bisect switches plugins off and on by design. Recording those as user
     // events would bury a month of real history under one search's noise, and
     // then offer the toggles back as "what changed in your vault".
-    if (this.settings.bisect) return;
+    //
+    // Keyed on the search still RUNNING, not merely existing: a finished search
+    // sits in settings until the user acknowledges the result, and gating on
+    // its mere presence meant a found-but-unacknowledged culprit switched off
+    // change tracking indefinitely.
+    if (this.bisectInProgress()) return;
 
     const { events, seen } = diffInstalled(
       this.settings.seenPlugins,
