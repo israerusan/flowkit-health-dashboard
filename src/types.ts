@@ -130,6 +130,34 @@ export interface HealthSnapshot {
   updates: number;
 }
 
+/**
+ * The scored fields of one community plugin, kept between sessions. Storing
+ * this rather than the raw feeds is what lets the dashboard paint immediately:
+ * the two source files are ~3.7 MB uncompressed, and re-fetching them was
+ * previously the first thing that happened on every open.
+ */
+export interface CachedPlugin {
+  downloads?: number;
+  updated?: number;
+  latest?: string;
+  /** Downloads sitting on the newest release, for the maturity signal. */
+  latestDownloads?: number;
+  releases?: number;
+  repo?: string;
+  listed?: boolean;
+}
+
+export interface RemoteCache {
+  /** When this projection was built. */
+  at: number;
+  plugins: Record<string, CachedPlugin>;
+  /** Sorted download counts across the directory, for percentile ranking. */
+  distribution: number[];
+  /** Which feeds contributed, so a cached scan reports coverage honestly. */
+  hadStats: boolean;
+  hadList: boolean;
+}
+
 /** One plugin's entry in Obsidian's community-plugins list. */
 export interface CommunityListEntry {
   id: string;

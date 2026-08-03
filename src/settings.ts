@@ -1,6 +1,6 @@
 import { App, PluginSettingTab, Setting } from "obsidian";
 import type FlowKitHealthPlugin from "./main";
-import type { HealthSnapshot } from "./types";
+import type { HealthSnapshot, RemoteCache } from "./types";
 import {
   PRODUCT_NAME,
   PRO_FEATURES,
@@ -20,8 +20,17 @@ export interface FlowKitHealthSettings {
   licenseKey: string;
   /** Pro: recompute automatically whenever the dashboard is opened. */
   autoRefreshOnOpen: boolean;
-  /** Pro: rolling history of vault-health snapshots for the trend tracker. */
+  /** Rolling history of vault-health snapshots for the trend tracker. */
   history: HealthSnapshot[];
+  /**
+   * A slim projection of the last successful community-data fetch. The two
+   * source files total ~3.7 MB uncompressed and were re-downloaded on every
+   * session; this keeps only the handful of fields we actually score on, so the
+   * dashboard renders immediately and the network is a background upgrade.
+   */
+  cache: RemoteCache | null;
+  /** Whether the first-run explainer has been dismissed. */
+  seenIntro: boolean;
 }
 
 export const DEFAULT_SETTINGS: FlowKitHealthSettings = {
@@ -31,6 +40,8 @@ export const DEFAULT_SETTINGS: FlowKitHealthSettings = {
   licenseKey: "",
   autoRefreshOnOpen: false,
   history: [],
+  cache: null,
+  seenIntro: false,
 };
 
 export class FlowKitHealthSettingTab extends PluginSettingTab {

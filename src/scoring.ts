@@ -1,9 +1,11 @@
 import { apiVersion } from "obsidian";
 import type { PluginManifest } from "obsidian";
 import type {
+  CachedPlugin,
   MaintenanceStatus,
   MetricScore,
   PluginHealth,
+  RemoteCache,
   RemotePluginStat,
 } from "./types";
 
@@ -354,39 +356,10 @@ function scoreHygiene(i: ScoreInput): MetricScore {
 }
 
 /**
- * Build a percentile lookup over the whole directory's download counts, once
- * per scan. Returns a function mapping one plugin's downloads to its rank (0–1).
- */
-export function buildDownloadRanker(
-  stats: Record<string, RemotePluginStat> | null | undefined
-): (downloads: number | undefined) => number | undefined {
-  if (!stats) return () => undefined;
-  const all: number[] = [];
-  for (const entry of Object.values(stats)) {
-    if (typeof entry?.downloads === "number") all.push(entry.downloads);
-  }
-  if (!all.length) return () => undefined;
-  all.sort((a, b) => a - b);
-
-  return (downloads) => {
-    if (downloads == null) return undefined;
-    // Binary search for the first index whose value is >= downloads; that index
-    // is the count of strictly smaller entries.
-    let lo = 0;
-    let hi = all.length;
-    while (lo < hi) {
-      const mid = (lo + hi) >> 1;
-      if (all[mid] < downloads) lo = mid + 1;
-      else hi = mid;
-    }
-    return lo / all.length;
-  };
-}
-
-/**
- * Where a plugin sits relative to the community directory.
+ * Where a plugin sits relative to the community directory, read from the
+ * persisted projection.
  *
- * `delisted` — present in the stats file but absent from the current list, i.e.
+ * `delisted` — present in the stats feed but absent from the current list, i.e.
  * Obsidian pulled it, potentially for a security or policy reason. Cross-
  * referencing the two live files finds 12 such ids today, at zero extra cost.
  * That is the single highest-value thing this product can tell a user, and it
@@ -395,13 +368,96 @@ export function buildDownloadRanker(
  */
 export function classifyListing(
   id: string,
-  stats: Record<string, RemotePluginStat> | null | undefined,
-  list: Record<string, unknown> | null | undefined
+  cache: RemoteCache | null | undefined
 ): ListingStatus {
-  if (!list) return "unknown";
-  if (id in list) return "listed";
-  if (stats && id in stats) return "delisted";
+  if (!cache || !cache.hadList) return "unknown";
+  const entry = cache.plugins[id];
+  if (entry?.listed) return "listed";
+  if (cache.hadStats && entry) return "delisted";
   return "local";
+}
+
+/**
+ * Reduce the two multi-megabyte community feeds to the handful of fields we
+ * actually score on, so the result is small enough to keep in plugin data and
+ * the dashboard can paint before the network answers.
+ */
+export function buildRemoteCache(
+  stats: Record<string, RemotePluginStat> | null,
+  list: Record<string, { repo?: string }> | null,
+  at: number
+): RemoteCache {
+  const plugins: Record<string, CachedPlugin> = {};
+  const distribution: number[] = [];
+
+  if (stats) {
+    for (const [id, entry] of Object.entries(stats)) {
+      if (!entry) continue;
+      const latest = pickLatestVersion(entry);
+      plugins[id] = {
+        downloads: entry.downloads,
+        updated: entry.updated,
+        latest,
+        latestDownloads: latest ? entry[latest] : undefined,
+        releases: releaseCount(entry),
+      };
+      if (typeof entry.downloads === "number") distribution.push(entry.downloads);
+    }
+    distribution.sort((a, b) => a - b);
+  }
+
+  if (list) {
+    for (const [id, entry] of Object.entries(list)) {
+      const existing = plugins[id] ?? {};
+      existing.repo = entry?.repo;
+      existing.listed = true;
+      plugins[id] = existing;
+    }
+  }
+
+  return { at, plugins, distribution, hadStats: stats != null, hadList: list != null };
+}
+
+/**
+ * Rebuild the scorer's view of one plugin from the cached projection. Keeps
+ * `computeHealth` unaware of whether its inputs came from the network or disk.
+ */
+export function remoteFromCache(
+  cached: CachedPlugin | undefined
+): RemotePluginStat | undefined {
+  if (!cached) return undefined;
+  const remote: RemotePluginStat = {
+    downloads: cached.downloads,
+    updated: cached.updated,
+  };
+  if (cached.latest) {
+    remote[cached.latest] = cached.latestDownloads ?? 0;
+    // The maturity signal only needs the release count and the newest release's
+    // share, so synthesise enough distinct keys to carry the count forward.
+    for (let i = 0; i < (cached.releases ?? 0); i++) {
+      const key = `0.0.${i}`;
+      if (!(key in remote)) remote[key] = 0;
+    }
+  }
+  return remote;
+}
+
+/** Percentile lookup over a pre-sorted distribution from the cache. */
+export function rankerFromDistribution(
+  distribution: number[] | undefined
+): (downloads: number | undefined) => number | undefined {
+  if (!distribution || !distribution.length) return () => undefined;
+  return (downloads) => {
+    if (downloads == null) return undefined;
+    let lo = 0;
+    let hi = distribution.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (distribution[mid] < downloads) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo / distribution.length;
+  };
 }
 
 /** Overall can rise no higher than this when a plugin cannot load at all. */

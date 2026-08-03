@@ -2,13 +2,15 @@
 // stub (apiVersion = "1.5.0") and run under Node — see test/run.mjs.
 import type { PluginManifest } from "obsidian";
 import {
-  buildDownloadRanker,
+  buildRemoteCache,
   classifyListing,
   compareVersion,
   computeHealth,
   deriveMaintenanceStatus,
   pickLatestVersion,
+  rankerFromDistribution,
   releaseCount,
+  remoteFromCache,
   type ScoreInput,
 } from "../src/scoring";
 import nacl from "tweetnacl";
@@ -218,15 +220,30 @@ eq(
   eq("no update without remote", h.updateAvailable, false);
 }
 
-// --- listing classification -------------------------------------------------
+// --- the persisted projection + listing classification ----------------------
 {
-  const stats = { a: { downloads: 1 }, b: { downloads: 2 } };
-  const list = { a: {} };
-  eq("in list is listed", classifyListing("a", stats, list), "listed");
-  // In the stats file but pulled from the list: Obsidian removed it.
-  eq("in stats but not list is delisted", classifyListing("b", stats, list), "delisted");
-  eq("in neither is local", classifyListing("c", stats, list), "local");
-  eq("no list at all is unknown", classifyListing("a", stats, null), "unknown");
+  const stats = {
+    a: { downloads: 10, updated: NOW, "1.0.0": 8 },
+    b: { downloads: 20, updated: NOW, "2.0.0": 20 },
+  };
+  const list = { a: { repo: "own/a" } };
+  const cache = buildRemoteCache(stats, list, NOW);
+
+  eq("cache carries the repo from the list", cache.plugins.a.repo, "own/a");
+  eq("cache records which feeds it had", cache.hadStats && cache.hadList, true);
+  eq("distribution is sorted for ranking", cache.distribution.join(","), "10,20");
+
+  eq("in list is listed", classifyListing("a", cache), "listed");
+  // In the stats feed but pulled from the list: Obsidian removed it.
+  eq("in stats but not list is delisted", classifyListing("b", cache), "delisted");
+  eq("in neither is local", classifyListing("c", cache), "local");
+  eq("no list at all is unknown", classifyListing("a", buildRemoteCache(stats, null, NOW)), "unknown");
+
+  // A cached scan must score the same as the live one it was built from.
+  const revived = remoteFromCache(cache.plugins.a);
+  eq("cache round-trips downloads", revived?.downloads, 10);
+  eq("cache round-trips the update time", revived?.updated, NOW);
+  eq("cache round-trips the latest version", pickLatestVersion(revived), "1.0.0");
 }
 {
   // Delisted is a hard cap, not a chip: it outranks an otherwise perfect score.
@@ -287,16 +304,11 @@ eq(
 
 // --- percentile ranking -----------------------------------------------------
 {
-  const rank = buildDownloadRanker({
-    a: { downloads: 10 },
-    b: { downloads: 20 },
-    c: { downloads: 30 },
-    d: { downloads: 40 },
-  });
+  const rank = rankerFromDistribution([10, 20, 30, 40]);
   eq("smallest ranks at 0", rank(10), 0);
   eq("median ranks mid-scale", rank(30), 0.5);
   eq("unknown downloads have no rank", rank(undefined), undefined);
-  eq("no stats means no ranker", buildDownloadRanker(null)(5), undefined);
+  eq("no distribution means no ranker", rankerFromDistribution([])(5), undefined);
 }
 
 // --- the stability carve-out ------------------------------------------------

@@ -14,6 +14,7 @@ import {
   type BulkAction,
   type Insight,
 } from "./insights";
+import { WEIGHTS } from "./scoring";
 import { BulkConfirmModal } from "./ui/BulkConfirmModal";
 import { PRO_PRICE, PURCHASE_URL } from "./product";
 
@@ -172,6 +173,12 @@ export class HealthDashboardView extends ItemView {
   private loading = false;
   /** Set when a scan threw, so the view offers a way out instead of a dead spinner. */
   private scanError: string | null = null;
+  /** The results region, rebuilt on its own when search/filter/sort change. */
+  private rowsEl: HTMLElement | null = null;
+  /** Live "N of M" readout in the toolbar. */
+  private countEl: HTMLElement | null = null;
+  /** The row whose reasoning panel is open, if any. */
+  private expandedId: string | null = null;
   /** The last bulk action, so it can be undone for the rest of the session. */
   private lastBulk: { label: string; revert: () => Promise<void> } | null = null;
 
@@ -316,7 +323,7 @@ export class HealthDashboardView extends ItemView {
       this.sortKey = key;
       this.sortDir = key === "name" ? 1 : -1;
     }
-    this.render();
+    this.renderRows();
   }
 
   // --- rendering ------------------------------------------------------------
@@ -354,24 +361,53 @@ export class HealthDashboardView extends ItemView {
       return;
     }
 
+    this.renderIntro(root);
     this.renderHero(root);
     this.renderCoverageNotice(root);
     this.renderUndoBar(root);
     this.renderSummary(root);
     this.renderInsights(root);
-    if (this.plugin.isPro) this.renderTrends(root);
+    this.renderTrends(root);
     this.renderToolbar(root);
 
-    const rows = this.visibleRows();
-    if (rows.length === 0) {
-      root.createDiv({
-        cls: "flowkit-health-empty",
-        text: "No plugins match the current filter.",
-      });
-    } else {
-      this.renderTable(root, rows);
-    }
+    // Everything above depends only on the scan; everything below depends on
+    // the search/filter/sort. Keeping them apart is what lets a keystroke
+    // rebuild ~40 table rows instead of the entire dashboard — which is what
+    // used to destroy the search box mid-word and force the caret to the end.
+    this.rowsEl = root.createDiv({ cls: "flowkit-rows" });
+    this.renderRows();
     this.renderLegend(root);
+  }
+
+  /** Rebuild only the results region. Cheap enough to run on every keystroke. */
+  private renderRows(): void {
+    const host = this.rowsEl;
+    if (!host) return;
+    host.empty();
+
+    const rows = this.visibleRows();
+    if (this.countEl) {
+      this.countEl.setText(
+        rows.length === this.results.length
+          ? `${rows.length} plugin${rows.length === 1 ? "" : "s"}`
+          : `${rows.length} of ${this.results.length}`
+      );
+    }
+
+    if (rows.length === 0) {
+      const empty = host.createDiv({ cls: "flowkit-health-empty" });
+      empty.createDiv({ text: "No plugins match the current filter." });
+      if (this.search || this.filter !== "all") {
+        const clear = empty.createEl("button", { text: "Clear filters" });
+        clear.onclick = () => {
+          this.search = "";
+          this.filter = "all";
+          this.render();
+        };
+      }
+      return;
+    }
+    this.renderTable(host, rows);
   }
 
   private renderHeader(root: HTMLElement): void {
@@ -491,6 +527,30 @@ export class HealthDashboardView extends ItemView {
   }
 
   /**
+   * A one-time orientation. Landing on a wall of numbers with no idea what they
+   * are or what to do next is how a first run ends in an uninstall.
+   */
+  private renderIntro(root: HTMLElement): void {
+    if (this.plugin.settings.seenIntro) return;
+    const intro = root.createDiv({ cls: "flowkit-intro" });
+    intro.createEl("strong", { text: "Start with “What to fix”." });
+    intro.createDiv({
+      cls: "flowkit-intro-body",
+      text:
+        "The list below ranks what actually needs your attention — plugins that " +
+        "can't load, ones pulled from the directory, ones with no recent release. " +
+        "The table underneath is the evidence: select any row to see why it scored " +
+        "what it did. Nothing here changes your vault until you say so.",
+    });
+    const done = intro.createEl("button", { text: "Got it" });
+    done.onclick = () => {
+      this.plugin.settings.seenIntro = true;
+      void this.plugin.saveSettings();
+      intro.remove();
+    };
+  }
+
+  /**
    * Say plainly when enrichment is incomplete, and why. Silently dropping two of
    * five columns and relabelling the header is the kind of thing users notice
    * and mistrust.
@@ -524,15 +584,28 @@ export class HealthDashboardView extends ItemView {
   private renderSummary(root: HTMLElement): void {
     const s = this.summaryStats();
     const summary = root.createDiv({ cls: "flowkit-health-summary" });
-    this.statTile(summary, "Plugins", String(this.results.length), "unknown");
-    this.statTile(summary, "Updates", String(s.updates), s.updates > 0 ? "warn" : "good");
+    this.statTile(summary, "Plugins", String(this.results.length), "unknown", "all");
     this.statTile(
       summary,
-      "Unmaintained",
-      String(s.unmaintained),
-      s.unmaintained > 0 ? "bad" : "good"
+      "Updates",
+      String(s.updates),
+      s.updates > 0 ? "warn" : "good",
+      "update"
     );
-    this.statTile(summary, "At risk", String(s.atRisk), s.atRisk > 0 ? "bad" : "good");
+    this.statTile(
+      summary,
+      "No recent release",
+      String(s.unmaintained),
+      s.unmaintained > 0 ? "warn" : "good",
+      "unmaintained"
+    );
+    this.statTile(
+      summary,
+      "At risk",
+      String(s.atRisk),
+      s.atRisk > 0 ? "bad" : "good",
+      "attention"
+    );
   }
 
   /** A standing way back from the last bulk action, for the rest of the session. */
@@ -545,10 +618,23 @@ export class HealthDashboardView extends ItemView {
     btn.onclick = () => void this.undoLastBulk();
   }
 
-  private statTile(parent: HTMLElement, label: string, value: string, tone: Tone): void {
-    const tile = parent.createDiv({ cls: "flowkit-stat" });
+  /** A stat tile that filters the table to the thing it counts. */
+  private statTile(
+    parent: HTMLElement,
+    label: string,
+    value: string,
+    tone: Tone,
+    filter: FilterKey
+  ): void {
+    const tile = parent.createEl("button", { cls: "flowkit-stat" });
+    tile.setAttr("aria-label", `${value} ${label} — show them`);
     tile.createDiv({ cls: `flowkit-stat-value tone-${tone}`, text: value });
     tile.createDiv({ cls: "flowkit-stat-label", text: label });
+    tile.onclick = () => {
+      this.filter = filter;
+      this.search = "";
+      this.render();
+    };
   }
 
   // --- insights -------------------------------------------------------------
@@ -592,12 +678,56 @@ export class HealthDashboardView extends ItemView {
     }
   }
 
+  /** The table filter that shows exactly the plugins an insight is about. */
+  private filterForInsight(id: string): FilterKey | null {
+    switch (id) {
+      case "delisted":
+        return "delisted";
+      case "incompatible":
+        return "incompatible";
+      case "unmaintained":
+        return "unmaintained";
+      case "at-risk":
+        return "attention";
+      case "updates":
+        return "update";
+      case "sideloaded":
+        return "sideloaded";
+      default:
+        return null;
+    }
+  }
+
   private renderInsightCard(parent: HTMLElement, ins: Insight, pro: boolean): void {
     const card = parent.createDiv({ cls: `flowkit-insight tone-${ins.tone}` });
     setIcon(card.createSpan({ cls: "flowkit-insight-icon" }), ins.icon);
     const body = card.createDiv({ cls: "flowkit-insight-body" });
     body.createDiv({ cls: "flowkit-insight-title", text: ins.title });
     body.createDiv({ cls: "flowkit-insight-detail", text: ins.detail });
+
+    // An insight that names plugins should be able to show you them.
+    const filter = ins.ids.length ? this.filterForInsight(ins.id) : null;
+    if (filter) {
+      card.addClass("is-clickable");
+      card.setAttr("tabindex", "0");
+      card.setAttr("role", "button");
+      card.setAttr("aria-label", `${ins.title} — show these plugins`);
+      const go = () => {
+        this.filter = filter;
+        this.search = "";
+        this.render();
+      };
+      card.onclick = (evt) => {
+        if ((evt.target as HTMLElement).closest("button")) return;
+        go();
+      };
+      card.onkeydown = (evt) => {
+        if (evt.key !== "Enter" && evt.key !== " ") return;
+        if ((evt.target as HTMLElement) !== card) return;
+        evt.preventDefault();
+        go();
+      };
+    }
     if (pro && ins.action && ins.ids.length) {
       const btn = card.createEl("button", { cls: "flowkit-insight-action" });
       btn.setText(ins.actionLabel ?? "Apply");
@@ -773,16 +903,12 @@ export class HealthDashboardView extends ItemView {
       placeholder: "Search plugins…",
     });
     input.value = this.search;
+    // The input element survives now, so there is no refocus-and-jump-the-caret
+    // hack. Typing in the middle of a query stays put, and IME composition is
+    // no longer torn down mid-word.
     input.oninput = () => {
       this.search = input.value;
-      this.render();
-      const next = this.contentEl.querySelector<HTMLInputElement>(
-        ".flowkit-search input"
-      );
-      if (next) {
-        next.focus();
-        next.setSelectionRange(next.value.length, next.value.length);
-      }
+      this.renderRows();
     };
 
     const select = bar.createEl("select", { cls: "flowkit-filter dropdown" });
@@ -792,13 +918,19 @@ export class HealthDashboardView extends ItemView {
     }
     select.onchange = () => {
       this.filter = select.value as FilterKey;
-      this.render();
+      this.renderRows();
     };
+
+    this.countEl = bar.createSpan({ cls: "flowkit-result-count" });
   }
 
   private renderTable(root: HTMLElement, rows: PluginHealth[]): void {
     const wrap = root.createDiv({ cls: "flowkit-table-wrap" });
     const table = wrap.createEl("table", { cls: "flowkit-health-table" });
+    table.createEl("caption", {
+      cls: "flowkit-sr-only",
+      text: "Installed plugins scored on compatibility, maintenance, footprint, manifest hygiene and popularity. Select a row to see why it scored what it did.",
+    });
     const thead = table.createEl("thead").createEl("tr");
     this.sortableTh(thead, "Plugin", "name");
     this.sortableTh(
@@ -814,7 +946,85 @@ export class HealthDashboardView extends ItemView {
     thead.createEl("th", { text: "", cls: "num" });
 
     const tbody = table.createEl("tbody");
-    for (const r of rows) this.renderRow(tbody, r);
+    for (const r of rows) {
+      this.renderRow(tbody, r);
+      if (this.expandedId === r.id) this.renderDetail(tbody, r);
+    }
+  }
+
+  /**
+   * The reasoning behind one plugin's score, inline under its row. Before this
+   * the numbers were terminal: a user could see 43 and had nowhere to go to
+   * find out why, or what to do about it.
+   */
+  private renderDetail(tbody: HTMLElement, r: PluginHealth): void {
+    const tr = tbody.createEl("tr", { cls: "flowkit-detail-row" });
+    const td = tr.createEl("td");
+    td.setAttr("colspan", String(METRIC_COLUMNS.length + 3));
+    const panel = td.createDiv({ cls: "flowkit-detail" });
+
+    const head = panel.createDiv({ cls: "flowkit-detail-head" });
+    head.createDiv({
+      cls: "flowkit-detail-title",
+      text: `Why ${r.name} scores ${r.overall ?? "—"}`,
+    });
+    head.createDiv({
+      cls: "flowkit-detail-sub",
+      text: `${Math.round(r.confidence * 100)}% confidence · ${
+        r.metrics.compatibility.value === 0
+          ? "capped because it can't load here"
+          : r.listing === "delisted"
+            ? "capped because it was removed from the directory"
+            : "weighted blend of the metrics below"
+      }`,
+    });
+
+    const list = panel.createDiv({ cls: "flowkit-detail-metrics" });
+    for (const col of METRIC_COLUMNS) {
+      const m = r.metrics[col.key];
+      const row = list.createDiv({ cls: "flowkit-detail-metric" });
+      row.createSpan({ cls: "flowkit-detail-metric-name", text: col.label });
+      row.createSpan({
+        cls: "flowkit-detail-metric-weight",
+        text: `${Math.round(WEIGHTS[col.key] * 100)}%`,
+      });
+      row.createSpan({
+        cls: `flowkit-detail-metric-value tone-${band(m.value)}`,
+        text: m.value == null ? "—" : String(m.value),
+      });
+      row.createSpan({ cls: "flowkit-detail-metric-detail", text: m.detail });
+    }
+
+    const facts = panel.createDiv({ cls: "flowkit-detail-facts" });
+    facts.createDiv({
+      text: `Installed v${r.version}${
+        r.latestVersion && r.latestVersion !== r.version
+          ? ` · latest published v${r.latestVersion}`
+          : ""
+      } · by ${r.author}`,
+    });
+
+    const actions = panel.createDiv({ cls: "flowkit-detail-actions" });
+    const toggle = actions.createEl("button", {
+      text: r.enabled ? "Disable" : "Enable",
+    });
+    toggle.onclick = () => {
+      void this.plugin.setPluginEnabled(r.id, !r.enabled).then(() => this.refresh());
+    };
+    if (r.enabled) {
+      const settings = actions.createEl("button", { text: "Open its settings" });
+      settings.onclick = () => this.plugin.openPluginSettings(r.id);
+    }
+    if (r.repo) {
+      const gh = actions.createEl("button", { text: "Open on GitHub" });
+      gh.onclick = () => window.open(`https://github.com/${r.repo}`, "_blank");
+    }
+    const mute = actions.createEl("button", {
+      text: r.muted ? "Unmute" : "Mute from counts",
+    });
+    mute.onclick = () => {
+      void this.plugin.toggleIgnore(r.id).then(() => this.refresh());
+    };
   }
 
   private sortableTh(
@@ -844,6 +1054,29 @@ export class HealthDashboardView extends ItemView {
     const tr = tbody.createEl("tr");
     if (!r.enabled) tr.addClass("is-disabled");
     if (r.muted) tr.addClass("is-muted");
+
+    const expanded = this.expandedId === r.id;
+    if (expanded) tr.addClass("is-expanded");
+    // Operable by keyboard, and announced as the disclosure control it is.
+    tr.setAttr("tabindex", "0");
+    tr.setAttr("role", "button");
+    tr.setAttr("aria-expanded", String(expanded));
+    tr.setAttr("aria-label", `${r.name} — show why it scores ${r.overall ?? "unknown"}`);
+    const toggle = () => {
+      this.expandedId = expanded ? null : r.id;
+      this.renderRows();
+    };
+    tr.onclick = (evt) => {
+      // Don't hijack the row menu button or the panel's own controls.
+      if ((evt.target as HTMLElement).closest("button")) return;
+      toggle();
+    };
+    tr.onkeydown = (evt) => {
+      if (evt.key !== "Enter" && evt.key !== " ") return;
+      if ((evt.target as HTMLElement) !== tr) return;
+      evt.preventDefault();
+      toggle();
+    };
 
     const nameCell = tr.createEl("td", { cls: "flowkit-name" });
     const nameRow = nameCell.createDiv({ cls: "flowkit-name-row" });
@@ -888,11 +1121,12 @@ export class HealthDashboardView extends ItemView {
       tr,
       r.overall,
       "estimated",
-      "Blended from the five metrics in this row."
+      "Blended from the five metrics in this row.",
+      "Overall"
     );
     for (const col of METRIC_COLUMNS) {
       const metric = r.metrics[col.key];
-      this.scoreCell(tr, metric.value, metric.source, metric.detail);
+      this.scoreCell(tr, metric.value, metric.source, metric.detail, col.label);
     }
 
     const actionCell = tr.createEl("td", { cls: "num flowkit-actions" });
@@ -960,18 +1194,25 @@ export class HealthDashboardView extends ItemView {
     tr: HTMLElement,
     value: number | null,
     source: MetricScore["source"],
-    detail?: string
+    detail?: string,
+    columnLabel?: string
   ): void {
     const td = tr.createEl("td", { cls: "num" });
+    // Read by the narrow-width card layout, where the header row is hidden.
+    if (columnLabel) td.setAttr("data-label", columnLabel);
+    const tone = band(value);
     const chip = td.createSpan({
-      cls: `flowkit-chip tone-${band(value)} src-${source}`,
+      cls: `flowkit-chip tone-${tone} src-${source}`,
     });
     chip.setText(value == null ? "—" : String(value));
     if (source === "estimated") chip.createSpan({ cls: "flowkit-est", text: "~" });
-    if (detail) {
-      chip.setAttr("aria-label", detail);
-      chip.setAttr("title", detail);
-    }
+    // Colour alone carried the good/warn/bad reading, which is invisible to
+    // anyone colour-blind and to a screen reader. Name the band in the label.
+    const bandWord =
+      tone === "good" ? "good" : tone === "warn" ? "needs a look" : tone === "bad" ? "poor" : "no data";
+    const label = detail ? `${bandWord} — ${detail}` : bandWord;
+    chip.setAttr("aria-label", label);
+    if (detail) chip.setAttr("title", detail);
   }
 
   private renderLegend(root: HTMLElement): void {

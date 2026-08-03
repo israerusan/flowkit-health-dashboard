@@ -1,7 +1,13 @@
-import { Platform, Plugin, WorkspaceLeaf } from "obsidian";
+import { Notice, Platform, Plugin, WorkspaceLeaf } from "obsidian";
 import type { PluginManifest } from "obsidian";
 import { HealthDashboardView, VIEW_TYPE_HEALTH } from "./view";
-import { buildDownloadRanker, classifyListing, computeHealth } from "./scoring";
+import {
+  buildRemoteCache,
+  classifyListing,
+  computeHealth,
+  rankerFromDistribution,
+  remoteFromCache,
+} from "./scoring";
 import {
   describeFailure,
   fetchCommunityList,
@@ -14,11 +20,10 @@ import {
   FlowKitHealthSettings,
 } from "./settings";
 import type {
-  CommunityList,
   DataCoverage,
   HealthSnapshot,
   PluginHealth,
-  RemoteStats,
+  RemoteCache,
 } from "./types";
 
 /** Obsidian's internal plugin registry — not in the public typings. */
@@ -43,6 +48,15 @@ type AppInternals = {
 /** Cap on stored trend snapshots — plenty for a readable history. */
 const MAX_HISTORY = 90;
 
+/**
+ * How long the persisted community projection is served before a refresh is
+ * attempted. Download counts and release dates move on the scale of days, so a
+ * day-old reading is not meaningfully worse than a fresh one — and it means the
+ * dashboard paints instantly instead of blocking on ~3.7 MB of JSON.
+ */
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+
+
 export default class FlowKitHealthPlugin extends Plugin {
   settings: FlowKitHealthSettings = DEFAULT_SETTINGS;
 
@@ -51,10 +65,9 @@ export default class FlowKitHealthPlugin extends Plugin {
   licenseEmail?: string;
   licenseError?: string;
 
-  /** Session cache of the (multi-MB) community data, so reopening the view or
-   *  re-scoring doesn't re-download it. Cleared on an explicit Refresh. */
-  private remoteCache: { stats: RemoteStats | null; list: CommunityList | null } | null =
-    null;
+  // The session-only cache of the raw multi-MB feeds is gone: the slim
+  // projection in `settings.cache` survives restarts, which is what actually
+  // makes the dashboard open instantly.
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -133,19 +146,32 @@ export default class FlowKitHealthPlugin extends Plugin {
     }
   }
 
-  /** Reveal the dashboard in the right sidebar, creating it if needed. */
+  /**
+   * Reveal the dashboard, creating it if needed.
+   *
+   * Opens in a main tab, not the right sidebar. An eight-column scorecard in a
+   * ~300px sidebar was hostile at the only width most users ever saw it at —
+   * and `getRightLeaf` can return null on mobile, where this silently did
+   * nothing at all.
+   */
   async activateView(): Promise<void> {
     const { workspace } = this.app;
-    let leaf: WorkspaceLeaf | null =
-      workspace.getLeavesOfType(VIEW_TYPE_HEALTH)[0] ?? null;
-
-    if (!leaf) {
-      leaf = workspace.getRightLeaf(false);
-      await leaf?.setViewState({ type: VIEW_TYPE_HEALTH, active: true });
+    const existing = workspace.getLeavesOfType(VIEW_TYPE_HEALTH)[0] ?? null;
+    if (existing) {
+      void workspace.revealLeaf(existing);
+      return;
     }
+
+    const leaf: WorkspaceLeaf | null =
+      workspace.getLeaf("tab") ?? workspace.getRightLeaf(false);
+    if (!leaf) {
+      new Notice("Couldn't open the dashboard — no place to put it.");
+      return;
+    }
+    await leaf.setViewState({ type: VIEW_TYPE_HEALTH, active: true });
     // `void` the reveal so no-floating-promises is satisfied (revealLeaf gained a
     // Promise return in 1.7.2; we don't consume it).
-    if (leaf) void this.app.workspace.revealLeaf(leaf);
+    void workspace.revealLeaf(leaf);
   }
 
   /** Obsidian's plugin registry, defaulted so a shape change degrades to an empty scan. */
@@ -172,65 +198,47 @@ export default class FlowKitHealthPlugin extends Plugin {
     const manifests = Object.values(api.manifests ?? {});
     const enabledSet = api.enabledPlugins ?? new Set<string>();
 
-    let stats: RemoteStats | null = null;
-    let list: CommunityList | null = null;
     const coverage: DataCoverage = {
       stats: false,
       list: false,
       disabled: !this.settings.enableOnlineEnrichment,
     };
 
+    let cache: RemoteCache | null = null;
     if (this.settings.enableOnlineEnrichment) {
-      if (forceRefresh || !this.remoteCache) {
-        const [statsRes, listRes] = await Promise.all([
-          fetchRemoteStats(),
-          fetchCommunityList(),
-        ]);
-        if (!statsRes.ok) {
-          coverage.error = describeFailure(statsRes.reason, statsRes.status);
-        } else if (!listRes.ok) {
-          coverage.error = describeFailure(listRes.reason, listRes.status);
-        }
-        // Only remember a scan that produced something. Caching a total failure
-        // would pin the whole session offline: `{stats:null,list:null}` is
-        // truthy, so every later non-forced call would short-circuit on it.
-        if (statsRes.ok || listRes.ok) {
-          this.remoteCache = {
-            stats: statsRes.ok ? statsRes.data : null,
-            list: listRes.ok ? listRes.data : null,
-          };
-        } else {
-          this.remoteCache = null;
-        }
+      cache = this.settings.cache;
+      const stale = !cache || Date.now() - cache.at > CACHE_TTL_MS;
+      if (forceRefresh || stale) {
+        const fetched = await this.fetchRemoteCache(coverage);
+        // Keep serving the previous projection when a refresh fails, rather
+        // than dropping two of five columns because GitHub had a bad minute.
+        if (fetched) cache = fetched;
       }
-      stats = this.remoteCache?.stats ?? null;
-      list = this.remoteCache?.list ?? null;
-      coverage.stats = stats != null;
-      coverage.list = list != null;
-    } else {
-      // Enrichment turned off — drop any cached data so re-enabling refetches.
-      this.remoteCache = null;
+      coverage.stats = cache?.hadStats ?? false;
+      coverage.list = cache?.hadList ?? false;
     }
 
     const now = Date.now();
     const ignored = new Set(this.settings.ignored);
-    const ranker = buildDownloadRanker(stats);
+    const rank = rankerFromDistribution(cache?.distribution);
     const results: PluginHealth[] = [];
     for (const manifest of manifests) {
       const enabled = enabledSet.has(manifest.id);
       if (!enabled && !this.settings.showDisabled) continue;
 
+      const cached = cache?.plugins[manifest.id];
+      const remote = remoteFromCache(cached);
       results.push(
         computeHealth(
           {
             manifest,
             enabled,
             isMobile: Platform.isMobile,
-            repo: list?.[manifest.id]?.repo,
-            remote: stats?.[manifest.id],
+            repo: cached?.repo,
+            remote,
             bundleBytes: await this.measureBundle(manifest),
-            downloadPercentile: ranker(stats?.[manifest.id]?.downloads),
-            listing: classifyListing(manifest.id, stats, list),
+            downloadPercentile: rank(cached?.downloads),
+            listing: classifyListing(manifest.id, cache),
             muted: ignored.has(manifest.id),
           },
           now
@@ -238,6 +246,34 @@ export default class FlowKitHealthPlugin extends Plugin {
       );
     }
     return { results, coverage };
+  }
+
+  /**
+   * Download both community feeds and reduce them to the slim projection we
+   * persist. Returns null when nothing usable came back.
+   */
+  private async fetchRemoteCache(
+    coverage: DataCoverage
+  ): Promise<RemoteCache | null> {
+    const [statsRes, listRes] = await Promise.all([
+      fetchRemoteStats(),
+      fetchCommunityList(),
+    ]);
+    if (!statsRes.ok) {
+      coverage.error = describeFailure(statsRes.reason, statsRes.status);
+    } else if (!listRes.ok) {
+      coverage.error = describeFailure(listRes.reason, listRes.status);
+    }
+    if (!statsRes.ok && !listRes.ok) return null;
+
+    const built = buildRemoteCache(
+      statsRes.ok ? statsRes.data : null,
+      listRes.ok ? listRes.data : null,
+      Date.now()
+    );
+    this.settings.cache = built;
+    await this.saveSettings();
+    return built;
   }
 
   /**
