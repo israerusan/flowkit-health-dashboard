@@ -3,6 +3,23 @@
 All notable changes to FlowKit Plugin Health Dashboard are documented here. This
 project follows [Semantic Versioning](https://semver.org/).
 
+## [1.2.1] - 2026-08-03
+
+### Fixed
+
+- **"GitHub returned an unexpected response (403)".** GitHub rate-limits
+  unauthenticated downloads per IP, and the two community files are ~1.8 MB
+  each, so a handful of scans in quick succession is enough to trip it. FlowKit
+  now falls back to the jsDelivr mirror of the same data, backs off for 30
+  minutes instead of hammering a limiter, and says plainly that it was
+  rate-limited rather than blaming an "unexpected response".
+- **Far fewer downloads.** Concurrent scans now share one fetch — a cold start
+  could previously issue four requests for the same data within a second.
+  Toggling "show disabled plugins" or clearing the mute list no longer
+  re-downloads anything; neither changes data the network could answer.
+- Retry now overrides the backoff, because an explicit Retry is you saying
+  "try now".
+
 ## [1.2.0] - 2026-08-03
 
 A UX pass driven by an adversarial review — four independent critiques, each

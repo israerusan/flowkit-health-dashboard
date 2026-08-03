@@ -87,6 +87,9 @@ export default class FlowKitHealthPlugin extends Plugin {
   /** Attributes runtime errors to the plugin that threw them. */
   private errorWatcher: ErrorWatcher | null = null;
 
+  /** Shared between concurrent scans, so one cold start means one download. */
+  private inFlightFetch: Promise<RemoteCache | null> | null = null;
+
   async onload(): Promise<void> {
     await this.loadSettings();
     this.refreshLicense();
@@ -386,11 +389,15 @@ export default class FlowKitHealthPlugin extends Plugin {
    * stale view and concludes nothing happened — at precisely the moment they
    * have just paid.
    */
-  refreshViews(rescan = false): void {
+  refreshViews(rescan = false, allowFetch = false): void {
     for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_HEALTH)) {
       const view = leaf.view;
       if (!(view instanceof HealthDashboardView)) continue;
-      if (rescan) void view.refresh();
+      // Rescanning defaults to local-only. Flipping "show disabled plugins" or
+      // clearing the mute list changes nothing the network could answer, and
+      // each of those toggles used to be able to pull ~3.7 MB — which is how a
+      // few settings clicks turn into a rate limit.
+      if (rescan) void view.refresh(false, allowFetch);
       else view.rerender();
     }
   }
@@ -520,6 +527,28 @@ export default class FlowKitHealthPlugin extends Plugin {
    * persist. Returns null when nothing usable came back.
    */
   private async fetchRemoteCache(
+    coverage: DataCoverage,
+    installed: Set<string>
+  ): Promise<RemoteCache | null> {
+    // Share one fetch between concurrent callers. The background pass fires on
+    // layout-ready and the view scans on open, so a cold start could otherwise
+    // issue four requests for the same ~3.7 MB within a second of each other —
+    // which is a good way to get told 403.
+    if (this.inFlightFetch) {
+      const shared = await this.inFlightFetch;
+      if (!shared) coverage.error = describeFailure("network");
+      return shared;
+    }
+    const run = this.doFetchRemoteCache(coverage, installed);
+    this.inFlightFetch = run;
+    try {
+      return await run;
+    } finally {
+      this.inFlightFetch = null;
+    }
+  }
+
+  private async doFetchRemoteCache(
     coverage: DataCoverage,
     installed: Set<string>
   ): Promise<RemoteCache | null> {

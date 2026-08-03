@@ -177,6 +177,11 @@ Key didn't arrive, or want a refund? Email <iavila01@gmail.com>.
 - **Online enrichment** — fetch popularity + maintenance from Obsidian's public
   community data. Turn off to stay fully offline (those two metrics then show as
   unavailable). Local-first: no telemetry, no accounts.
+
+  The two files come from `raw.githubusercontent.com`, falling back to the
+  jsDelivr CDN mirror of the same repository when GitHub rate-limits the
+  connection. Nothing is sent — these are plain public downloads — and the
+  result is cached locally for a day.
 - **Show disabled plugins** — include installed-but-disabled plugins.
 - **Re-download community data on open** — off by default; the cached scan is
   reused for a day, and Refresh always refetches.

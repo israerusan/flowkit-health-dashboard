@@ -27,6 +27,7 @@ import {
   type Insight,
 } from "./insights";
 import { WEIGHTS } from "./scoring";
+import { clearCooldown } from "./dataSources";
 import { totalUncaught } from "./errors";
 import { BulkConfirmModal } from "./ui/BulkConfirmModal";
 import { UpgradeModal } from "./ui/UpgradeModal";
@@ -241,6 +242,15 @@ export class HealthDashboardView extends ItemView {
 
   async onOpen(): Promise<void> {
     await this.refresh(this.plugin.settings.autoRefreshOnOpen);
+  }
+
+  /**
+   * An explicit Retry overrides the rate-limit backoff — the user is telling us
+   * to try now, and they can see the result themselves.
+   */
+  private forceRetry(): void {
+    clearCooldown();
+    void this.refresh(true);
   }
 
   /** Re-render from the results already in hand, without rescanning. */
@@ -548,7 +558,7 @@ export class HealthDashboardView extends ItemView {
       body.createEl("strong", { text: "The scan didn't finish." });
       body.createDiv({ cls: "flowkit-error-detail", text: this.scanError });
       const retry = card.createEl("button", { cls: "mod-cta", text: "Try again" });
-      retry.onclick = () => void this.refresh(true);
+      retry.onclick = () => this.forceRetry();
       return;
     }
 
@@ -817,7 +827,7 @@ export class HealthDashboardView extends ItemView {
         .createDiv({ cls: "flowkit-coverage-body" })
         .setText(`${error} Showing the last data FlowKit downloaded.`);
       const again = stale.createEl("button", { text: "Retry" });
-      again.onclick = () => void this.refresh(true);
+      again.onclick = () => this.forceRetry();
       return;
     }
 
@@ -840,7 +850,7 @@ export class HealthDashboardView extends ItemView {
     const missing = !stats && !list ? "Popularity, Maintenance and sideload detection" : !stats ? "Popularity and Maintenance" : "sideload detection and repository links";
     body.createDiv({ text: `${error ?? "Couldn't reach GitHub."} ${missing} unavailable for this scan.` });
     const btn = note.createEl("button", { text: "Retry" });
-    btn.onclick = () => void this.refresh(true);
+    btn.onclick = () => this.forceRetry();
   }
 
   private renderSummary(root: HTMLElement): void {

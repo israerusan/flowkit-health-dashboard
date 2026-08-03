@@ -118,8 +118,9 @@ export class FlowKitHealthSettingTab extends PluginSettingTab {
           .onChange(async (value) => {
             this.plugin.settings.enableOnlineEnrichment = value;
             await this.plugin.saveSettings();
-            // Changes which metrics are even computable — needs a rescan.
-            this.plugin.refreshViews(true);
+            // The one toggle that genuinely may need the network: switching
+            // enrichment on with no cached data has nothing to show otherwise.
+            this.plugin.refreshViews(true, value);
           })
       );
 
