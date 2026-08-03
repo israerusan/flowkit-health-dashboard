@@ -1381,6 +1381,17 @@ eq("prerelease vs prerelease", compareVersion("1.0.0-alpha", "1.0.0-beta"), -1);
     searchableCandidates(["alpha"], "flowkit-health-dashboard").join(),
     "alpha"
   );
+  // The same hazard, learned a second time: profiling restarts every plugin it
+  // is handed, so handing it our own id orphans the run inside an unloaded
+  // instance and silently discards every measurement.
+  eq(
+    "profiling is filtered the same way",
+    searchableCandidates(
+      ["flowkit-health-dashboard", "alpha", "beta"],
+      "flowkit-health-dashboard"
+    ).join(),
+    "alpha,beta"
+  );
 }
 
 // --- timeline ----------------------------------------------------------------

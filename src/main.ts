@@ -1181,7 +1181,12 @@ export default class FlowKitHealthPlugin extends Plugin {
   ): Promise<{ measured: number; failed: string[] } | null> {
     if (!this.runtimeWatcher) return null;
     const watcher = this.runtimeWatcher;
-    const result = await this.withVaultMutation(() => watcher.profileAll(ids, onProgress));
+    // Never profile ourselves. Restarting FlowKit mid-run orphans this very
+    // loop inside an unloaded instance and silently discards every reading —
+    // and we could not time our own load anyway, since we would not be
+    // running to observe it.
+    const safe = searchableCandidates(ids, this.manifest.id);
+    const result = await this.withVaultMutation(() => watcher.profileAll(safe, onProgress));
     await this.saveSettings();
     return result;
   }

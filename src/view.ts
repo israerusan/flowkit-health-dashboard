@@ -793,7 +793,6 @@ export class HealthDashboardView extends ItemView {
 
   private openToolsMenu(evt: MouseEvent): void {
     const menu = new Menu();
-    const enabled = this.results.filter((r) => r.enabled);
 
     menu.addItem((item) =>
       item
@@ -810,7 +809,7 @@ export class HealthDashboardView extends ItemView {
       item
         .setTitle(this.plugin.isPro ? "Profile startup…" : "Profile startup… (Pro)")
         .setIcon("timer")
-        .onClick(() => this.startProfileAll(enabled.map((r) => r.id)))
+        .onClick(() => this.startProfileAll(this.profilableIds()))
     );
 
     menu.addSeparator();
@@ -1276,7 +1275,7 @@ export class HealthDashboardView extends ItemView {
         "aria-label",
         "Restart each unmeasured plugin in turn and time how long it takes to load"
       );
-      profile.onclick = () => this.startProfileAll(enabled.map((r) => r.id));
+      profile.onclick = () => this.startProfileAll(this.profilableIds());
     }
 
     const btn = bar.createEl("button", { text: "Why is my vault slow?" });
@@ -1292,6 +1291,17 @@ export class HealthDashboardView extends ItemView {
    * "why is my vault slow" answer partial. This fills it, at the cost of
    * genuinely restarting everything, so it is confirmed and it is Pro.
    */
+  /**
+   * Enabled plugins that may be restarted for measurement — never FlowKit,
+   * which cannot time its own load and would orphan the run by unloading it.
+   */
+  private profilableIds(): string[] {
+    return searchableCandidates(
+      this.results.filter((r) => r.enabled).map((r) => r.id),
+      this.plugin.manifest.id
+    );
+  }
+
   private startProfileAll(ids: string[]): void {
     if (!this.plugin.isPro) {
       this.openUpgrade("profile");

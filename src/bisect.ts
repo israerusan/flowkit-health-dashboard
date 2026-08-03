@@ -65,15 +65,23 @@ function halfOf(candidates: string[]): string[] {
 }
 
 /**
- * The plugins a search may switch off.
+ * The plugins an operation may switch off — anything except FlowKit itself.
  *
- * Excludes the searcher itself, which is not fastidiousness — it is the
- * difference between a feature and a disaster. Bisect disables half its
- * candidates each round, so a run that included FlowKit would eventually
- * unload FlowKit: the view disappears mid-search, the session state survives
- * on disk describing a vault with half its plugins switched off, and the only
- * thing that knows how to put them back is now disabled. The user would be
- * re-enabling by hand, guessing at what had been on to begin with.
+ * Not fastidiousness: it is the difference between a feature and a disaster,
+ * and it has now been learned twice.
+ *
+ * Bisect disables half its candidates each round, so a run including FlowKit
+ * would eventually unload FlowKit: the view disappears mid-search, the session
+ * survives on disk describing a vault with half its plugins off, and the only
+ * thing that knows how to put them back is disabled.
+ *
+ * Profiling is worse, because it fails quietly. Restarting FlowKit mid-run
+ * leaves the loop executing inside an unloaded instance, which then re-enables
+ * FlowKit as a SECOND instance; the two race to write plugin data and the
+ * surviving one holds state read from before the run. Every measurement is
+ * lost and the operation still reports success.
+ *
+ * Any future operation that toggles plugins in bulk belongs behind this too.
  */
 export function searchableCandidates(
   enabled: readonly string[],
