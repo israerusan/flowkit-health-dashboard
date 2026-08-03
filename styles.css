@@ -88,53 +88,28 @@
   border: 1px solid var(--background-modifier-border);
   border-radius: 12px;
 }
-.flowkit-gauge {
-  position: relative;
+/* The score, without the ring. */
+.flowkit-hero-score {
   flex: 0 0 auto;
-  width: 116px;
-  height: 116px;
-  display: grid;
-  place-items: center;
-}
-.flowkit-gauge-track {
-  stroke: var(--background-modifier-border);
-}
-.flowkit-gauge-arc {
-  transition: stroke-dasharray 600ms ease;
-}
-.flowkit-gauge-arc.tone-good {
-  stroke: var(--color-green, #2e7d32);
-}
-.flowkit-gauge-arc.tone-warn {
-  stroke: var(--color-yellow, #b8860b);
-}
-.flowkit-gauge-arc.tone-bad {
-  stroke: var(--color-red, #c62828);
-}
-.flowkit-gauge-arc.tone-unknown {
-  stroke: var(--background-modifier-border);
-}
-.flowkit-gauge-label {
-  position: absolute;
-  inset: 0;
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 0;
+  min-width: 74px;
 }
-.flowkit-gauge-score {
-  font-size: 2em;
+.flowkit-hero-number {
+  font-size: 2.1em;
   font-weight: 800;
   line-height: 1;
   font-variant-numeric: tabular-nums;
 }
-.flowkit-gauge-grade {
-  font-size: 0.72em;
-  color: var(--text-muted);
+/* The grade letter is the most memorable thing in the product; it used to be
+   rendered smaller and greyer than the digits above it. */
+.flowkit-hero-grade {
+  font-size: 1em;
+  font-weight: 700;
   margin-top: 2px;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
+  letter-spacing: 0.02em;
 }
 .flowkit-hero-text {
   min-width: 0;
@@ -156,19 +131,25 @@
 }
 
 /* Summary tiles ---------------------------------------------------------- */
+/* One line of label/value pairs, not four stacked cards. Same information,
+   ~22px instead of ~56px, and it stops competing with the findings below it. */
 .flowkit-health-summary {
   display: flex;
-  gap: 10px;
-  margin: 0 0 14px;
+  gap: 6px;
+  margin: 0 0 12px;
   flex-wrap: wrap;
+  align-items: stretch;
 }
 .flowkit-stat {
-  flex: 1 1 80px;
+  flex: 0 1 auto;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
   background: var(--background-secondary);
   border: 1px solid var(--background-modifier-border);
-  border-radius: 8px;
-  padding: 8px 12px;
-  text-align: center;
+  border-radius: 999px;
+  padding: 3px 12px;
+  text-align: left;
   /* It's a <button> now (it filters the table), so undo the button chrome. */
   box-shadow: none;
   cursor: pointer;
@@ -184,17 +165,13 @@
   outline-offset: 2px;
 }
 .flowkit-stat-value {
-  font-size: 1.5em;
+  font-size: 0.95em;
   font-weight: 700;
-  line-height: 1.1;
   font-variant-numeric: tabular-nums;
 }
 .flowkit-stat-label {
-  font-size: 0.72em;
+  font-size: 0.78em;
   color: var(--text-muted);
-  margin-top: 2px;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
 }
 
 /* Section headers (Insights / Trends) ------------------------------------ */
@@ -627,6 +604,51 @@
   font-size: 0.8em;
   color: var(--text-muted);
   white-space: nowrap;
+}
+
+/* Active-scope chip: what the table is filtered to, and a way out. Kept in
+   normal flow rather than sticky — the header above already wraps to a variable
+   height, and a fixed offset under it was wrong at most widths. */
+.flowkit-scope-host {
+  flex: 1 1 100%;
+  min-width: 0;
+}
+.flowkit-scope-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 2px 4px 2px 10px;
+  border-radius: 999px;
+  font-size: 0.8em;
+  background: color-mix(in srgb, var(--interactive-accent) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--interactive-accent) 40%, transparent);
+}
+.flowkit-scope-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.flowkit-scope-chip button {
+  flex: 0 0 auto;
+  padding: 0 6px;
+  background: transparent;
+  box-shadow: none;
+  border: none;
+  cursor: pointer;
+  font-size: 1.1em;
+  line-height: 1;
+  color: var(--text-muted);
+}
+.flowkit-scope-chip button:hover {
+  color: var(--text-normal);
+}
+
+/* Busy state: dim the rows in place instead of blanking the whole view. */
+.flowkit-health.is-busy .flowkit-rows {
+  opacity: 0.55;
+  pointer-events: none;
+  transition: opacity 120ms ease;
 }
 
 /* Per-plugin reasoning panel ---------------------------------------------- */

@@ -579,6 +579,53 @@ eq("prerelease vs prerelease", compareVersion("1.0.0-alpha", "1.0.0-beta"), -1);
   eq("and it is the enabled one", both?.ids[0], "on");
 }
 
+// --- a finding shows exactly what it counted --------------------------------
+{
+  // The card said "3 plugins score below 50" and opened a table of everything
+  // the `attention` filter matched — which includes anything with an update
+  // available. Every insight now carries the predicate it was built from.
+  const rows = [
+    ph({ id: "bad", overall: 20 }),
+    ph({ id: "fine-but-update", overall: 95, updateAvailable: true }),
+    ph({ id: "fine", overall: 95 }),
+  ];
+  const insights = buildInsights(rows);
+  for (const ins of insights) {
+    const matched = rows.filter((r) => ins.match(r)).map((r) => r.id).sort();
+    check(
+      `insight "${ins.id}" matches exactly the plugins it counted`,
+      JSON.stringify(matched) === JSON.stringify([...ins.ids].sort()),
+      `counted ${JSON.stringify(ins.ids)}, matches ${JSON.stringify(matched)}`
+    );
+  }
+
+  // Muted plugins are excluded from every count, so no predicate may match one.
+  const muted = ph({ id: "m", overall: 5, muted: true, maintenanceStatus: "unmaintained" });
+  for (const ins of buildInsights([...rows, muted])) {
+    check(`insight "${ins.id}" never matches a muted plugin`, !ins.match(muted), "muted leaked");
+  }
+}
+
+// --- findings don't restate each other --------------------------------------
+{
+  // One broken plugin used to generate four findings: delisted, incompatible,
+  // no-recent-release AND "scores below 50" all naming the same row.
+  const broken = ph({
+    id: "broken",
+    overall: 12,
+    listing: "delisted",
+    maintenanceStatus: "unmaintained",
+  });
+  broken.metrics.compatibility = { value: 0, source: "measured", detail: "" };
+  const found = buildInsights([broken]);
+  const atRisk = found.find((i) => i.id === "at-risk");
+  check(
+    "a plugin already explained above is not restated by at-risk",
+    !atRisk || !atRisk.ids.includes("broken"),
+    "broken was listed twice"
+  );
+}
+
 // --- error attribution ------------------------------------------------------
 {
   const installed = new Set(["dataview", "templater-obsidian", "flowkit-health-dashboard"]);

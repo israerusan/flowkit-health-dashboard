@@ -183,6 +183,8 @@ export class HealthDashboardView extends ItemView {
   private loading = false;
   /** Set when a scan threw, so the view offers a way out instead of a dead spinner. */
   private scanError: string | null = null;
+  /** In-flight guard: two concurrent scans would race results and double-write. */
+  private refreshing = false;
   /** The results region, rebuilt on its own when search/filter/sort change. */
   private rowsEl: HTMLElement | null = null;
   /** Live "N of M" readout in the toolbar. */
@@ -196,7 +198,16 @@ export class HealthDashboardView extends ItemView {
   private search = "";
   private filter: FilterKey = "all";
   private sortKey: SortKey = "overall";
-  private sortDir: 1 | -1 = -1;
+  // Ascending: worst first. The whole product exists to surface the plugin you
+  // should worry about, and it used to open sorted best-first, putting that
+  // plugin at the bottom of the list, below the fold.
+  private sortDir: 1 | -1 = 1;
+  /** When set, the table is scoped to exactly the cohort a finding counted. */
+  private scopeInsight: Insight | null = null;
+  private toolbarEl: HTMLElement | null = null;
+  private filterSelect: HTMLSelectElement | null = null;
+  private searchInput: HTMLInputElement | null = null;
+  private scopeChipEl: HTMLElement | null = null;
 
   constructor(leaf: WorkspaceLeaf, plugin: FlowKitHealthPlugin) {
     super(leaf);
@@ -224,13 +235,39 @@ export class HealthDashboardView extends ItemView {
     this.render();
   }
 
-  /** Recompute all scores and re-render. Pass `force` to re-download data. */
-  async refresh(force = false): Promise<void> {
-    this.loading = true;
+  /**
+   * Recompute all scores and re-render.
+   *
+   * @param force re-download community data instead of using the cache.
+   * @param allowFetch whether this rescan may touch the network at all. Acting
+   *   on a single row must never do so: with the 24h cache TTL, muting one
+   *   plugin could otherwise trigger a multi-megabyte download behind a
+   *   full-page spinner, which made the paid bulk flow the slowest thing here.
+   */
+  async refresh(force = false, allowFetch = true): Promise<void> {
+    // A second concurrent scan would race `this.results` and double-write the
+    // same snapshot. The full-page spinner used to hide this by making a second
+    // click unlikely; now that the page stays interactive, guard it properly.
+    if (this.refreshing) return;
+    this.refreshing = true;
     this.scanError = null;
-    this.render();
+
+    // Only blank the view when there is nothing to keep. Otherwise dim the
+    // rows in place, so acting on a plugin doesn't throw the user back to the
+    // top of the page with no evidence anything happened.
+    const firstRun = this.results.length === 0;
+    if (firstRun) {
+      this.loading = true;
+      this.render();
+    } else {
+      this.contentEl.addClass("is-busy");
+    }
+
+    const scrollTop = this.contentEl.scrollTop;
+    const focusedId = this.focusedRowId();
+
     try {
-      const { results, coverage } = await this.plugin.computeAll({ force });
+      const { results, coverage } = await this.plugin.computeAll({ force, allowFetch });
       this.results = results;
       this.coverage = coverage;
       const s = this.summaryStats();
@@ -260,7 +297,56 @@ export class HealthDashboardView extends ItemView {
         err instanceof Error ? err.message : "Something went wrong during the scan.";
     } finally {
       this.loading = false;
+      this.refreshing = false;
+      this.contentEl.removeClass("is-busy");
       this.render();
+      // Put the user back exactly where they were.
+      if (!firstRun) {
+        this.contentEl.scrollTop = scrollTop;
+        this.restoreFocus(focusedId);
+      }
+    }
+  }
+
+  /**
+   * Mute or unmute without rescanning. `muted` is pure passthrough — it changes
+   * no score — so re-running the whole scorer (and possibly the network) for it
+   * was pure latency on the most casual action in the product.
+   */
+  private async toggleMute(r: PluginHealth): Promise<void> {
+    await this.plugin.toggleIgnore(r.id);
+    r.muted = !r.muted;
+    const s = this.summaryStats();
+    this.plugin.updateStatusBar(
+      s.avg,
+      this.results.filter((x) => !x.muted)
+    );
+    const scrollTop = this.contentEl.scrollTop;
+    const focusedId = this.focusedRowId();
+    this.render();
+    this.contentEl.scrollTop = scrollTop;
+    this.restoreFocus(focusedId);
+  }
+
+  /** The plugin id of the row currently holding focus, if any. */
+  private focusedRowId(): string | null {
+    const active = this.contentEl.ownerDocument.activeElement;
+    if (!(active instanceof HTMLElement)) return null;
+    const row = active.closest<HTMLElement>("[data-plugin-id]");
+    return row?.dataset.pluginId ?? null;
+  }
+
+  /** Return focus to the row the user was on before the re-render. */
+  private restoreFocus(id: string | null): void {
+    if (!id) return;
+    // Matched by data value rather than interpolated into a selector, so a
+    // plugin id containing quotes can't break the lookup.
+    const rows = this.contentEl.querySelectorAll<HTMLElement>("[data-plugin-id]");
+    for (const row of Array.from(rows)) {
+      if (row.dataset.pluginId === id) {
+        row.focus();
+        return;
+      }
     }
   }
 
@@ -295,6 +381,12 @@ export class HealthDashboardView extends ItemView {
         const hay = `${r.name} ${r.author} ${r.id}`.toLowerCase();
         if (!hay.includes(q)) return false;
       }
+      // A finding scopes the table to exactly the rows it counted.
+      if (this.scopeInsight) return this.scopeInsight.match(r);
+      // Muted plugins are excluded from every count and every finding, but no
+      // filter branch excluded them — so a filter could show rows the tile that
+      // led there had deliberately not counted.
+      if (r.muted && this.filter !== "all" && this.filter !== "muted") return false;
       switch (this.filter) {
         case "attention":
           return needsAttention(r);
@@ -342,9 +434,57 @@ export class HealthDashboardView extends ItemView {
       this.sortDir = (this.sortDir * -1) as 1 | -1;
     } else {
       this.sortKey = key;
-      this.sortDir = key === "name" ? 1 : -1;
+      this.sortDir = 1; // worst first, for scores as well as names
     }
     this.renderRows();
+  }
+
+  /**
+   * Point the table at a cohort and take the user to it.
+   *
+   * Everything used to route through `render()`, which empties `contentEl` and
+   * drops you back at the top of the page — so clicking a finding filtered a
+   * table ~800px below the fold with no indication anything had happened.
+   */
+  private applyScope(scope: FilterKey | Insight): void {
+    if (typeof scope === "string") {
+      this.filter = scope;
+      this.scopeInsight = null;
+    } else {
+      this.scopeInsight = scope;
+      this.filter = "all";
+    }
+    this.search = "";
+    if (this.searchInput) this.searchInput.value = "";
+    if (this.filterSelect) this.filterSelect.value = this.filter;
+    this.renderRows();
+    this.renderScopeChip();
+    this.toolbarEl?.scrollIntoView({
+      block: "start",
+      behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches
+        ? "auto"
+        : "smooth",
+    });
+  }
+
+  /** Show what the table is currently scoped to, with a one-click way out. */
+  private renderScopeChip(): void {
+    const host = this.scopeChipEl;
+    if (!host) return;
+    host.empty();
+    const active = this.scopeInsight || this.filter !== "all" || this.search;
+    if (!active) return;
+
+    const label = this.scopeInsight
+      ? this.scopeInsight.title
+      : this.filter !== "all"
+        ? (FILTERS.find((f) => f.key === this.filter)?.label ?? this.filter)
+        : `matching “${this.search}”`;
+    const chip = host.createDiv({ cls: "flowkit-scope-chip" });
+    chip.createSpan({ cls: "flowkit-scope-label", text: label });
+    const clear = chip.createEl("button", { text: "×" });
+    clear.setAttr("aria-label", "Clear filter");
+    clear.onclick = () => this.applyScope("all");
   }
 
   // --- rendering ------------------------------------------------------------
@@ -418,13 +558,9 @@ export class HealthDashboardView extends ItemView {
     if (rows.length === 0) {
       const empty = host.createDiv({ cls: "flowkit-health-empty" });
       empty.createDiv({ text: "No plugins match the current filter." });
-      if (this.search || this.filter !== "all") {
+      if (this.search || this.filter !== "all" || this.scopeInsight) {
         const clear = empty.createEl("button", { text: "Clear filters" });
-        clear.onclick = () => {
-          this.search = "";
-          this.filter = "all";
-          this.render();
-        };
+        clear.onclick = () => this.applyScope("all");
       }
       return;
     }
@@ -495,10 +631,12 @@ export class HealthDashboardView extends ItemView {
 
   private renderHero(root: HTMLElement): void {
     const s = this.summaryStats();
-    // Strictly greater: offline coverage lands on exactly 0.60 (compatibility
-    // .30 + footprint .20 + hygiene .10), so `>=` let a vault with maintenance
-    // and popularity entirely unmeasured still print a confident letter grade.
-    const graded = s.confidence > GRADE_MIN_CONFIDENCE;
+    // The guard exists to stop a confident letter appearing when the online
+    // signals are missing. A pure weight threshold no longer does that: since
+    // Reliability is local, offline coverage now reaches 0.70 on its own, which
+    // would clear any threshold low enough to be meaningful. Require the data
+    // whose absence the guard was written about.
+    const graded = s.confidence > GRADE_MIN_CONFIDENCE && this.coverage.stats;
     const grade = graded
       ? gradeFor(s.avg)
       : {
@@ -508,55 +646,37 @@ export class HealthDashboardView extends ItemView {
         };
     const hero = root.createDiv({ cls: "flowkit-hero" });
 
-    // Circular gauge.
-    const gauge = hero.createDiv({ cls: "flowkit-gauge" });
-    const size = 116;
-    const stroke = 12;
-    const r = (size - stroke) / 2;
-    const c = 2 * Math.PI * r;
-    const pct = s.avg == null ? 0 : Math.max(0, Math.min(100, s.avg)) / 100;
-    const svg = svgEl(gauge, "svg", {
-      viewBox: `0 0 ${size} ${size}`,
-      width: size,
-      height: size,
-    });
-    svgEl(svg, "circle", {
-      cx: size / 2,
-      cy: size / 2,
-      r,
-      fill: "none",
-      "stroke-width": stroke,
-      class: "flowkit-gauge-track",
-    });
-    svgEl(svg, "circle", {
-      cx: size / 2,
-      cy: size / 2,
-      r,
-      fill: "none",
-      "stroke-width": stroke,
-      "stroke-linecap": "round",
-      "stroke-dasharray": `${(c * pct).toFixed(2)} ${c.toFixed(2)}`,
-      transform: `rotate(-90 ${size / 2} ${size / 2})`,
-      class: `flowkit-gauge-arc tone-${grade.tone}`,
-    });
-    // The reveal transition lives in styles.css (.flowkit-gauge-arc) rather than an
-    // inline style assignment (obsidianmd/no-static-styles-assignment).
-    const label = gauge.createDiv({ cls: "flowkit-gauge-label" });
-    label.createDiv({
-      cls: `flowkit-gauge-score tone-${grade.tone}`,
+    // No ring. A 116px SVG arc drew one number four different ways (arc, digits,
+    // letter, sentence) and could collapse to a giant "—" when confidence was
+    // low. The score stays; the ceremony around it doesn't.
+    const scoreBlock = hero.createDiv({ cls: "flowkit-hero-score" });
+    scoreBlock.createDiv({
+      cls: `flowkit-hero-number tone-${grade.tone}`,
       text: s.avg == null ? "—" : String(s.avg),
     });
-    label.createDiv({ cls: "flowkit-gauge-grade", text: `Grade ${grade.letter}` });
+    scoreBlock.createDiv({
+      cls: `flowkit-hero-grade tone-${grade.tone}`,
+      text: `Grade ${grade.letter}`,
+    });
 
     const text = hero.createDiv({ cls: "flowkit-hero-text" });
     text.createEl("h3", { text: grade.verdict });
-    const signals = Math.round(s.confidence * 5);
-    text.createEl("p", {
-      cls: "flowkit-hero-sub",
-      text:
-        `Across ${s.count} plugin${s.count === 1 ? "" : "s"} · ` +
-        `${signals} of 5 signals available · ${Math.round(s.confidence * 100)}% confidence.`,
-    });
+
+    // The floor under the mean. An average hides the single delisted or erroring
+    // plugin that is the entire reason to open this, so name the worst one.
+    const worst = this.results
+      .filter((r) => !r.muted && r.overall != null)
+      .sort((a, b) => (a.overall ?? 100) - (b.overall ?? 100))[0];
+    const parts = [`Across ${s.count} plugin${s.count === 1 ? "" : "s"}`];
+    if (worst && worst.overall != null) parts.push(`worst: ${worst.name} ${worst.overall}`);
+    parts.push(`${Math.round(s.confidence * 100)}% of scoring signals available`);
+    const watching = this.plugin.observedMs();
+    if (watching > 0) {
+      const days = Math.floor(watching / 86_400_000);
+      parts.push(days >= 1 ? `watching ${days} day${days === 1 ? "" : "s"}` : "watching since today");
+    }
+    text.createEl("p", { cls: "flowkit-hero-sub", text: parts.join(" · ") });
+
     if (!graded) {
       text.createEl("p", {
         cls: "flowkit-hero-hint",
@@ -652,11 +772,14 @@ export class HealthDashboardView extends ItemView {
       s.unmaintained > 0 ? "warn" : "good",
       "unmaintained"
     );
+    // Relabelled: it clicks through to the `attention` filter, which is broader
+    // than "scores below 50" — so the tile now says what it actually shows.
+    const attention = this.results.filter((r) => needsAttention(r)).length;
     this.statTile(
       summary,
-      "At risk",
-      String(s.atRisk),
-      s.atRisk > 0 ? "bad" : "good",
+      "Needs attention",
+      String(attention),
+      attention > 0 ? "bad" : "good",
       "attention"
     );
   }
@@ -681,13 +804,10 @@ export class HealthDashboardView extends ItemView {
   ): void {
     const tile = parent.createEl("button", { cls: "flowkit-stat" });
     tile.setAttr("aria-label", `${value} ${label} — show them`);
-    tile.createDiv({ cls: `flowkit-stat-value tone-${tone}`, text: value });
-    tile.createDiv({ cls: "flowkit-stat-label", text: label });
-    tile.onclick = () => {
-      this.filter = filter;
-      this.search = "";
-      this.render();
-    };
+    // Label first: as a one-line pill it reads "Updates 3", not "3 Updates".
+    tile.createSpan({ cls: "flowkit-stat-label", text: label });
+    tile.createSpan({ cls: `flowkit-stat-value tone-${tone}`, text: value });
+    tile.onclick = () => this.applyScope(filter);
   }
 
   // --- insights -------------------------------------------------------------
@@ -732,28 +852,6 @@ export class HealthDashboardView extends ItemView {
     btn.onclick = () => this.openUpgrade("bulk");
   }
 
-  /** The table filter that shows exactly the plugins an insight is about. */
-  private filterForInsight(id: string): FilterKey | null {
-    switch (id) {
-      case "delisted":
-        return "delisted";
-      case "incompatible":
-        return "incompatible";
-      case "erroring":
-        return "erroring";
-      case "unmaintained":
-        return "unmaintained";
-      case "at-risk":
-        return "attention";
-      case "updates":
-        return "update";
-      case "sideloaded":
-        return "sideloaded";
-      default:
-        return null;
-    }
-  }
-
   private renderInsightCard(parent: HTMLElement, ins: Insight, pro: boolean): void {
     const card = parent.createDiv({ cls: `flowkit-insight tone-${ins.tone}` });
     setIcon(card.createSpan({ cls: "flowkit-insight-icon" }), ins.icon);
@@ -761,18 +859,17 @@ export class HealthDashboardView extends ItemView {
     body.createDiv({ cls: "flowkit-insight-title", text: ins.title });
     body.createDiv({ cls: "flowkit-insight-detail", text: ins.detail });
 
-    // An insight that names plugins should be able to show you them.
-    const filter = ins.ids.length ? this.filterForInsight(ins.id) : null;
-    if (filter) {
+    // An insight that names plugins should be able to show you exactly them —
+    // scoped by the same predicate the count was built from.
+    if (ins.ids.length) {
       card.addClass("is-clickable");
       card.setAttr("tabindex", "0");
       card.setAttr("role", "button");
-      card.setAttr("aria-label", `${ins.title} — show these plugins`);
-      const go = () => {
-        this.filter = filter;
-        this.search = "";
-        this.render();
-      };
+      card.setAttr(
+        "aria-label",
+        `${ins.title} — show these ${ins.ids.length} plugin${ins.ids.length === 1 ? "" : "s"}`
+      );
+      const go = () => this.applyScope(ins);
       card.onclick = (evt) => {
         if ((evt.target as HTMLElement).closest("button")) return;
         go();
@@ -912,7 +1009,7 @@ export class HealthDashboardView extends ItemView {
       };
       new Notice(`Disabled ${changed.length} plugin${changed.length === 1 ? "" : "s"}.`);
     }
-    await this.refresh();
+    await this.refresh(false, false);
   }
 
   private async undoLastBulk(): Promise<void> {
@@ -928,7 +1025,7 @@ export class HealthDashboardView extends ItemView {
       console.error("FlowKit: undo failed", err);
       new Notice("Couldn't undo that — see the console. The Undo button is still there.");
     }
-    await this.refresh();
+    await this.refresh(false, false);
   }
 
   // --- trends (Pro) ---------------------------------------------------------
@@ -1064,6 +1161,7 @@ export class HealthDashboardView extends ItemView {
 
   private renderToolbar(root: HTMLElement): void {
     const bar = root.createDiv({ cls: "flowkit-health-toolbar" });
+    this.toolbarEl = bar;
 
     const searchWrap = bar.createDiv({ cls: "flowkit-search" });
     setIcon(searchWrap.createSpan({ cls: "flowkit-search-icon" }), "search");
@@ -1072,12 +1170,16 @@ export class HealthDashboardView extends ItemView {
       placeholder: "Search plugins…",
     });
     input.value = this.search;
+    this.searchInput = input;
     // The input element survives now, so there is no refocus-and-jump-the-caret
     // hack. Typing in the middle of a query stays put, and IME composition is
     // no longer torn down mid-word.
     input.oninput = () => {
       this.search = input.value;
+      // Typing is its own scope; drop any finding scope so the two can't fight.
+      this.scopeInsight = null;
       this.renderRows();
+      this.renderScopeChip();
     };
 
     const select = bar.createEl("select", { cls: "flowkit-filter dropdown" });
@@ -1085,12 +1187,12 @@ export class HealthDashboardView extends ItemView {
       const opt = select.createEl("option", { value: f.key, text: f.label });
       if (f.key === this.filter) opt.selected = true;
     }
-    select.onchange = () => {
-      this.filter = select.value as FilterKey;
-      this.renderRows();
-    };
+    this.filterSelect = select;
+    select.onchange = () => this.applyScope(select.value as FilterKey);
 
     this.countEl = bar.createSpan({ cls: "flowkit-result-count" });
+    this.scopeChipEl = bar.createDiv({ cls: "flowkit-scope-host" });
+    this.renderScopeChip();
   }
 
   private renderTable(root: HTMLElement, rows: PluginHealth[]): void {
@@ -1180,7 +1282,7 @@ export class HealthDashboardView extends ItemView {
       text: r.enabled ? "Disable" : "Enable",
     });
     toggle.onclick = () => {
-      void this.plugin.setPluginEnabled(r.id, !r.enabled).then(() => this.refresh());
+      void this.plugin.setPluginEnabled(r.id, !r.enabled).then(() => this.refresh(false, false));
     };
     if (r.enabled) {
       const settings = actions.createEl("button", { text: "Open its settings" });
@@ -1194,7 +1296,7 @@ export class HealthDashboardView extends ItemView {
       text: r.muted ? "Unmute" : "Mute from counts",
     });
     mute.onclick = () => {
-      void this.plugin.toggleIgnore(r.id).then(() => this.refresh());
+      void this.toggleMute(r);
     };
   }
 
@@ -1228,6 +1330,7 @@ export class HealthDashboardView extends ItemView {
 
     const expanded = this.expandedId === r.id;
     if (expanded) tr.addClass("is-expanded");
+    tr.dataset.pluginId = r.id;
     // Operable by keyboard, and announced as the disclosure control it is.
     tr.setAttr("tabindex", "0");
     tr.setAttr("role", "button");
@@ -1334,7 +1437,7 @@ export class HealthDashboardView extends ItemView {
         .setIcon(r.enabled ? "power-off" : "power")
         .onClick(async () => {
           await this.plugin.setPluginEnabled(r.id, !r.enabled);
-          await this.refresh();
+          await this.refresh(false, false);
         })
     );
 
@@ -1361,10 +1464,7 @@ export class HealthDashboardView extends ItemView {
       item
         .setTitle(r.muted ? "Unmute plugin" : "Mute from counts")
         .setIcon(r.muted ? "bell" : "bell-off")
-        .onClick(async () => {
-          await this.plugin.toggleIgnore(r.id);
-          await this.refresh();
-        })
+        .onClick(() => void this.toggleMute(r))
     );
 
     menu.showAtMouseEvent(evt);
@@ -1432,7 +1532,7 @@ export class HealthDashboardView extends ItemView {
         await this.plugin.saveSettings();
         const flipped = this.plugin.refreshLicense();
         if (flipped && this.plugin.isPro) {
-          await this.refresh();
+          await this.refresh(false, false);
           return true;
         }
         return this.plugin.isPro;
