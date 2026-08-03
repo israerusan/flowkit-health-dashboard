@@ -128,6 +128,14 @@ export interface HealthSnapshot {
   atRisk: number;
   unmaintained: number;
   updates: number;
+  /**
+   * Whether community data was available for this reading. Without it, a scan
+   * taken on a train (two of five signals) sat on the same polyline as a full
+   * one and fabricated a celebratory jump.
+   */
+  online?: boolean;
+  /** Share of metric weight available, mirroring PluginHealth.confidence. */
+  confidence?: number;
 }
 
 /**

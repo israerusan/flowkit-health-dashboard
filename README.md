@@ -1,28 +1,45 @@
-# FlowKit Plugin Health Dashboard
+# FlowKit Health Dashboard
 
-> Know which of your Obsidian plugins are healthy, which are abandoned, and which are quietly slowing you down — at a glance.
+> Know which of your add-ons still work, which have been pulled, and which are
+> quietly weighing your vault down — and fix them without hunting through
+> settings.
 
-FlowKit scores every installed community plugin on five signals and turns the
-result into a ranked to-do list, so you can stop guessing which plugins are safe
-to keep and which are risks worth removing.
+FlowKit scores every installed community plugin and turns the result into a
+ranked, evidence-backed to-do list. Every finding tells you what it saw and
+why it matters; select any row to see exactly how its score was built.
+
+The **complete diagnosis is free**. Pro is for acting on it in one click,
+keeping a record, and being told when something changes.
 
 <!-- SCREENSHOT SLOT — drop a real Obsidian capture here to lift conversions.
      ![FlowKit dashboard: vault-health gauge, letter grade, and the ranked plugin scorecard](docs/assets/hero.png)
-     Suggested shot: the dashboard open in the right sidebar showing the health gauge + a few scored rows. Save as docs/assets/hero.png -->
+     Suggested shot: the dashboard in a main tab showing the "What to fix" list
+     with a row expanded to its reasoning panel. Save as docs/assets/hero.png -->
 
 
 ## Metrics
 
-| Metric | What it measures | Source |
-|---|---|---|
-| **Quality** | Composite of manifest completeness + the measured signals below | Estimated |
-| **Maintenance** | How recently the plugin was updated | Measured (online) |
-| **Performance** | Startup/runtime cost heuristic | Estimated |
-| **Popularity** | Community download count (log scale) | Measured (online) |
-| **Compatibility** | `minAppVersion` vs. your Obsidian version; desktop-only on mobile | Measured (local) |
+| Metric | What it measures | Weight | Source |
+|---|---|---:|---|
+| **Compatibility** | `minAppVersion` vs. your Obsidian version; desktop-only on mobile | 30% | Measured (local) |
+| **Maintenance** | How recently it was released, allowing for plugins that are simply finished | 30% | Measured (online) |
+| **Footprint** | Code and styles the plugin loads at startup, read from disk | 20% | Measured (local) |
+| **Manifest hygiene** | What the plugin's manifest declares | 10% | Measured (local) |
+| **Popularity** | Download rank within the directory — context, not health | 10% | Measured (online) |
 
-Each plugin also gets a blended **Overall** score, and the header shows a
-vault-wide average plus unmaintained and at-risk counts.
+**Overall** is a weighted blend of those five, renormalised over whatever data
+is actually available, and shown alongside a **confidence** figure so a score
+built on three signals doesn't read like one built on five. Below 60%
+confidence the letter grade is withheld rather than guessed.
+
+Two things override the blend, because they are risk facts rather than
+quantities worth averaging:
+
+- a plugin that **can't load** on your setup is capped at **20**
+- a plugin **removed from the community directory** is capped at **30**
+
+A missing signal can never raise a score. Select any row in the dashboard to
+see each metric's value, weight, and the evidence behind it.
 
 ### Maintained or not
 
@@ -31,25 +48,26 @@ maintained/not badge derived from how long ago it was last updated:
 
 | Badge | Meaning |
 |---|---|
-| **Maintained** | Updated within the last 6 months |
-| **Aging** | No update in 6–18 months |
-| **Unmaintained** | No update in over 18 months — likely abandoned |
-| **Unknown** | No update data (offline, or not a community plugin) |
+| **Maintained** | Released within the last 6 months |
+| **Aging** | No release in 6–18 months |
+| **Stable** | No recent release, but many published versions and most users on the newest — finished, not abandoned |
+| **No recent release** | Nothing in over 18 months, and no sign it has settled into maturity |
+| **Unknown** | No release data (offline, or not a community plugin) |
 
-Scores are honest about confidence: **Compatibility** is fully local and always
-available; **Popularity** and **Maintenance** come from Obsidian's public
-community data when online; **Performance** and **Quality** are heuristics
-(marked with `~`) because Obsidian exposes no direct per-plugin profiling API.
+Release age alone cannot establish abandonment, and this is deliberately worded
+so it doesn't pretend otherwise. Plenty of excellent plugins are simply done.
 
 ### Extra signals
 
 Each plugin row also surfaces:
 
-- **Update available** — a newer version is published than the one you have
-  (derived from the community stats' per-version data). The header shows an
-  **Updates** count.
-- **Sideloaded** — the plugin isn't in Obsidian's community list, so it skipped
-  community review. A trust signal, shown when online.
+- **Update available** — a newer *stable* version is published than the one you
+  have. Prereleases are ignored, so a `-beta` build doesn't nag you about an
+  update you can't install.
+- **Delisted** — the plugin was in Obsidian's community directory and has since
+  been removed. Worth knowing why before keeping it.
+- **Local install** — never in the directory: installed manually or via BRAT, so
+  it skipped community review. A neutral fact, not a fault.
 
 ## At a glance
 
@@ -67,26 +85,36 @@ FlowKit is useful for free forever, and a one-time **Pro** unlock adds the
 power-user tooling. Pro is verified fully offline (a signed license key — no
 account, no server, no telemetry).
 
+The whole diagnosis is free. Pro is for *acting* on it.
+
 ### Free
 
-- The full **five-metric scorecard** and blended overall for every plugin
-- **Vault-health gauge**, letter grade, and summary tiles
-- The **top Insight** — your single most important thing to fix
+- The **complete ranked "What to fix" list** — every finding, not a teaser
+- The full **five-metric scorecard**, weighted overall, and confidence figure
+- **Select any row** to see why it scored what it did: each metric's value,
+  weight, and evidence
+- **Vault-health gauge**, letter grade, and summary tiles that filter the table
+- A **30-day health trend**, recorded whether or not you open the dashboard
+- A **status-bar readout** that turns red when something needs attention
+- **One full Markdown report**, no strings
 - **Search, filter, sort**, and the per-row menu (enable/disable, open settings,
   open on GitHub, mute)
 - Fully **offline-capable**; online enrichment is optional
 
-### Pro ($6 one-time)
+### Pro ($9 one-time)
 
-- **Full Insights** — the complete ranked list, not just the top item
-- **One-click bulk actions** — disable all incompatible/abandoned plugins, or
-  mute all sideloaded ones, straight from an insight
-- **Export reports** — Markdown *and* CSV of the full scorecard
-- **Health trends** — FlowKit records your vault health over time and shows the
-  delta since the last scan, with a sparkline
-- **Auto-refresh on open** — always see a fresh scan
+- **Bulk fixes in one click** — review exactly which plugins will change and
+  why, apply it together, and **undo** if you disagree
+- **Background monitoring** — get told when a plugin turns incompatible, goes
+  stale, or is pulled from the community directory. Most useful right after an
+  Obsidian update, which is when nobody thinks to look
+- **Unlimited reports** — Markdown *and* CSV, as a document with the findings
+  and methodology, not a bare grid of numbers
+- **Full history** — 90 days of vault health, per-metric trends, exportable
 
-Purchase: [Buy Me a Coffee — FlowKit Pro](https://buymeacoffee.com/vaultspotlight/e/560206). License keys are verified **offline** (Ed25519) — no account, server, or subscription.
+Purchase: [Buy Me a Coffee — FlowKit Pro](https://buymeacoffee.com/vaultspotlight/e/560206). License keys are verified **offline** (Ed25519) — no account, server, or subscription, and one key works on every device you own.
+
+Key didn't arrive, or want a refund? Email <iavila01@gmail.com>.
 
 ### Activate Pro
 
@@ -103,16 +131,19 @@ Purchase: [Buy Me a Coffee — FlowKit Pro](https://buymeacoffee.com/vaultspotli
 ## Usage
 
 - Click the **activity** ribbon icon, or run the command
-  **"Open Plugin Health Dashboard"** — the dashboard opens in the right sidebar.
-- **Search** by name/author, **filter** (needs attention, unmaintained,
-  incompatible, update available, disabled, muted), and **click any column** to
-  sort. Hover any score for the reasoning behind it.
-- **Row menu (⋮)** — enable/disable the plugin, open its settings, open its
-  GitHub repo, or mute it from the counts.
-- **Insights** — act on the ranked list; Pro adds one-click bulk fixes.
-- **Export** *(Pro)* writes the current (filtered) report to a Markdown note or a
-  CSV file in your vault.
-- **Refresh** re-scores and re-downloads community data on demand.
+  **"Open health dashboard"** — it opens in a main tab. On narrow panes and
+  phones the table becomes one card per plugin.
+- Start with **What to fix**. Selecting a finding filters the table to exactly
+  the plugins it names.
+- **Select any row** to open its reasoning panel: each metric's value, weight
+  and evidence, plus enable/disable, open settings, GitHub, and mute.
+- **Search** by name/author, **filter** (needs attention, no recent release,
+  incompatible, delisted, local installs, update available, disabled, muted),
+  and **click any column** to sort.
+- **Export** writes a report — findings, scorecard and methodology — to a
+  Markdown note or CSV. Free includes one; Pro is unlimited and adds CSV.
+- **Refresh** re-scores and re-downloads community data on demand. Otherwise the
+  cached data is reused for a day so the dashboard opens instantly.
 
 ## Settings
 
@@ -122,9 +153,12 @@ Purchase: [Buy Me a Coffee — FlowKit Pro](https://buymeacoffee.com/vaultspotli
   community data. Turn off to stay fully offline (those two metrics then show as
   unavailable). Local-first: no telemetry, no accounts.
 - **Show disabled plugins** — include installed-but-disabled plugins.
-- **Auto-refresh on open** *(Pro)* — recompute every time the dashboard opens.
-- **Muted plugins** — plugins you've muted from the at-risk / unmaintained
-  counts; clear the list here.
+- **Re-download community data on open** — off by default; the cached scan is
+  reused for a day, and Refresh always refetches.
+- **Background monitoring** *(Pro)* — check quietly for plugins that turn
+  incompatible, go stale, or get pulled from the directory.
+- **Muted plugins** — plugins you've muted from the at-risk counts; clear the
+  list here.
 
 ## Development
 
@@ -136,9 +170,12 @@ npm test        # run the scoring engine test suite
 ```
 
 The test suite (`test/`) executes the real scoring code against mock plugin
-data — verifying compatibility, popularity, maintenance, performance, quality,
-the blended overall, the maintained/not status, update-available detection, the
-sideload flag, the offline license verifier, and the insights engine — so the
+data — verifying compatibility, popularity, maintenance, footprint, hygiene,
+the weighted overall and its confidence figure, the incompatible and delisted
+caps, the guarantee that a missing signal never raises a score, the stability
+carve-out, the persisted-cache round trip, the maintained/not status,
+update-available detection (including prerelease handling), the
+delisted-vs-local split, the offline license verifier, and the insights engine — so the
 core logic is checked even without a live Obsidian vault.
 
 ### Licensing (author-only)

@@ -844,6 +844,91 @@
   container: flowkit-health / inline-size;
 }
 
+/* Status bar -------------------------------------------------------------- */
+.flowkit-status-item {
+  cursor: pointer;
+}
+.flowkit-status-item.is-alert {
+  color: var(--color-red, #c62828);
+  font-weight: 600;
+}
+
+/* Upgrade modal ----------------------------------------------------------- */
+.flowkit-upgrade-headline {
+  font-size: 1.05em;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+.flowkit-upgrade-lead {
+  color: var(--text-muted);
+  margin-bottom: 10px;
+}
+.flowkit-upgrade-list {
+  margin: 0 0 12px;
+  padding-left: 18px;
+  font-size: 0.9em;
+  line-height: 1.6;
+}
+.flowkit-upgrade-tagline {
+  font-size: 0.85em;
+  color: var(--text-muted);
+  margin-bottom: 14px;
+}
+.flowkit-upgrade-key {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.flowkit-upgrade-key input {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: var(--font-monospace);
+}
+.flowkit-upgrade-status {
+  font-size: 0.82em;
+  color: var(--text-error, var(--color-red));
+  min-height: 1em;
+  margin-bottom: 10px;
+}
+.flowkit-upgrade-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 12px;
+}
+.flowkit-upgrade-footer {
+  font-size: 0.8em;
+  color: var(--text-muted);
+  line-height: 1.6;
+  border-top: 1px solid var(--background-modifier-border);
+  padding-top: 10px;
+}
+
+/* A Pro action shown, but locked. */
+.flowkit-insight-action.is-locked {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  opacity: 0.75;
+}
+.flowkit-insight-action.is-locked .flowkit-lock-icon {
+  transform: scale(0.8);
+}
+
+.flowkit-trends-more {
+  font-size: 0.8em;
+  color: var(--text-muted);
+  margin-top: 8px;
+}
+.flowkit-trends-more button {
+  font-size: inherit;
+  padding: 2px 8px;
+}
+
+.flowkit-pro-lead {
+  font-size: 0.88em;
+  margin-top: 6px;
+}
+
 /* Settings: Pro section -------------------------------------------------- */
 .flowkit-pro-banner {
   padding: 12px 14px;

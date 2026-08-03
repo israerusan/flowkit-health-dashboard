@@ -31,6 +31,12 @@ export interface FlowKitHealthSettings {
   cache: RemoteCache | null;
   /** Whether the first-run explainer has been dismissed. */
   seenIntro: boolean;
+  /** Free users get one full report; this records that it's been spent. */
+  usedFreeExport: boolean;
+  /** Pro: check for newly-degraded plugins in the background once a day. */
+  backgroundMonitoring: boolean;
+  /** Ids already reported by monitoring, so the same news isn't repeated. */
+  notified: string[];
 }
 
 export const DEFAULT_SETTINGS: FlowKitHealthSettings = {
@@ -42,6 +48,9 @@ export const DEFAULT_SETTINGS: FlowKitHealthSettings = {
   history: [],
   cache: null,
   seenIntro: false,
+  usedFreeExport: false,
+  backgroundMonitoring: true,
+  notified: [],
 };
 
 export class FlowKitHealthSettingTab extends PluginSettingTab {
@@ -110,6 +119,24 @@ export class FlowKitHealthSettingTab extends PluginSettingTab {
           })
       );
 
+    const monitoring = new Setting(containerEl)
+      .setName("Background monitoring")
+      .setDesc(
+        this.plugin.isPro
+          ? "Check quietly for plugins that turn incompatible, go stale, or get pulled from the directory, and tell you when they do."
+          : `Pro — get told when a plugin turns incompatible, goes stale, or is removed from the community directory. ${PRO_PRICE}.`
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.backgroundMonitoring && this.plugin.isPro)
+          .setDisabled(!this.plugin.isPro)
+          .onChange(async (value) => {
+            this.plugin.settings.backgroundMonitoring = value;
+            await this.plugin.saveSettings();
+          })
+      );
+    if (!this.plugin.isPro) monitoring.settingEl.addClass("flowkit-locked-setting");
+
     const muted = this.plugin.settings.ignored;
     new Setting(containerEl)
       .setName("Muted plugins")
@@ -147,6 +174,10 @@ export class FlowKitHealthSettingTab extends PluginSettingTab {
       });
     } else {
       banner.createEl("strong", { text: `Unlock FlowKit Pro (${PRO_PRICE})` });
+      banner.createDiv({
+        cls: "flowkit-pro-lead",
+        text: "The full diagnosis is free, and stays free. Pro is for acting on it:",
+      });
       const list = banner.createEl("ul", { cls: "flowkit-pro-list" });
       for (const f of PRO_FEATURES) list.createEl("li", { text: f });
     }

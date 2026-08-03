@@ -1,6 +1,7 @@
 import { ItemView, Menu, Notice, WorkspaceLeaf, setIcon } from "obsidian";
 import type {
   DataCoverage,
+  HealthSnapshot,
   MaintenanceStatus,
   MetricScore,
   PluginHealth,
@@ -16,7 +17,8 @@ import {
 } from "./insights";
 import { WEIGHTS } from "./scoring";
 import { BulkConfirmModal } from "./ui/BulkConfirmModal";
-import { PRO_PRICE, PURCHASE_URL } from "./product";
+import { UpgradeModal } from "./ui/UpgradeModal";
+import { PRODUCT_NAME, PRO_PRICE } from "./product";
 
 export const VIEW_TYPE_HEALTH = "flowkit-health-dashboard";
 
@@ -220,7 +222,7 @@ export class HealthDashboardView extends ItemView {
     this.scanError = null;
     this.render();
     try {
-      const { results, coverage } = await this.plugin.computeAll(force);
+      const { results, coverage } = await this.plugin.computeAll({ force });
       this.results = results;
       this.coverage = coverage;
       const s = this.summaryStats();
@@ -231,6 +233,8 @@ export class HealthDashboardView extends ItemView {
         atRisk: s.atRisk,
         unmaintained: s.unmaintained,
         updates: s.updates,
+        online: coverage.stats,
+        confidence: s.confidence,
       });
     } catch (err) {
       // A rejected saveData (read-only disk, sync conflict) used to escape here
@@ -439,15 +443,30 @@ export class HealthDashboardView extends ItemView {
       const exportBtn = actions.createEl("button", { cls: "flowkit-health-btn" });
       setIcon(exportBtn.createSpan(), "download");
       exportBtn.createSpan({ text: " Export" });
-      if (!this.plugin.isPro) setIcon(exportBtn.createSpan({ cls: "flowkit-lock" }), "lock");
+      if (!this.plugin.isPro && this.plugin.settings.usedFreeExport) {
+        setIcon(exportBtn.createSpan({ cls: "flowkit-lock" }), "lock");
+      }
       exportBtn.onclick = (evt) => this.onExportClick(evt);
     }
 
-    if (!this.plugin.isPro && !this.loading) {
-      const up = actions.createEl("button", { cls: "flowkit-health-btn flowkit-upgrade-btn" });
-      setIcon(up.createSpan(), "sparkles");
-      up.createSpan({ text: " Upgrade" });
-      up.onclick = () => this.openUpgrade();
+    // Only ask once there is something to ask about, and never above an empty
+    // dashboard. The old button rendered before the early returns, so the same
+    // context-free "Upgrade" sat above "No installed community plugins found" —
+    // loudest exactly where it was least earned.
+    if (!this.plugin.isPro && !this.loading && this.results.length > 0) {
+      const fixable = new Set(
+        buildInsights(this.results)
+          .filter((i) => i.action && i.ids.length)
+          .flatMap((i) => i.ids)
+      ).size;
+      if (fixable > 0) {
+        const up = actions.createEl("button", {
+          cls: "flowkit-health-btn flowkit-upgrade-btn",
+        });
+        setIcon(up.createSpan(), "zap");
+        up.createSpan({ text: ` Fix ${fixable} in one click` });
+        up.onclick = () => this.openUpgrade("bulk");
+      }
     }
 
     const refreshBtn = actions.createEl("button", { cls: "flowkit-health-btn" });
@@ -646,36 +665,37 @@ export class HealthDashboardView extends ItemView {
     const head = section.createDiv({ cls: "flowkit-section-head" });
     setIcon(head.createSpan({ cls: "flowkit-section-icon" }), "lightbulb");
     head.createSpan({ cls: "flowkit-section-title", text: "What to fix" });
-    if (!this.plugin.isPro) head.createSpan({ cls: "flowkit-pro-tag", text: "PRO" });
 
-    if (this.plugin.isPro) {
-      for (const ins of insights) this.renderInsightCard(section, ins, true);
-      return;
-    }
+    // The complete diagnosis, for everyone.
+    //
+    // This used to show insights[0] and then a lock card. It converted nobody:
+    // every input the hidden insights are built from was already free — the
+    // badges, the chips — and the filter dropdown ships a dedicated option for
+    // each hidden cohort, so any user could reconstruct the whole list in five
+    // seconds and conclude the gate was artificial. What Pro sells now is
+    // applying the fixes, not being told what they are.
+    for (const ins of insights) this.renderInsightCard(section, ins, this.plugin.isPro);
 
-    // Free: show the single most-important insight, then a locked teaser.
-    this.renderInsightCard(section, insights[0], false);
-    const remaining = insights.length - 1;
-    const hasActions = insights.some((i) => i.action);
-    if (remaining > 0 || hasActions) {
-      const lock = section.createDiv({ cls: "flowkit-insight-lock" });
-      const body = lock.createDiv({ cls: "flowkit-insight-lock-body" });
-      setIcon(body.createSpan({ cls: "flowkit-lock-icon" }), "lock");
-      const txt = body.createDiv();
-      txt.createEl("strong", {
-        text:
-          remaining > 0
-            ? `Unlock ${remaining} more insight${remaining === 1 ? "" : "s"} + one-click fixes`
-            : "Unlock one-click bulk fixes",
-      });
-      txt.createDiv({
-        cls: "flowkit-lock-sub",
-        text: `FlowKit Pro (${PRO_PRICE}) adds bulk actions, export, and trends.`,
-      });
-      const btn = lock.createEl("button", { cls: "flowkit-health-btn flowkit-upgrade-btn" });
-      btn.setText("Unlock Pro");
-      btn.onclick = () => this.openUpgrade();
-    }
+    if (this.plugin.isPro) return;
+
+    const actionable = insights.filter((i) => i.action && i.ids.length);
+    if (!actionable.length) return;
+
+    const affected = new Set(actionable.flatMap((i) => i.ids));
+    const lock = section.createDiv({ cls: "flowkit-insight-lock" });
+    const body = lock.createDiv({ cls: "flowkit-insight-lock-body" });
+    setIcon(body.createSpan({ cls: "flowkit-lock-icon" }), "zap");
+    const txt = body.createDiv();
+    txt.createEl("strong", {
+      text: `Apply ${affected.size} of these fixes in one click`,
+    });
+    txt.createDiv({
+      cls: "flowkit-lock-sub",
+      text: `Review what changes, apply it together, undo if you disagree — plus monitoring, reports and history. Pro, ${PRO_PRICE}.`,
+    });
+    const btn = lock.createEl("button", { cls: "flowkit-health-btn flowkit-upgrade-btn" });
+    btn.setText("See what Pro adds");
+    btn.onclick = () => this.openUpgrade("bulk");
   }
 
   /** The table filter that shows exactly the plugins an insight is about. */
@@ -728,10 +748,20 @@ export class HealthDashboardView extends ItemView {
         go();
       };
     }
-    if (pro && ins.action && ins.ids.length) {
+    if (ins.action && ins.ids.length) {
       const btn = card.createEl("button", { cls: "flowkit-insight-action" });
-      btn.setText(ins.actionLabel ?? "Apply");
-      btn.onclick = () => this.runBulk(ins);
+      if (pro) {
+        btn.setText(ins.actionLabel ?? "Apply");
+        btn.onclick = () => this.runBulk(ins);
+      } else {
+        // Shown, not hidden: the user should be able to see the capability they
+        // would be buying, on their own vault's numbers.
+        btn.addClass("is-locked");
+        setIcon(btn.createSpan({ cls: "flowkit-lock-icon" }), "lock");
+        btn.createSpan({ text: ` ${ins.actionLabel ?? "Apply"}` });
+        btn.setAttr("aria-label", `${ins.actionLabel ?? "Apply"} — a Pro feature`);
+        btn.onclick = () => this.openUpgrade("bulk");
+      }
     }
   }
 
@@ -815,30 +845,49 @@ export class HealthDashboardView extends ItemView {
   // --- trends (Pro) ---------------------------------------------------------
 
   private renderTrends(root: HTMLElement): void {
-    const history = this.plugin.settings.history;
+    // Free sees the last 30 days; Pro sees the full retained window.
+    const windowDays = this.plugin.isPro ? 90 : 30;
+    const cutoff = Date.now() - windowDays * 86_400_000;
+    const history = this.plugin.settings.history
+      .filter((h) => h.at >= cutoff)
+      .sort((a, b) => a.at - b.at);
+
     const section = root.createDiv({ cls: "flowkit-trends" });
     const head = section.createDiv({ cls: "flowkit-section-head" });
     setIcon(head.createSpan({ cls: "flowkit-section-icon" }), "trending-up");
-    head.createSpan({ cls: "flowkit-section-title", text: "Vault health trend" });
+    head.createSpan({
+      cls: "flowkit-section-title",
+      text: `Vault health trend · ${windowDays} days`,
+    });
 
-    const points = history
-      .map((h) => h.avg)
-      .filter((v): v is number => v != null);
-    if (points.length < 2) {
+    // Offline readings are excluded from the line entirely rather than plotted
+    // beside full ones, where a missing signal looked like an improvement.
+    const usable = history.filter(
+      (h): h is HealthSnapshot & { avg: number } => h.avg != null && h.online !== false
+    );
+
+    if (usable.length === 0) {
       section.createDiv({
         cls: "flowkit-trends-empty",
-        text: "Trends build up as FlowKit records your vault health over time. Check back after a few scans.",
+        text: "FlowKit records one reading a day. Your trend appears here from tomorrow.",
+      });
+      return;
+    }
+    if (usable.length === 1) {
+      section.createDiv({
+        cls: "flowkit-trends-empty",
+        text: `First reading recorded: ${usable[0].avg}/100. The trend line builds from tomorrow.`,
       });
       return;
     }
 
-    const latest = history[history.length - 1];
+    const latest = usable[usable.length - 1];
     const prev = this.plugin.previousSnapshot(latest.at);
     const row = section.createDiv({ cls: "flowkit-trends-row" });
-    this.renderSparkline(row, points);
+    this.renderSparkline(row, usable);
 
     const delta = row.createDiv({ cls: "flowkit-trends-delta" });
-    if (prev && prev.avg != null && latest.avg != null) {
+    if (prev && prev.avg != null) {
       const d = latest.avg - prev.avg;
       const tone: Tone = d > 0 ? "good" : d < 0 ? "bad" : "unknown";
       const sign = d > 0 ? "▲" : d < 0 ? "▼" : "—";
@@ -851,22 +900,44 @@ export class HealthDashboardView extends ItemView {
         text: ` since ${describeWhen(prev.at)}`,
       });
     } else {
-      delta.createSpan({ cls: "flowkit-delta-sub", text: `${points.length} scans recorded` });
+      delta.createSpan({
+        cls: "flowkit-delta-sub",
+        text: `${usable.length} readings recorded`,
+      });
+    }
+
+    if (!this.plugin.isPro && this.plugin.settings.history.length > usable.length) {
+      const more = section.createDiv({ cls: "flowkit-trends-more" });
+      more.appendText(
+        `You have ${this.plugin.settings.history.length} readings saved. `
+      );
+      const link = more.createEl("button", { text: "See all 90 days with Pro" });
+      link.onclick = () => this.openUpgrade("history");
     }
   }
 
-  private renderSparkline(parent: HTMLElement, values: number[]): void {
+  private renderSparkline(
+    parent: HTMLElement,
+    points: Array<HealthSnapshot & { avg: number }>
+  ): void {
     const w = 180;
     const h = 40;
     const pad = 3;
-    const max = Math.max(...values, 100);
-    const min = Math.min(...values, 0);
-    const span = Math.max(1, max - min);
-    const step = values.length > 1 ? (w - pad * 2) / (values.length - 1) : 0;
-    const pts = values
-      .map((v, i) => {
-        const x = pad + i * step;
-        const y = pad + (1 - (v - min) / span) * (h - pad * 2);
+    const values = points.map((p) => p.avg);
+    // Auto-scale to the data. It used to force `max(...values, 100)` and
+    // `min(...values, 0)`, pinning the span to at least 100 inside a 34px
+    // drawing area — so real movement of a few points rendered as about one
+    // pixel, and the headline trend feature drew a flat line.
+    const lo = Math.max(0, Math.min(...values) - 3);
+    const hi = Math.min(100, Math.max(...values) + 3);
+    const span = Math.max(1, hi - lo);
+    // Space by real elapsed time, so a gap in scanning looks like a gap.
+    const t0 = points[0].at;
+    const tSpan = Math.max(1, points[points.length - 1].at - t0);
+    const pts = points
+      .map((p) => {
+        const x = pad + ((p.at - t0) / tSpan) * (w - pad * 2);
+        const y = pad + (1 - (p.avg - lo) / span) * (h - pad * 2);
         return `${x.toFixed(1)},${y.toFixed(1)}`;
       })
       .join(" ");
@@ -885,10 +956,14 @@ export class HealthDashboardView extends ItemView {
       class: "flowkit-sparkline-line",
     });
     // Highlight the last point.
-    const lastVal = values[values.length - 1];
-    const lx = pad + (values.length - 1) * step;
-    const ly = pad + (1 - (lastVal - min) / span) * (h - pad * 2);
+    const last = points[points.length - 1];
+    const lx = pad + (w - pad * 2);
+    const ly = pad + (1 - (last.avg - lo) / span) * (h - pad * 2);
     svgEl(svg, "circle", { cx: lx, cy: ly, r: 3, class: "flowkit-sparkline-dot" });
+    svg.setAttribute(
+      "aria-label",
+      `Vault health from ${values[0]} to ${last.avg} over ${points.length} readings.`
+    );
   }
 
   // --- toolbar + table ------------------------------------------------------
@@ -1233,14 +1308,36 @@ export class HealthDashboardView extends ItemView {
 
   // --- upgrade + export -----------------------------------------------------
 
-  private openUpgrade(): void {
-    window.open(PURCHASE_URL, "_blank");
+  /** The one way to reach the upgrade path, from anywhere in the view. */
+  private openUpgrade(feature?: "bulk" | "export" | "history" | "monitoring"): void {
+    const insights = buildInsights(this.results);
+    const affected = new Set(
+      insights.filter((i) => i.action && i.ids.length).flatMap((i) => i.ids)
+    );
+    new UpgradeModal(this.app, {
+      feature,
+      headline: affected.size
+        ? `Fix ${affected.size} plugin${affected.size === 1 ? "" : "s"} in this vault in one click.`
+        : undefined,
+      activate: async (key) => {
+        this.plugin.settings.licenseKey = key;
+        await this.plugin.saveSettings();
+        const flipped = this.plugin.refreshLicense();
+        if (flipped && this.plugin.isPro) {
+          await this.refresh();
+          return true;
+        }
+        return this.plugin.isPro;
+      },
+    }).open();
   }
 
   private onExportClick(evt: MouseEvent): void {
-    if (!this.plugin.isPro) {
-      new Notice("Report export is a FlowKit Pro feature.");
-      this.openUpgrade();
+    // Free users get one full report. It is the only artefact this plugin
+    // produces that leaves the app and gets seen by other people, so refusing
+    // it outright was refusing the product's best piece of marketing.
+    if (!this.plugin.isPro && this.plugin.settings.usedFreeExport) {
+      this.openUpgrade("export");
       return;
     }
     const menu = new Menu();
@@ -1275,6 +1372,10 @@ export class HealthDashboardView extends ItemView {
       );
       if (format === "md") {
         await this.app.workspace.getLeaf(true).openFile(file);
+      }
+      if (!this.plugin.isPro) {
+        this.plugin.settings.usedFreeExport = true;
+        await this.plugin.saveSettings();
       }
       new Notice(`Exported health report to “${path}”.`);
     } catch (err) {
@@ -1315,6 +1416,28 @@ export class HealthDashboardView extends ItemView {
     );
     lines.push("");
     lines.push(
+      `Built from ${Math.round(s.confidence * 100)}% of the available signals.` +
+        (this.filter !== "all" || this.search
+          ? ` Filtered view: ${FILTERS.find((f) => f.key === this.filter)?.label ?? this.filter}${
+              this.search ? `, matching “${this.search}”` : ""
+            }.`
+          : "")
+    );
+    lines.push("");
+
+    // The report never called buildInsights, so the one thing this product
+    // produces that other people actually see was an uninterpreted grid of
+    // numbers. Lead with the conclusions.
+    const insights = buildInsights(this.results);
+    lines.push("## What to fix");
+    lines.push("");
+    for (const ins of insights) {
+      lines.push(`- **${md(ins.title)}** — ${md(ins.detail)}`);
+    }
+    lines.push("");
+    lines.push("## Scorecard");
+    lines.push("");
+    lines.push(
       "| Plugin | Version | Status | Overall | Compatibility | Maintenance | Footprint | Hygiene | Popularity |"
     );
     lines.push("| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |");
@@ -1329,6 +1452,21 @@ export class HealthDashboardView extends ItemView {
         )} | ${cell(m.popularity.value)} |`
       );
     }
+    lines.push("");
+    lines.push("---");
+    lines.push("");
+    lines.push(
+      "Overall is a weighted blend — Compatibility 30%, Maintenance 30%, " +
+        "Footprint 20%, Hygiene 10%, Popularity 10% — renormalised over the " +
+        "signals available. A plugin that can't load is capped at 20; one " +
+        "removed from the community directory at 30."
+    );
+    lines.push("");
+    lines.push(
+      this.plugin.isPro
+        ? `Generated by ${PRODUCT_NAME}.`
+        : `Generated by ${PRODUCT_NAME}. Pro (${PRO_PRICE}) adds one-click bulk fixes with undo, background monitoring, unlimited reports, and 90 days of history.`
+    );
     lines.push("");
     return lines.join("\n");
   }

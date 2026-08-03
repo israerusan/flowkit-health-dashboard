@@ -56,6 +56,9 @@ const MAX_HISTORY = 90;
  */
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
+/** How often the background pass runs while Obsidian stays open. */
+const MONITOR_INTERVAL_MS = 6 * 60 * 60 * 1000;
+
 
 export default class FlowKitHealthPlugin extends Plugin {
   settings: FlowKitHealthSettings = DEFAULT_SETTINGS;
@@ -68,6 +71,9 @@ export default class FlowKitHealthPlugin extends Plugin {
   // The session-only cache of the raw multi-MB feeds is gone: the slim
   // projection in `settings.cache` survives restarts, which is what actually
   // makes the dashboard open instantly.
+
+  /** Always-visible health readout in the status bar. */
+  private statusBarEl: HTMLElement | null = null;
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -89,10 +95,123 @@ export default class FlowKitHealthPlugin extends Plugin {
     });
 
     this.addSettingTab(new FlowKitHealthSettingTab(this.app, this));
+
+    this.statusBarEl = this.addStatusBarItem();
+    this.statusBarEl.addClass("flowkit-status-item");
+    this.statusBarEl.addEventListener("click", () => void this.activateView());
+
+    // Everything below is why the plugin exists after the first week. Until
+    // now it registered a ribbon icon and one command and nothing else, so
+    // plugin health was a curiosity satisfied exactly once: install, see a
+    // grade, disable two things, never reopen.
+    this.app.workspace.onLayoutReady(() => {
+      void this.backgroundScan();
+    });
+    this.registerInterval(
+      window.setInterval(() => void this.backgroundScan(), MONITOR_INTERVAL_MS)
+    );
   }
 
   onunload(): void {
     // Leaves of our view type are detached automatically by Obsidian.
+  }
+
+  /**
+   * Score the vault without opening anything: keeps the daily trend reading
+   * honest whether or not the user visits, updates the status bar, and (Pro)
+   * reports plugins that have newly gone bad.
+   */
+  private async backgroundScan(): Promise<void> {
+    try {
+      const { results, coverage } = await this.computeAll({ allowFetch: false });
+      const active = results.filter((r) => !r.muted);
+      const scored = active.map((r) => r.overall).filter((v): v is number => v != null);
+      const avg = scored.length
+        ? Math.round(scored.reduce((a, b) => a + b, 0) / scored.length)
+        : null;
+      const confidence = active.length
+        ? active.reduce((a, r) => a + r.confidence, 0) / active.length
+        : 0;
+
+      await this.recordSnapshot({
+        at: Date.now(),
+        avg,
+        count: active.length,
+        atRisk: active.filter((r) => r.overall != null && r.overall < 50).length,
+        unmaintained: active.filter((r) => r.maintenanceStatus === "unmaintained").length,
+        updates: active.filter((r) => r.updateAvailable).length,
+        online: coverage.stats,
+        confidence,
+      });
+
+      this.updateStatusBar(avg, active);
+      if (this.isPro && this.settings.backgroundMonitoring) {
+        await this.reportRegressions(active);
+      }
+    } catch (err) {
+      // A background pass must never surface as a broken plugin.
+      console.error("FlowKit: background scan failed", err);
+    }
+  }
+
+  /** A quiet, always-visible health readout that opens the dashboard. */
+  private updateStatusBar(avg: number | null, active: PluginHealth[]): void {
+    if (!this.statusBarEl) return;
+    const urgent = active.filter(
+      (r) => r.enabled && (r.metrics.compatibility.value === 0 || r.listing === "delisted")
+    ).length;
+    this.statusBarEl.empty();
+    this.statusBarEl.toggleClass("is-alert", urgent > 0);
+    this.statusBarEl.setText(
+      urgent > 0
+        ? `Plugin health: ${urgent} to fix`
+        : `Plugin health: ${avg == null ? "—" : avg}`
+    );
+    this.statusBarEl.setAttr(
+      "aria-label",
+      urgent > 0
+        ? `${urgent} plugin${urgent === 1 ? "" : "s"} need attention — open FlowKit`
+        : "Open FlowKit Health Dashboard"
+    );
+  }
+
+  /**
+   * Tell a Pro user when an enabled plugin has newly crossed into trouble —
+   * most valuable right after an Obsidian update, which is exactly when nobody
+   * thinks to go looking.
+   */
+  private async reportRegressions(active: PluginHealth[]): Promise<void> {
+    const seen = new Set(this.settings.notified);
+    const fresh: string[] = [];
+    for (const r of active) {
+      if (!r.enabled) continue;
+      const bad =
+        r.metrics.compatibility.value === 0 ||
+        r.listing === "delisted" ||
+        r.maintenanceStatus === "unmaintained";
+      if (!bad) continue;
+      if (seen.has(r.id)) continue;
+      fresh.push(r.id);
+    }
+    if (!fresh.length) return;
+
+    const names = active
+      .filter((r) => fresh.includes(r.id))
+      .map((r) => r.name)
+      .slice(0, 3)
+      .join(", ");
+    new Notice(
+      `FlowKit: ${fresh.length} plugin${fresh.length === 1 ? "" : "s"} need${
+        fresh.length === 1 ? "s" : ""
+      } a look — ${names}${fresh.length > 3 ? ` +${fresh.length - 3} more` : ""}.`,
+      8000
+    );
+    // Only report each plugin once, and forget ones that recovered so a genuine
+    // future regression is reported again.
+    const stillBad = new Set([...seen, ...fresh]);
+    const currentIds = new Set(active.map((r) => r.id));
+    this.settings.notified = [...stillBad].filter((id) => currentIds.has(id));
+    await this.saveSettings();
   }
 
   async loadSettings(): Promise<void> {
@@ -189,11 +308,16 @@ export default class FlowKitHealthPlugin extends Plugin {
    * loaded so the UI can label its confidence honestly — the two community
    * files fail independently.
    *
-   * @param forceRefresh re-download community data instead of using the cache.
+   * @param opts.force re-download community data instead of using the cache.
+   * @param opts.allowFetch whether this scan may touch the network at all. The
+   *   background pass sets it false: it runs unprompted, so it works from
+   *   whatever is already cached and leaves fetching to something the user
+   *   actually asked for.
    */
   async computeAll(
-    forceRefresh = false
+    opts: { force?: boolean; allowFetch?: boolean } = {}
   ): Promise<{ results: PluginHealth[]; coverage: DataCoverage }> {
+    const { force = false, allowFetch = true } = opts;
     const api = this.pluginsApi();
     const manifests = Object.values(api.manifests ?? {});
     const enabledSet = api.enabledPlugins ?? new Set<string>();
@@ -208,7 +332,7 @@ export default class FlowKitHealthPlugin extends Plugin {
     if (this.settings.enableOnlineEnrichment) {
       cache = this.settings.cache;
       const stale = !cache || Date.now() - cache.at > CACHE_TTL_MS;
-      if (forceRefresh || stale) {
+      if (allowFetch && (force || stale)) {
         const fetched = await this.fetchRemoteCache(coverage);
         // Keep serving the previous projection when a refresh fails, rather
         // than dropping two of five columns because GitHub had a bad minute.
@@ -404,15 +528,24 @@ export default class FlowKitHealthPlugin extends Plugin {
   }
 
   /**
-   * Record a vault-health snapshot for the trend tracker (Pro only). To keep
-   * the history compact, it replaces the last entry when it's from the same
-   * calendar day, and otherwise appends — capping the list to a recent window.
+   * Record a vault-health snapshot for the trend tracker. To keep the history
+   * compact, it replaces the last entry when it's from the same calendar day,
+   * and otherwise appends — capping the list to a recent window.
+   *
+   * Recorded for everyone, not just Pro. Recording was previously gated, so a
+   * new buyer had to open the dashboard on two separate calendar days before
+   * the headline feature they had just paid for rendered anything but "check
+   * back after a few scans" — squarely inside the post-purchase-regret window
+   * of a one-time sale. It also makes the strongest upsell there is: a free
+   * user already sitting on months of their own history.
    */
   async recordSnapshot(snapshot: HealthSnapshot): Promise<void> {
-    if (!this.isPro) return;
     const history = this.settings.history.slice();
     const last = history[history.length - 1];
     if (last && sameDay(last.at, snapshot.at)) {
+      // Never let a degraded offline reading overwrite a full one from the same
+      // day — that turned a network hiccup into an apparent health event.
+      if (last.online && !snapshot.online) return;
       history[history.length - 1] = snapshot;
     } else {
       history.push(snapshot);
