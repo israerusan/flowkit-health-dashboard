@@ -51,6 +51,11 @@ export interface FlowKitHealthSettings {
   changeLog: HealthChange[];
   /** When the user last dismissed the "since you last looked" strip. */
   lastSeenChangeAt: number | null;
+  /**
+   * Whether the change baseline has been taken. The first scan after install or
+   * upgrade records what is already wrong without reporting it as news.
+   */
+  changeBaselineSet: boolean;
   /** Watch for runtime errors and attribute them to the plugin that threw. */
   trackErrors: boolean;
   /** Also capture errors plugins catch and log themselves. */
@@ -75,6 +80,7 @@ export const DEFAULT_SETTINGS: FlowKitHealthSettings = {
   notified: {},
   changeLog: [],
   lastSeenChangeAt: null,
+  changeBaselineSet: false,
   trackErrors: true,
   trackConsoleErrors: true,
   watchingSince: null,

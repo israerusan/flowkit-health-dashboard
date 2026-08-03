@@ -1227,3 +1227,17 @@
   outline-offset: 2px;
   border-radius: 3px;
 }
+
+/* The header is sticky, so scrolling the toolbar to the container's top edge
+   would park it underneath — hiding the search, filter and the scope chip that
+   the scroll exists to reveal. */
+.flowkit-health-toolbar {
+  scroll-margin-top: 60px;
+}
+
+/* The header is sticky, so scrolling the toolbar to the container's top edge
+   would park it underneath — hiding the search, filter and the scope chip that
+   the scroll exists to reveal. */
+.flowkit-health-toolbar {
+  scroll-margin-top: 60px;
+}

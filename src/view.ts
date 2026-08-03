@@ -196,6 +196,8 @@ export class HealthDashboardView extends ItemView {
   private scanError: string | null = null;
   /** In-flight guard: two concurrent scans would race results and double-write. */
   private refreshing = false;
+  /** A scan requested while one was in flight, to be run once it finishes. */
+  private pendingRefresh = false;
   /** The results region, rebuilt on its own when search/filter/sort change. */
   private rowsEl: HTMLElement | null = null;
   /** Live "N of M" readout in the toolbar. */
@@ -257,27 +259,33 @@ export class HealthDashboardView extends ItemView {
    */
   async refresh(force = false, allowFetch = true): Promise<void> {
     // A second concurrent scan would race `this.results` and double-write the
-    // same snapshot. The full-page spinner used to hide this by making a second
-    // click unlikely; now that the page stays interactive, guard it properly.
-    if (this.refreshing) return;
-    this.refreshing = true;
-    this.scanError = null;
-
-    // Only blank the view when there is nothing to keep. Otherwise dim the
-    // rows in place, so acting on a plugin doesn't throw the user back to the
-    // top of the page with no evidence anything happened.
-    const firstRun = this.results.length === 0;
-    if (firstRun) {
-      this.loading = true;
-      this.render();
-    } else {
-      this.contentEl.addClass("is-busy");
+    // same snapshot. Queue it rather than dropping it: an action taken during
+    // an in-flight scan (disable a plugin while Refresh is running) would
+    // otherwise complete for real and then render pre-action state.
+    if (this.refreshing) {
+      this.pendingRefresh = true;
+      return;
     }
+    this.refreshing = true;
 
-    const scrollTop = this.contentEl.scrollTop;
-    const focusedId = this.focusedRowId();
+    const firstRun = this.results.length === 0;
+    let scrollTop = 0;
+    let focusedId: string | null = null;
 
     try {
+      this.scanError = null;
+      // Only blank the view when there is nothing to keep. Otherwise dim the
+      // rows in place, so acting on a plugin doesn't throw the user back to the
+      // top of the page with no evidence anything happened.
+      if (firstRun) {
+        this.loading = true;
+        this.render();
+      } else {
+        this.contentEl.addClass("is-busy");
+      }
+      scrollTop = this.contentEl.scrollTop;
+      focusedId = this.focusedRowId();
+
       const { results, coverage } = await this.plugin.computeAll({ force, allowFetch });
       this.results = results;
       this.coverage = coverage;
@@ -295,7 +303,9 @@ export class HealthDashboardView extends ItemView {
       });
       // Record what moved since the last scan, so reopening the dashboard can
       // lead with it rather than rendering an identical screen.
-      await this.plugin.diffChanges(this.results.filter((r) => !r.muted));
+      // The whole result set, including muted plugins: their state is preserved
+      // so unmuting later doesn't re-announce old trouble as new.
+      await this.plugin.diffChanges(this.results, coverage);
       // Otherwise the status bar keeps quoting the last background pass — so
       // acting on a bulk fix left it reading "5 to fix" for hours afterwards.
       this.plugin.updateStatusBar(
@@ -313,11 +323,23 @@ export class HealthDashboardView extends ItemView {
       this.loading = false;
       this.refreshing = false;
       this.contentEl.removeClass("is-busy");
+      // The scoped finding is a snapshot of the previous scan — its title and
+      // count are already stale. Re-resolve it, and drop it if the cohort it
+      // named no longer exists, so the chip can't assert a count the table
+      // below it contradicts.
+      if (this.scopeInsight) {
+        const id = this.scopeInsight.id;
+        this.scopeInsight = buildInsights(this.results).find((i) => i.id === id) ?? null;
+      }
       this.render();
       // Put the user back exactly where they were.
       if (!firstRun) {
         this.contentEl.scrollTop = scrollTop;
         this.restoreFocus(focusedId);
+      }
+      if (this.pendingRefresh) {
+        this.pendingRefresh = false;
+        await this.refresh(false, false);
       }
     }
   }
@@ -357,10 +379,12 @@ export class HealthDashboardView extends ItemView {
     // plugin id containing quotes can't break the lookup.
     const rows = this.contentEl.querySelectorAll<HTMLElement>("[data-plugin-id]");
     for (const row of Array.from(rows)) {
-      if (row.dataset.pluginId === id) {
-        row.focus();
-        return;
-      }
+      if (row.dataset.pluginId !== id) continue;
+      // The `tr` carries the id but isn't focusable — focus() on it is a no-op.
+      // The row's disclosure control is the plugin name button.
+      const target = row.querySelector<HTMLElement>("button.flowkit-plugin-name");
+      target?.focus();
+      return;
     }
   }
 
@@ -692,10 +716,7 @@ export class HealthDashboardView extends ItemView {
     if (worst && worst.overall != null) parts.push(`worst: ${worst.name} ${worst.overall}`);
     parts.push(`${Math.round(s.confidence * 100)}% of scoring signals available`);
     const watching = this.plugin.observedMs();
-    if (watching > 0) {
-      const days = Math.floor(watching / 86_400_000);
-      parts.push(days >= 1 ? `watching ${days} day${days === 1 ? "" : "s"}` : "watching since today");
-    }
+    if (watching > 0) parts.push(`watching ${describeWatched(watching)}`);
     text.createEl("p", { cls: "flowkit-hero-sub", text: parts.join(" · ") });
 
     if (!graded) {
@@ -946,7 +967,7 @@ export class HealthDashboardView extends ItemView {
       `${live.filter((r) => r.listing === "delisted").length} pulled from the community directory`,
       `${live.filter((r) => isIncompatible(r)).length} incompatible with Obsidian ${apiVersion}`,
       watched > 0
-        ? `${errors} errors traced to a plugin in ${Math.max(1, Math.floor(watched / 86_400_000))} day${Math.floor(watched / 86_400_000) === 1 ? "" : "s"} of watching`
+        ? `${errors} error${errors === 1 ? "" : "s"} traced to a plugin in ${describeWatched(watched)} of watching`
         : "error watching is off",
       `${live.filter((r) => r.maintenanceStatus === "unmaintained").length} without a release in 18 months`,
     ];
@@ -1170,7 +1191,7 @@ export class HealthDashboardView extends ItemView {
     for (const ins of insights.slice(0, 3)) lines.push(`• ${ins.title}`);
     const watching = this.plugin.observedMs();
     if (watching > 0) {
-      lines.push(`Watching for plugin errors for ${Math.max(1, Math.floor(watching / 86_400_000))} days.`);
+      lines.push(`Watching for plugin errors for ${describeWatched(watching)}.`);
     }
     try {
       await navigator.clipboard.writeText(lines.join("\n"));
@@ -2005,6 +2026,16 @@ export class HealthDashboardView extends ItemView {
       .filter(Boolean)
       .join(", ");
   }
+}
+
+/** How long error-watching has been running, in words. */
+function describeWatched(ms: number): string {
+  const days = Math.floor(ms / 86_400_000);
+  if (days < 1) {
+    const hours = Math.max(1, Math.floor(ms / 3_600_000));
+    return `${hours} hour${hours === 1 ? "" : "s"}`;
+  }
+  return `${days} day${days === 1 ? "" : "s"}`;
 }
 
 /** Plain-English wording for one recorded transition. */

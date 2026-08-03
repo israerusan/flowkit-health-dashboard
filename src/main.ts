@@ -16,6 +16,7 @@ import {
 } from "./dataSources";
 import { ErrorWatcher } from "./errorWatcher";
 import { pruneErrorLog } from "./errors";
+import { diffTrouble, sameKinds } from "./changes";
 import { LicenseManager } from "./license/LicenseManager";
 import {
   DEFAULT_SETTINGS,
@@ -67,18 +68,6 @@ const MONITOR_INTERVAL_MS = 6 * 60 * 60 * 1000;
 
 /** Cap on the recorded change log. */
 const MAX_CHANGES = 60;
-
-/** Whether two trouble maps describe the same state. */
-function sameKinds(
-  a: Record<string, HealthChangeKind[]>,
-  b: Record<string, HealthChangeKind[]>
-): boolean {
-  const ka = Object.keys(a);
-  const kb = Object.keys(b);
-  if (ka.length !== kb.length) return false;
-  return ka.every((id) => (a[id] ?? []).join("|") === (b[id] ?? []).join("|"));
-}
-
 
 export default class FlowKitHealthPlugin extends Plugin {
   settings: FlowKitHealthSettings = DEFAULT_SETTINGS;
@@ -198,7 +187,11 @@ export default class FlowKitHealthPlugin extends Plugin {
 
       this.updateStatusBar(avg, active);
       if (this.isPro && this.settings.backgroundMonitoring) {
-        await this.reportRegressions(active);
+        await this.reportRegressions(results, coverage);
+      } else {
+        // Still record the transitions — the dashboard leads with them for
+        // everyone; only the Notice is Pro.
+        await this.diffChanges(results, coverage);
       }
     } catch (err) {
       // A background pass must never surface as a broken plugin.
@@ -236,6 +229,13 @@ export default class FlowKitHealthPlugin extends Plugin {
    * most valuable right after an Obsidian update, which is exactly when nobody
    * thinks to go looking.
    */
+  /** Kinds that mean something is wrong, as opposed to merely newsworthy. */
+  private static readonly BAD_KINDS: HealthChangeKind[] = [
+    "error-started",
+    "delisted",
+    "became-incompatible",
+  ];
+
   /** Which kinds of trouble a plugin is in right now. */
   private troubleKinds(r: PluginHealth): HealthChangeKind[] {
     const kinds: HealthChangeKind[] = [];
@@ -248,31 +248,52 @@ export default class FlowKitHealthPlugin extends Plugin {
   }
 
   /**
+   * Which kinds this scan was actually able to judge. Absence of evidence is
+   * not evidence of recovery: `delisted` and `update-published` both need the
+   * community feeds, so a scan taken with enrichment off would otherwise
+   * "resolve" every delisting and announce it as good news.
+   */
+  private evaluableKinds(coverage: DataCoverage): Set<HealthChangeKind> {
+    const set = new Set<HealthChangeKind>(["error-started", "became-incompatible"]);
+    if (coverage.list) set.add("delisted");
+    if (coverage.stats) set.add("update-published");
+    return set;
+  }
+
+  /**
    * Diff this scan against the last one and append what moved.
    *
    * This used to live inline, fire a Notice, and then throw the transition
    * away — so the product knew exactly what had changed and kept none of it.
    * Recorded for everyone; only the Notice stays Pro.
    */
-  async diffChanges(active: PluginHealth[]): Promise<HealthChange[]> {
+  async diffChanges(
+    all: PluginHealth[],
+    coverage: DataCoverage
+  ): Promise<HealthChange[]> {
     const previous = this.settings.notified;
-    const current: Record<string, HealthChangeKind[]> = {};
-    const fresh: HealthChange[] = [];
-    const at = Date.now();
+    const { fresh, current } = diffTrouble(
+      previous,
+      all.map((r) => ({
+        id: r.id,
+        name: r.name,
+        muted: r.muted,
+        kinds: this.troubleKinds(r),
+      })),
+      this.evaluableKinds(coverage),
+      Date.now()
+    );
 
-    for (const r of active) {
-      const kinds = this.troubleKinds(r);
-      if (kinds.length) current[r.id] = kinds;
-      const before = new Set(previous[r.id] ?? []);
-      for (const kind of kinds) {
-        if (!before.has(kind)) fresh.push({ at, id: r.id, name: r.name, kind });
-      }
-      // Everything that cleared. The product had no way to say good news.
-      const stillBad = new Set(kinds);
-      const recovered = [...before].filter((k) => !stillBad.has(k));
-      if (recovered.length && kinds.length === 0) {
-        fresh.push({ at, id: r.id, name: r.name, kind: "resolved" });
-      }
+    // First run after install or upgrade: record the baseline silently. Without
+    // this, every pre-existing problem and every pending update is emitted as
+    // having happened "since you last looked" — so the feature's first
+    // impression on every upgrading user would be a list of events that never
+    // occurred.
+    if (!this.settings.changeBaselineSet) {
+      this.settings.changeBaselineSet = true;
+      this.settings.notified = current;
+      await this.saveSettings();
+      return [];
     }
 
     if (!fresh.length && sameKinds(previous, current)) return [];
@@ -295,8 +316,11 @@ export default class FlowKitHealthPlugin extends Plugin {
     await this.saveSettings();
   }
 
-  private async reportRegressions(active: PluginHealth[]): Promise<void> {
-    const fresh = await this.diffChanges(active);
+  private async reportRegressions(
+    all: PluginHealth[],
+    coverage: DataCoverage
+  ): Promise<void> {
+    const fresh = await this.diffChanges(all, coverage);
     const worrying = fresh.filter((c) => c.kind !== "resolved" && c.kind !== "update-published");
     if (!worrying.length) return;
 

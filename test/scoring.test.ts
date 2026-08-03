@@ -26,7 +26,8 @@ import {
 import nacl from "tweetnacl";
 import { verifyLicense } from "../src/shared/verifyLicense.mjs";
 import { buildInsights } from "../src/insights";
-import type { PluginHealth } from "../src/types";
+import type { HealthChangeKind, PluginHealth } from "../src/types";
+import { diffTrouble } from "../src/changes";
 
 const DAY = 86_400_000;
 const NOW = 2_000_000_000_000; // fixed "now" so the tests are deterministic
@@ -787,6 +788,70 @@ eq("prerelease vs prerelease", compareVersion("1.0.0-alpha", "1.0.0-beta"), -1);
   };
   const pruned = pruneErrorLog(log, new Set(["kept"]));
   eq("uninstalled plugins are forgotten", Object.keys(pruned).join(","), "kept");
+}
+
+// --- change detection -------------------------------------------------------
+{
+  const ALL = new Set<HealthChangeKind>([
+    "error-started",
+    "became-incompatible",
+    "delisted",
+    "update-published",
+  ]);
+  const LOCAL_ONLY = new Set<HealthChangeKind>(["error-started", "became-incompatible"]);
+  const BAD: HealthChangeKind[] = ["error-started", "delisted", "became-incompatible"];
+  const row = (
+    id: string,
+    kinds: HealthChangeKind[],
+    muted = false
+  ): { id: string; name: string; muted: boolean; kinds: HealthChangeKind[] } => ({
+    id,
+    name: id,
+    muted,
+    kinds,
+  });
+
+  // A new problem is reported once, and only once.
+  {
+    const first = diffTrouble({}, [row("a", ["error-started"])], ALL, 1);
+    eq("a new problem is reported", first.fresh.length, 1);
+    eq("and remembered", first.current.a.join(), "error-started");
+    const second = diffTrouble(first.current, [row("a", ["error-started"])], ALL, 2);
+    eq("the same problem is not reported twice", second.fresh.length, 0);
+  }
+
+  // Installing an update is not "back to normal". This is the most common
+  // transition in any vault, so getting it wrong was the most visible bug.
+  {
+    const before = { a: ["update-published"] as HealthChangeKind[] };
+    const after = diffTrouble(before, [row("a", [])], ALL, 2);
+    eq("applying an update reports nothing", after.fresh.length, 0);
+  }
+
+  // Genuine recovery does say so.
+  {
+    const before = { a: ["error-started"] as HealthChangeKind[] };
+    const after = diffTrouble(before, [row("a", [])], ALL, 2);
+    eq("a fixed plugin is reported resolved", after.fresh[0]?.kind, "resolved");
+  }
+
+  // A signal we couldn't read this scan must not read as recovery.
+  {
+    const before = { a: ["delisted"] as HealthChangeKind[] };
+    const offline = diffTrouble(before, [row("a", [])], LOCAL_ONLY, 2);
+    eq("an unreadable signal is not a recovery", offline.fresh.length, 0);
+    eq("and the state is carried forward", offline.current.a.join(), "delisted");
+  }
+
+  // Muted plugins keep their state but generate no news, so unmuting later
+  // doesn't re-announce trouble the user already acknowledged.
+  {
+    const muted = diffTrouble({}, [row("a", ["error-started"], true)], ALL, 1);
+    eq("a muted plugin reports nothing", muted.fresh.length, 0);
+    eq("but its state is remembered", muted.current.a.join(), "error-started");
+    const unmuted = diffTrouble(muted.current, [row("a", ["error-started"])], ALL, 2);
+    eq("unmuting doesn't re-announce it", unmuted.fresh.length, 0);
+  }
 }
 
 // --- report -----------------------------------------------------------------
