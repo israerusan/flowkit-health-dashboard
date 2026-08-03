@@ -206,7 +206,13 @@ export function correlate(
 /** "two hours", "3 days" — the gap, in words. */
 export function describeGap(ms: number): string {
   const hours = ms / 3_600_000;
-  if (hours < 1) return "minutes";
+  // A 45-second gap was reading as "minutes". Small, but this is a product
+  // whose whole claim is not overstating what it saw.
+  if (ms < 60_000) return "less than a minute";
+  if (hours < 1) {
+    const mins = Math.round(ms / 60_000);
+    return `${mins} minute${mins === 1 ? "" : "s"}`;
+  }
   if (hours < 24) {
     const h = Math.round(hours);
     return `${h} hour${h === 1 ? "" : "s"}`;

@@ -53,6 +53,7 @@ import {
 } from "../src/bisect";
 import {
   correlate,
+  describeGap,
   diffInstalled,
   pruneEvents,
   type PluginEvent,
@@ -1484,6 +1485,10 @@ eq("prerelease vs prerelease", compareVersion("1.0.0-alpha", "1.0.0-beta"), -1);
     const clean = correlate(events, [{ id: "a", name: "A", firstAt: NOW, uncaught: 0 }], NOW);
     eq("a plugin with no errors never correlates", clean.length, 0);
   }
+
+  eq("under a minute isn't 'minutes'", describeGap(45_000), "less than a minute");
+  eq("and minutes are counted", describeGap(20 * 60_000), "20 minutes");
+  eq("hours still read as hours", describeGap(2 * 3_600_000), "2 hours");
 
   {
     const kept = pruneEvents(
