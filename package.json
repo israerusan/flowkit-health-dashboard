@@ -11,7 +11,8 @@
     "lint": "tsc --noEmit -p . && eslint . --max-warnings 0",
     "test": "npm run lint && node test/run.mjs",
     "test:ci": "node test/run.mjs",
-    "license:generate": "node scripts/generate-license.mjs"
+    "license:generate": "node scripts/generate-license.mjs",
+    "probe:network": "node test/probe.mjs"
   },
   "keywords": [
     "obsidian",

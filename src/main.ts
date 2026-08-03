@@ -444,6 +444,36 @@ export default class FlowKitHealthPlugin extends Plugin {
     return state != null && !state.done;
   }
 
+  /** Depth of FlowKit-initiated plugin toggling currently in flight. */
+  private vaultMutationDepth = 0;
+
+  /**
+   * Run something that deliberately toggles plugins, without the result being
+   * recorded as your vault's history.
+   *
+   * Profiling switches every plugin off and on again and finishes exactly where
+   * it started, but a scan landing halfway through sees a vault mid-surgery —
+   * and would write down that eight plugins were disabled and one recovered.
+   * Bisect taught this lesson once already; this is the general form, so the
+   * next thing that moves plugins around doesn't have to learn it again.
+   *
+   * Deliberately NOT used for bulk fixes or switching plugin sets: those are
+   * changes the user actually asked for, and recording them is the point.
+   */
+  private async withVaultMutation<T>(fn: () => Promise<T>): Promise<T> {
+    this.vaultMutationDepth++;
+    try {
+      return await fn();
+    } finally {
+      this.vaultMutationDepth--;
+    }
+  }
+
+  /** Whether this scan should keep its observations out of the history. */
+  private recordingSuspended(): boolean {
+    return this.bisectInProgress() || this.vaultMutationDepth > 0;
+  }
+
   async diffChanges(
     all: PluginHealth[],
     coverage: DataCoverage
@@ -459,7 +489,7 @@ export default class FlowKitHealthPlugin extends Plugin {
     // Worse than the noise: `notified` would be left describing the mid-search
     // vault, so restoring everything at the end re-reports the original trouble
     // as newly started.
-    if (this.bisectInProgress()) return [];
+    if (this.recordingSuspended()) return [];
 
     const previous = this.settings.notified;
     const { fresh, current } = diffTrouble(
@@ -1095,7 +1125,7 @@ export default class FlowKitHealthPlugin extends Plugin {
     // sits in settings until the user acknowledges the result, and gating on
     // its mere presence meant a found-but-unacknowledged culprit switched off
     // change tracking indefinitely.
-    if (this.bisectInProgress()) return;
+    if (this.recordingSuspended()) return;
 
     const { events, seen } = diffInstalled(
       this.settings.seenPlugins,
@@ -1150,7 +1180,8 @@ export default class FlowKitHealthPlugin extends Plugin {
     onProgress?: (done: number, total: number, id: string) => void
   ): Promise<{ measured: number; failed: string[] } | null> {
     if (!this.runtimeWatcher) return null;
-    const result = await this.runtimeWatcher.profileAll(ids, onProgress);
+    const watcher = this.runtimeWatcher;
+    const result = await this.withVaultMutation(() => watcher.profileAll(ids, onProgress));
     await this.saveSettings();
     return result;
   }
