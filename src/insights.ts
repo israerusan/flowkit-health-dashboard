@@ -66,6 +66,21 @@ export function buildInsights(results: PluginHealth[]): Insight[] {
   const live = results.filter((r) => !r.muted);
   const insights: Insight[] = [];
 
+  // Ranked first, above even "won't load": a plugin Obsidian has pulled from
+  // the directory may have been pulled for a security or policy reason, and the
+  // user has it installed right now. Deliberately carries no mute action.
+  const delisted = live.filter((r) => r.listing === "delisted");
+  if (delisted.length) {
+    insights.push({
+      id: "delisted",
+      tone: "bad",
+      icon: "shield-x",
+      title: `${delisted.length} plugin${delisted.length > 1 ? "s are" : " is"} no longer in the community directory`,
+      detail: `${names(delisted)} ${delisted.length > 1 ? "were" : "was"} listed once but ${delisted.length > 1 ? "have" : "has"} since been removed. Worth checking why before keeping ${delisted.length > 1 ? "them" : "it"}.`,
+      ids: delisted.map((r) => r.id),
+    });
+  }
+
   const incompatible = live.filter((r) => r.enabled && isIncompatible(r));
   if (incompatible.length) {
     insights.push({
@@ -124,15 +139,15 @@ export function buildInsights(results: PluginHealth[]): Insight[] {
     });
   }
 
-  const sideloaded = live.filter((r) => r.sideloaded === true);
-  if (sideloaded.length) {
+  const local = live.filter((r) => r.listing === "local");
+  if (local.length) {
     insights.push({
       id: "sideloaded",
       tone: "warn",
       icon: "shield-alert",
-      title: `${sideloaded.length} sideloaded plugin${sideloaded.length > 1 ? "s" : ""} skipped review`,
-      detail: `Not in Obsidian's community list: ${names(sideloaded)}.`,
-      ids: sideloaded.map((r) => r.id),
+      title: `${local.length} plugin${local.length > 1 ? "s were" : " was"} installed outside the directory`,
+      detail: `Not in Obsidian's community list, so ${local.length > 1 ? "they" : "it"} skipped community review: ${names(local)}.`,
+      ids: local.map((r) => r.id),
       action: "mute-sideloaded",
       actionLabel: "Mute these",
     });

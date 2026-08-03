@@ -1,7 +1,7 @@
 import { Platform, Plugin, WorkspaceLeaf } from "obsidian";
 import type { PluginManifest } from "obsidian";
 import { HealthDashboardView, VIEW_TYPE_HEALTH } from "./view";
-import { computeHealth } from "./scoring";
+import { buildDownloadRanker, classifyListing, computeHealth } from "./scoring";
 import {
   describeFailure,
   fetchCommunityList,
@@ -171,7 +171,6 @@ export default class FlowKitHealthPlugin extends Plugin {
     const api = this.pluginsApi();
     const manifests = Object.values(api.manifests ?? {});
     const enabledSet = api.enabledPlugins ?? new Set<string>();
-    const enabledCount = enabledSet.size;
 
     let stats: RemoteStats | null = null;
     let list: CommunityList | null = null;
@@ -215,6 +214,7 @@ export default class FlowKitHealthPlugin extends Plugin {
 
     const now = Date.now();
     const ignored = new Set(this.settings.ignored);
+    const ranker = buildDownloadRanker(stats);
     const results: PluginHealth[] = [];
     for (const manifest of manifests) {
       const enabled = enabledSet.has(manifest.id);
@@ -226,10 +226,11 @@ export default class FlowKitHealthPlugin extends Plugin {
             manifest,
             enabled,
             isMobile: Platform.isMobile,
-            enabledCount,
             repo: list?.[manifest.id]?.repo,
             remote: stats?.[manifest.id],
-            inCommunityList: list ? manifest.id in list : null,
+            bundleBytes: await this.measureBundle(manifest),
+            downloadPercentile: ranker(stats?.[manifest.id]?.downloads),
+            listing: classifyListing(manifest.id, stats, list),
             muted: ignored.has(manifest.id),
           },
           now
@@ -237,6 +238,33 @@ export default class FlowKitHealthPlugin extends Plugin {
       );
     }
     return { results, coverage };
+  }
+
+  /**
+   * Bytes of code and styles this plugin loads at startup. Read from the vault
+   * adapter, so it works offline and on mobile and needs no new dependency.
+   * Returns undefined when the files can't be read — the metric then reports
+   * itself unavailable rather than guessing.
+   */
+  private async measureBundle(
+    manifest: PluginManifest
+  ): Promise<number | undefined> {
+    const dir = (manifest as PluginManifest & { dir?: string }).dir;
+    if (!dir) return undefined;
+    let total = 0;
+    let sawAny = false;
+    for (const file of ["main.js", "styles.css"]) {
+      try {
+        const stat = await this.app.vault.adapter.stat(`${dir}/${file}`);
+        if (stat?.type === "file") {
+          total += stat.size;
+          sawAny = true;
+        }
+      } catch {
+        // Missing styles.css is normal; an unreadable main.js just means no score.
+      }
+    }
+    return sawAny ? total : undefined;
   }
 
   /** Whether Obsidian currently has this plugin enabled. */

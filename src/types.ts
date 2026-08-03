@@ -1,5 +1,9 @@
 // Shared types for the FlowKit Health Dashboard.
 
+import type { ListingStatus } from "./scoring";
+
+export type { ListingStatus };
+
 /**
  * How much to trust a metric value.
  * - `measured`   — derived from a real, authoritative signal (e.g. app version,
@@ -19,16 +23,19 @@ export interface MetricScore {
 }
 
 /**
- * A plain, categorical read on whether a plugin is still being maintained —
- * easier to scan than the 0–100 maintenance score.
- * - `maintained`   — updated recently (≤6 months).
- * - `aging`        — no update in a while (6–18 months).
- * - `unmaintained` — likely abandoned (>18 months).
- * - `unknown`      — no update data (offline, or not a community plugin).
+ * A plain, categorical read on release activity — easier to scan than the 0–100
+ * maintenance score.
+ * - `maintained`   — released recently (≤6 months).
+ * - `aging`        — no release in a while (6–18 months).
+ * - `stable`       — no recent release, but many published versions and most
+ *                    users on the newest: finished rather than abandoned.
+ * - `unmaintained` — no release in over 18 months, and no sign of maturity.
+ * - `unknown`      — no release data (offline, or not a community plugin).
  */
 export type MaintenanceStatus =
   | "maintained"
   | "aging"
+  | "stable"
   | "unmaintained"
   | "unknown";
 
@@ -48,19 +55,27 @@ export interface PluginHealth {
   /** Latest published version, when known. */
   latestVersion?: string;
   /**
-   * Whether the plugin is absent from Obsidian's community list (a trust
-   * signal — sideloaded plugins skip community review). `null` when unknown
-   * (offline / enrichment off).
+   * Where the plugin stands relative to Obsidian's community directory.
+   * `delisted` (present in the stats file but pulled from the list) is a very
+   * different thing from `local` (never listed — a personal or BRAT install),
+   * and collapsing both into one "sideloaded" warning buried the more serious
+   * of the two.
    */
-  sideloaded: boolean | null;
+  listing: ListingStatus;
   /** User has muted this plugin from the at-risk / unmaintained counts. */
   muted: boolean;
-  /** Average of the available metric values, or `null` if none are available. */
+  /** Weighted blend of the available metrics, or `null` if none are available. */
   overall: number | null;
+  /**
+   * Share of the total metric weight that was actually available (0–1). Shown
+   * to the user so a score built on two of five signals doesn't read as
+   * confidently as one built on all five.
+   */
+  confidence: number;
   metrics: {
-    quality: MetricScore;
+    hygiene: MetricScore;
     maintenance: MetricScore;
-    performance: MetricScore;
+    footprint: MetricScore;
     popularity: MetricScore;
     compatibility: MetricScore;
   };

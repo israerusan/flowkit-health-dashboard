@@ -2,10 +2,13 @@
 // stub (apiVersion = "1.5.0") and run under Node — see test/run.mjs.
 import type { PluginManifest } from "obsidian";
 import {
+  buildDownloadRanker,
+  classifyListing,
   compareVersion,
   computeHealth,
   deriveMaintenanceStatus,
   pickLatestVersion,
+  releaseCount,
   type ScoreInput,
 } from "../src/scoring";
 import nacl from "tweetnacl";
@@ -48,7 +51,7 @@ function input(overrides: Partial<ScoreInput>): ScoreInput {
     manifest: manifest({}),
     enabled: true,
     isMobile: false,
-    enabledCount: 10,
+    bundleBytes: 50_000, // the footprint anchor: scores exactly 100
     ...overrides,
   };
 }
@@ -76,48 +79,50 @@ eq("status abandoned", deriveMaintenanceStatus(NOW - 600 * DAY, NOW), "unmaintai
         id: "dataview",
         name: "Dataview",
         author: "blacksmithgu",
-        authorUrl: "https://github.com/blacksmithgu",
         minAppVersion: "0.13.11",
       }),
       repo: "blacksmithgu/obsidian-dataview",
       remote: { downloads: 5_000_000, updated: NOW - 30 * DAY },
+      downloadPercentile: 1,
+      listing: "listed",
     }),
     NOW
   );
   eq("healthy compatibility", h.metrics.compatibility.value, 100);
   eq("healthy popularity", h.metrics.popularity.value, 100);
   eq("healthy maintenance", h.metrics.maintenance.value, 100);
-  eq("healthy performance", h.metrics.performance.value, 90);
-  eq("healthy quality", h.metrics.quality.value, 95);
-  eq("healthy overall", h.overall, 97);
+  eq("healthy footprint", h.metrics.footprint.value, 100);
+  eq("healthy hygiene", h.metrics.hygiene.value, 100);
+  eq("healthy overall", h.overall, 100);
+  eq("full coverage means full confidence", h.confidence, 1);
   eq("healthy status", h.maintenanceStatus, "maintained");
   eq("compatibility source measured", h.metrics.compatibility.source, "measured");
-  eq("quality source estimated", h.metrics.quality.source, "estimated");
+  eq("hygiene is measured, not estimated", h.metrics.hygiene.source, "measured");
 }
 
-// --- computeHealth: abandoned, offline, crowded vault -----------------------
+// --- computeHealth: incompatible is gated, not averaged ---------------------
 {
   const h = computeHealth(
     input({
       manifest: manifest({
         id: "old",
         name: "Old Plugin",
-        authorUrl: undefined,
         minAppVersion: "1.9.0", // newer than stubbed apiVersion 1.5.0
       }),
-      enabledCount: 30,
       remote: undefined,
     }),
     NOW
   );
-  eq("abandoned compatibility", h.metrics.compatibility.value, 0);
+  eq("incompatible compatibility", h.metrics.compatibility.value, 0);
   eq("abandoned popularity null", h.metrics.popularity.value, null);
   eq("abandoned maintenance null", h.metrics.maintenance.value, null);
-  eq("abandoned performance penalized", h.metrics.performance.value, 75);
-  eq("abandoned quality", h.metrics.quality.value, 28);
-  eq("abandoned overall", h.overall, 34);
-  eq("abandoned status", h.maintenanceStatus, "unknown");
   eq("popularity unavailable", h.metrics.popularity.source, "unavailable");
+  // A plugin that cannot load must not wear a mid-range score. Previously 72.
+  check(
+    "a plugin that cannot load is capped at 20",
+    h.overall != null && h.overall <= 20,
+    `got ${h.overall}`
+  );
 }
 
 // --- computeHealth: desktop-only on mobile ----------------------------------
@@ -133,11 +138,43 @@ eq("status abandoned", deriveMaintenanceStatus(NOW - 600 * DAY, NOW), "unmaintai
   eq("mobile-incompatible source", h.metrics.compatibility.source, "measured");
 }
 
-// --- computeHealth: disabled plugin has no performance value ----------------
+// --- computeHealth: disabling a plugin must not change its score ------------
 {
-  const h = computeHealth(input({ enabled: false }), NOW);
-  eq("disabled performance null", h.metrics.performance.value, null);
-  eq("disabled performance unavailable", h.metrics.performance.source, "unavailable");
+  const base = {
+    manifest: manifest({ id: "same", minAppVersion: "1.0.0" }),
+    repo: "a/b",
+    remote: { downloads: 100, updated: NOW - 10 * DAY },
+    downloadPercentile: 0.5,
+    listing: "listed" as const,
+  };
+  const on = computeHealth(input({ ...base, enabled: true }), NOW);
+  const off = computeHealth(input({ ...base, enabled: false }), NOW);
+  eq("disabled footprint is scored, not dropped", off.metrics.footprint.value, 100);
+  eq("disabled footprint source", off.metrics.footprint.source, "measured");
+  // The old model dropped Performance from the denominator when disabled, so
+  // the same plugin scored 92 enabled and 97 disabled — turning something off
+  // and watching its health improve.
+  eq("denominator is stable across enabled state", on.confidence, off.confidence);
+  check(
+    "disabling never raises a score",
+    off.overall != null && on.overall != null && off.overall <= on.overall,
+    `enabled ${on.overall}, disabled ${off.overall}`
+  );
+}
+
+// --- footprint is a real per-plugin signal ----------------------------------
+{
+  const small = computeHealth(input({ bundleBytes: 50_000 }), NOW);
+  const large = computeHealth(input({ bundleBytes: 5_000_000 }), NOW);
+  eq("50 KB anchors at 100", small.metrics.footprint.value, 100);
+  eq("5 MB scores far lower", large.metrics.footprint.value, 20);
+  check(
+    "footprint actually differentiates plugins",
+    small.metrics.footprint.value !== large.metrics.footprint.value,
+    "the old Performance metric returned the same constant for every row"
+  );
+  const unknown = computeHealth(input({ bundleBytes: undefined }), NOW);
+  eq("unreadable bundle is unavailable, not guessed", unknown.metrics.footprint.value, null);
 }
 
 // --- pickLatestVersion ------------------------------------------------------
@@ -148,37 +185,145 @@ eq(
   "0.5.64"
 );
 
-// --- computeHealth: update available + sideload -----------------------------
+// --- computeHealth: update available + listing ------------------------------
 {
   const h = computeHealth(
     input({
       manifest: manifest({ id: "x", version: "1.2.0" }),
-      inCommunityList: true,
+      listing: "listed",
       remote: { downloads: 100, updated: NOW, "1.2.0": 10, "1.3.0": 20 },
     }),
     NOW
   );
   eq("update available", h.updateAvailable, true);
   eq("latest version", h.latestVersion, "1.3.0");
-  eq("in-list not sideloaded", h.sideloaded, false);
+  eq("in-list is listed", h.listing, "listed");
 }
 {
   const h = computeHealth(
     input({
       manifest: manifest({ id: "x", version: "1.3.0" }),
-      inCommunityList: false,
+      listing: "local",
       remote: { downloads: 100, updated: NOW, "1.3.0": 20 },
     }),
     NOW
   );
   eq("no update when current", h.updateAvailable, false);
-  eq("absent from list is sideloaded", h.sideloaded, true);
+  eq("absent from both files is a local install", h.listing, "local");
 }
 {
-  const h = computeHealth(input({ inCommunityList: null, muted: true }), NOW);
-  eq("unknown sideload when no list", h.sideloaded, null);
+  const h = computeHealth(input({ listing: undefined, muted: true }), NOW);
+  eq("unknown listing when no list", h.listing, "unknown");
   eq("muted flag propagates", h.muted, true);
   eq("no update without remote", h.updateAvailable, false);
+}
+
+// --- listing classification -------------------------------------------------
+{
+  const stats = { a: { downloads: 1 }, b: { downloads: 2 } };
+  const list = { a: {} };
+  eq("in list is listed", classifyListing("a", stats, list), "listed");
+  // In the stats file but pulled from the list: Obsidian removed it.
+  eq("in stats but not list is delisted", classifyListing("b", stats, list), "delisted");
+  eq("in neither is local", classifyListing("c", stats, list), "local");
+  eq("no list at all is unknown", classifyListing("a", stats, null), "unknown");
+}
+{
+  // Delisted is a hard cap, not a chip: it outranks an otherwise perfect score.
+  const h = computeHealth(
+    input({
+      manifest: manifest({ minAppVersion: "1.0.0" }),
+      repo: "a/b",
+      remote: { downloads: 900_000, updated: NOW },
+      downloadPercentile: 0.99,
+      listing: "delisted",
+    }),
+    NOW
+  );
+  check(
+    "a delisted plugin is capped at 30",
+    h.overall != null && h.overall <= 30,
+    `got ${h.overall}`
+  );
+}
+
+// --- a missing signal must never flatter a plugin ---------------------------
+{
+  const shared = {
+    manifest: manifest({ id: "abandoned", minAppVersion: "1.0.0" }),
+    repo: "a/b",
+  };
+  const online = computeHealth(
+    input({
+      ...shared,
+      remote: { downloads: 200_000, updated: NOW - 1100 * DAY },
+      downloadPercentile: 0.95,
+      listing: "listed",
+    }),
+    NOW
+  );
+  const offline = computeHealth(input({ ...shared, listing: "unknown" }), NOW);
+  // Offline we genuinely cannot know this plugin is stale, so the score can't
+  // be expected to match the online one. What it must not do is sail to 100
+  // because the condemning metric left the denominator: it is capped at what a
+  // neutral maintenance reading would earn, and confidence says how thin the
+  // evidence is. (Previously: 100 offline, presented with a grade and no caveat.)
+  check(
+    "a missing signal cannot push a score to full marks",
+    offline.overall != null && offline.overall <= 85,
+    `offline ${offline.overall}`
+  );
+  check(
+    "and the cap is what does it, not luck",
+    offline.overall != null && offline.overall < 100,
+    `offline ${offline.overall}`
+  );
+  check(
+    "and confidence drops to say so",
+    offline.confidence < online.confidence,
+    `online ${online.confidence}, offline ${offline.confidence}`
+  );
+}
+
+// --- percentile ranking -----------------------------------------------------
+{
+  const rank = buildDownloadRanker({
+    a: { downloads: 10 },
+    b: { downloads: 20 },
+    c: { downloads: 30 },
+    d: { downloads: 40 },
+  });
+  eq("smallest ranks at 0", rank(10), 0);
+  eq("median ranks mid-scale", rank(30), 0.5);
+  eq("unknown downloads have no rank", rank(undefined), undefined);
+  eq("no stats means no ranker", buildDownloadRanker(null)(5), undefined);
+}
+
+// --- the stability carve-out ------------------------------------------------
+{
+  // Calendar's real shape: last release 2021, ~3M downloads, many versions,
+  // and its users long since migrated to the newest one. The old model called
+  // this "abandoned" and offered to bulk-disable it.
+  const mature: Record<string, number | undefined> = {
+    downloads: 1000,
+    updated: NOW - 1200 * DAY,
+    "1.8.0": 800, // the newest release, and where the users are
+  };
+  for (let i = 0; i < 8; i++) mature[`1.${i}.0`] = 10;
+  eq("mature stable is not unmaintained", deriveMaintenanceStatus(NOW - 1200 * DAY, NOW, mature), "stable");
+
+  const abandoned = { downloads: 1000, updated: NOW - 1200 * DAY, "0.1.0": 5 };
+  eq(
+    "one release and long silent is unmaintained",
+    deriveMaintenanceStatus(NOW - 1200 * DAY, NOW, abandoned),
+    "unmaintained"
+  );
+  eq("release count counts stable keys only", releaseCount(abandoned), 1);
+  check(
+    "mature stable earns a maintenance floor",
+    (computeHealth(input({ remote: mature as never }), NOW).metrics.maintenance.value ?? 0) >= 60,
+    "a finished plugin should not score 5"
+  );
 }
 
 // --- license verification (offline Ed25519) ---------------------------------
@@ -237,13 +382,14 @@ function ph(overrides: Partial<PluginHealth>): PluginHealth {
     enabled: true,
     maintenanceStatus: "maintained",
     updateAvailable: false,
-    sideloaded: false,
+    listing: "listed",
     muted: false,
     overall: 90,
+    confidence: 1,
     metrics: {
-      quality: metric(90),
+      hygiene: metric(90),
       maintenance: metric(90),
-      performance: metric(90),
+      footprint: metric(90),
       popularity: metric(90),
       compatibility: metric(100),
     },
@@ -286,9 +432,23 @@ function ph(overrides: Partial<PluginHealth>): PluginHealth {
   );
   eq(
     "insight sideloaded present",
-    buildInsights([ph({ id: "s", sideloaded: true })]).some((i) => i.id === "sideloaded"),
+    buildInsights([ph({ id: "s", listing: "local" })]).some((i) => i.id === "sideloaded"),
     true
   );
+  // A delisted plugin is a different, more serious thing than a local install,
+  // and it must outrank everything — including "won't load".
+  {
+    const withDelisted = buildInsights([
+      ph({ id: "d", listing: "delisted" }),
+      ph({ id: "l", listing: "local" }),
+    ]);
+    eq("delisted insight present", withDelisted[0].id, "delisted");
+    eq(
+      "delisted offers no mute action",
+      withDelisted.find((i) => i.id === "delisted")?.action,
+      undefined
+    );
+  }
 }
 
 // --- version parsing regressions (0.3.0) ------------------------------------

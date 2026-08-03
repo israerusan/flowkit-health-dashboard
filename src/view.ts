@@ -27,23 +27,47 @@ type FilterKey =
   | "attention"
   | "unmaintained"
   | "incompatible"
+  | "delisted"
+  | "sideloaded"
   | "update"
   | "disabled"
   | "muted";
 
-const METRIC_COLUMNS: Array<{ key: MetricKey; label: string }> = [
-  { key: "quality", label: "Quality" },
-  { key: "maintenance", label: "Maintenance" },
-  { key: "performance", label: "Performance" },
-  { key: "popularity", label: "Popularity" },
-  { key: "compatibility", label: "Compatibility" },
+const METRIC_COLUMNS: Array<{ key: MetricKey; label: string; hint: string }> = [
+  {
+    key: "compatibility",
+    label: "Compatibility",
+    hint: "Whether it can run on your Obsidian, on this device. Weighted 30%.",
+  },
+  {
+    key: "maintenance",
+    label: "Maintenance",
+    hint: "How recently it was released, allowing for plugins that are simply finished. Weighted 30%.",
+  },
+  {
+    key: "footprint",
+    label: "Footprint",
+    hint: "Code and styles loaded at startup, measured on disk. Weighted 20%.",
+  },
+  {
+    key: "hygiene",
+    label: "Hygiene",
+    hint: "What the plugin's manifest declares. Weighted 10%.",
+  },
+  {
+    key: "popularity",
+    label: "Popularity",
+    hint: "Download rank within the directory — context, not health. Weighted 10%.",
+  },
 ];
 
 const FILTERS: Array<{ key: FilterKey; label: string }> = [
   { key: "all", label: "All plugins" },
   { key: "attention", label: "Needs attention" },
-  { key: "unmaintained", label: "Unmaintained" },
+  { key: "unmaintained", label: "No recent release" },
   { key: "incompatible", label: "Incompatible" },
+  { key: "delisted", label: "Delisted" },
+  { key: "sideloaded", label: "Local installs" },
   { key: "update", label: "Update available" },
   { key: "disabled", label: "Disabled" },
   { key: "muted", label: "Muted" },
@@ -56,18 +80,23 @@ const MAINTENANCE_META: Record<
   maintained: {
     label: "Maintained",
     tone: "good",
-    hint: "Updated within the last 6 months.",
+    hint: "Released within the last 6 months.",
   },
-  aging: { label: "Aging", tone: "warn", hint: "No update in 6–18 months." },
+  aging: { label: "Aging", tone: "warn", hint: "No release in 6–18 months." },
+  stable: {
+    label: "Stable",
+    tone: "good",
+    hint: "No recent release, but many published versions and most users on the newest — finished, not abandoned.",
+  },
   unmaintained: {
-    label: "Unmaintained",
-    tone: "bad",
-    hint: "No update in over 18 months — likely abandoned.",
+    label: "No recent release",
+    tone: "warn",
+    hint: "No recorded release in over 18 months, and no sign it has settled into maturity.",
   },
   unknown: {
     label: "Unknown",
     tone: "unknown",
-    hint: "No update data (offline, or not a community plugin).",
+    hint: "No release data (offline, or not a community plugin).",
   },
 };
 
@@ -125,7 +154,16 @@ interface SummaryStats {
   atRisk: number;
   unmaintained: number;
   updates: number;
+  /** Mean share of metric weight available across the scored plugins (0–1). */
+  confidence: number;
 }
+
+/**
+ * Below this, the letter grade is withheld. A grade is a confident-sounding
+ * artifact; printing "A" off two of five signals is how the dashboard used to
+ * announce "your vault is in excellent shape" because the network was down.
+ */
+const GRADE_MIN_CONFIDENCE = 0.6;
 
 export class HealthDashboardView extends ItemView {
   private plugin: FlowKitHealthPlugin;
@@ -210,6 +248,9 @@ export class HealthDashboardView extends ItemView {
     const avg = scored.length
       ? Math.round(scored.reduce((a, b) => a + b, 0) / scored.length)
       : null;
+    const confidence = active.length
+      ? active.reduce((a, r) => a + r.confidence, 0) / active.length
+      : 0;
     return {
       count: active.length,
       avg,
@@ -217,6 +258,7 @@ export class HealthDashboardView extends ItemView {
       unmaintained: active.filter((r) => r.maintenanceStatus === "unmaintained")
         .length,
       updates: active.filter((r) => r.updateAvailable).length,
+      confidence,
     };
   }
 
@@ -234,6 +276,10 @@ export class HealthDashboardView extends ItemView {
           return r.maintenanceStatus === "unmaintained";
         case "incompatible":
           return isIncompatible(r);
+        case "delisted":
+          return r.listing === "delisted";
+        case "sideloaded":
+          return r.listing === "local";
         case "update":
           return r.updateAvailable;
         case "disabled":
@@ -377,7 +423,14 @@ export class HealthDashboardView extends ItemView {
 
   private renderHero(root: HTMLElement): void {
     const s = this.summaryStats();
-    const grade = gradeFor(s.avg);
+    const graded = s.confidence >= GRADE_MIN_CONFIDENCE;
+    const grade = graded
+      ? gradeFor(s.avg)
+      : {
+          letter: "—",
+          tone: "unknown" as Tone,
+          verdict: "Not enough signal to grade this vault yet.",
+        };
     const hero = root.createDiv({ cls: "flowkit-hero" });
 
     // Circular gauge.
@@ -422,12 +475,19 @@ export class HealthDashboardView extends ItemView {
 
     const text = hero.createDiv({ cls: "flowkit-hero-text" });
     text.createEl("h3", { text: grade.verdict });
+    const signals = Math.round(s.confidence * 5);
     text.createEl("p", {
       cls: "flowkit-hero-sub",
-      text: `Vault health across ${s.count} plugin${s.count === 1 ? "" : "s"} · ${
-        this.coverage.stats ? "measured + estimated signals" : "local signals only"
-      }.`,
+      text:
+        `Across ${s.count} plugin${s.count === 1 ? "" : "s"} · ` +
+        `${signals} of 5 signals available · ${Math.round(s.confidence * 100)}% confidence.`,
     });
+    if (!graded) {
+      text.createEl("p", {
+        cls: "flowkit-hero-hint",
+        text: "Turn on online enrichment for maintenance and popularity data, and a letter grade.",
+      });
+    }
   }
 
   /**
@@ -741,9 +801,15 @@ export class HealthDashboardView extends ItemView {
     const table = wrap.createEl("table", { cls: "flowkit-health-table" });
     const thead = table.createEl("thead").createEl("tr");
     this.sortableTh(thead, "Plugin", "name");
-    this.sortableTh(thead, "Overall", "overall", true);
+    this.sortableTh(
+      thead,
+      "Overall",
+      "overall",
+      true,
+      "Weighted blend of the five metrics, renormalised over what was available."
+    );
     for (const col of METRIC_COLUMNS) {
-      this.sortableTh(thead, col.label, col.key, true);
+      this.sortableTh(thead, col.label, col.key, true, col.hint);
     }
     thead.createEl("th", { text: "", cls: "num" });
 
@@ -751,8 +817,19 @@ export class HealthDashboardView extends ItemView {
     for (const r of rows) this.renderRow(tbody, r);
   }
 
-  private sortableTh(tr: HTMLElement, label: string, key: SortKey, num = false): void {
+  private sortableTh(
+    tr: HTMLElement,
+    label: string,
+    key: SortKey,
+    num = false,
+    hint?: string
+  ): void {
     const th = tr.createEl("th", { cls: num ? "num sortable" : "sortable" });
+    th.setAttr("scope", "col");
+    if (hint) {
+      th.setAttr("title", hint);
+      th.setAttr("aria-label", `${label} — ${hint}`);
+    }
     th.createSpan({ text: label });
     if (this.sortKey === key) {
       th.createSpan({
@@ -782,12 +859,20 @@ export class HealthDashboardView extends ItemView {
         `Newer version available${r.latestVersion ? ` (v${r.latestVersion})` : ""}.`
       );
     }
-    if (r.sideloaded === true) {
+    if (r.listing === "delisted") {
       this.badge(
         nameRow,
-        "Sideloaded",
-        "warn",
-        "Not in Obsidian's community list — skips community review."
+        "Delisted",
+        "bad",
+        "Was in Obsidian's community directory and has since been removed."
+      );
+    } else if (r.listing === "local") {
+      // Neutral: installing outside the directory is a choice, not a fault.
+      this.badge(
+        nameRow,
+        "Local install",
+        "unknown",
+        "Not in Obsidian's community list — installed manually or via BRAT, so it skipped community review."
       );
     }
     if (r.muted) {
@@ -894,10 +979,14 @@ export class HealthDashboardView extends ItemView {
     legend.createEl("strong", { text: "How to read this: " });
     legend.createSpan({
       text:
-        "Scores are 0–100. Compatibility and (when online) Popularity and " +
-        "Maintenance are measured. Performance and Quality are estimates — " +
-        "marked with ~ — because Obsidian exposes no direct signal for them. " +
-        "Click a column to sort; use the ⋮ menu to enable/disable, open, or mute.",
+        "Scores are 0–100. Overall is a weighted blend — Compatibility 30%, " +
+        "Maintenance 30%, Footprint 20%, Hygiene 10%, Popularity 10% — " +
+        "renormalised over whatever data is actually available, with the " +
+        "confidence figure above showing how much that was. A plugin that " +
+        "can't load is capped at 20 regardless of its other scores, and one " +
+        "removed from the community directory at 30. Popularity is context, " +
+        "not health: a niche plugin isn't a worse plugin. Click a column to " +
+        "sort; use the ⋮ menu to enable/disable, open, or mute.",
     });
   }
 
@@ -985,7 +1074,7 @@ export class HealthDashboardView extends ItemView {
     );
     lines.push("");
     lines.push(
-      "| Plugin | Version | Status | Overall | Quality | Maintenance | Performance | Popularity | Compatibility |"
+      "| Plugin | Version | Status | Overall | Compatibility | Maintenance | Footprint | Hygiene | Popularity |"
     );
     lines.push("| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |");
     for (const r of rows) {
@@ -993,10 +1082,10 @@ export class HealthDashboardView extends ItemView {
       const flags = this.flagText(r);
       lines.push(
         `| ${md(r.name)} | ${md(r.version)} | ${md(flags)} | ${cell(r.overall)} | ${cell(
-          m.quality.value
-        )} | ${cell(m.maintenance.value)} | ${cell(m.performance.value)} | ${cell(
-          m.popularity.value
-        )} | ${cell(m.compatibility.value)} |`
+          m.compatibility.value
+        )} | ${cell(m.maintenance.value)} | ${cell(m.footprint.value)} | ${cell(
+          m.hygiene.value
+        )} | ${cell(m.popularity.value)} |`
       );
     }
     lines.push("");
@@ -1014,11 +1103,12 @@ export class HealthDashboardView extends ItemView {
       "Enabled",
       "Status",
       "Overall",
-      "Quality",
-      "Maintenance",
-      "Performance",
-      "Popularity",
+      "Confidence",
       "Compatibility",
+      "Maintenance",
+      "Footprint",
+      "Hygiene",
+      "Popularity",
     ];
     const lines = [header.map(esc).join(",")];
     for (const r of rows) {
@@ -1032,11 +1122,12 @@ export class HealthDashboardView extends ItemView {
           r.enabled ? "yes" : "no",
           esc(this.flagText(r)),
           num(r.overall),
-          num(m.quality.value),
-          num(m.maintenance.value),
-          num(m.performance.value),
-          num(m.popularity.value),
+          `${Math.round(r.confidence * 100)}%`,
           num(m.compatibility.value),
+          num(m.maintenance.value),
+          num(m.footprint.value),
+          num(m.hygiene.value),
+          num(m.popularity.value),
         ].join(",")
       );
     }
@@ -1047,7 +1138,8 @@ export class HealthDashboardView extends ItemView {
     return [
       MAINTENANCE_META[r.maintenanceStatus].label,
       r.updateAvailable ? "Update" : "",
-      r.sideloaded === true ? "Sideloaded" : "",
+      r.listing === "delisted" ? "Delisted" : "",
+      r.listing === "local" ? "Local install" : "",
       r.enabled ? "" : "Disabled",
       r.muted ? "Muted" : "",
     ]
