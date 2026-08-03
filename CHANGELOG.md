@@ -71,7 +71,13 @@ diagnosis, and Pro is about acting on it rather than seeing it.
 - **Background monitoring** — get told when a plugin turns incompatible, goes
   stale, or is pulled from the directory.
 - **Unlimited reports**, as a real document with the findings, not a bare grid.
-- **90 days of history**, per-metric trends, and exportable data.
+- **90 days of history**, where free keeps the last 30.
+
+### Note for existing Pro users
+
+Your saved trend history was recorded by the old scoring model and isn't
+comparable to the new one, so the chart starts fresh rather than drawing a step
+you didn't cause. Old readings are kept, just not plotted.
 
 ## [0.2.2] - 2026-07-05
 

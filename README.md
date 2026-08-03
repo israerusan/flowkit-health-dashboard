@@ -110,7 +110,7 @@ The whole diagnosis is free. Pro is for *acting* on it.
   Obsidian update, which is when nobody thinks to look
 - **Unlimited reports** — Markdown *and* CSV, as a document with the findings
   and methodology, not a bare grid of numbers
-- **Full history** — 90 days of vault health, per-metric trends, exportable
+- **90 days of vault-health history**, instead of the last 30
 
 Purchase: [Buy Me a Coffee — FlowKit Pro](https://buymeacoffee.com/vaultspotlight/e/560206). License keys are verified **offline** (Ed25519) — no account, server, or subscription, and one key works on every device you own.
 
@@ -156,7 +156,9 @@ Key didn't arrive, or want a refund? Email <iavila01@gmail.com>.
 - **Re-download community data on open** — off by default; the cached scan is
   reused for a day, and Refresh always refetches.
 - **Background monitoring** *(Pro)* — check quietly for plugins that turn
-  incompatible, go stale, or get pulled from the directory.
+  incompatible, go stale, or get pulled from the directory. This is the only
+  feature that fetches community data without you asking; switch it off and
+  FlowKit only ever goes online when you open or refresh the dashboard.
 - **Muted plugins** — plugins you've muted from the at-risk counts; clear the
   list here.
 

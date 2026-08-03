@@ -385,14 +385,20 @@ export function classifyListing(
 export function buildRemoteCache(
   stats: Record<string, RemotePluginStat> | null,
   list: Record<string, { repo?: string }> | null,
-  at: number
+  at: number,
+  /** Installed plugin ids. Only these are kept — see below. */
+  keep: Set<string>
 ): RemoteCache {
   const plugins: Record<string, CachedPlugin> = {};
-  const distribution: number[] = [];
+  const all: number[] = [];
 
   if (stats) {
     for (const [id, entry] of Object.entries(stats)) {
       if (!entry) continue;
+      // The distribution is built from the WHOLE directory, because that is
+      // what a percentile means — but only installed plugins are stored.
+      if (typeof entry.downloads === "number") all.push(entry.downloads);
+      if (!keep.has(id)) continue;
       const latest = pickLatestVersion(entry);
       plugins[id] = {
         downloads: entry.downloads,
@@ -401,13 +407,13 @@ export function buildRemoteCache(
         latestDownloads: latest ? entry[latest] : undefined,
         releases: releaseCount(entry),
       };
-      if (typeof entry.downloads === "number") distribution.push(entry.downloads);
     }
-    distribution.sort((a, b) => a - b);
+    all.sort((a, b) => a - b);
   }
 
   if (list) {
     for (const [id, entry] of Object.entries(list)) {
+      if (!keep.has(id)) continue;
       const existing = plugins[id] ?? {};
       existing.repo = entry?.repo;
       existing.listed = true;
@@ -415,7 +421,71 @@ export function buildRemoteCache(
     }
   }
 
-  return { at, plugins, distribution, hadStats: stats != null, hadList: list != null };
+  return {
+    at,
+    plugins,
+    distribution: quantiles(all),
+    hadStats: stats != null,
+    hadList: list != null,
+  };
+}
+
+/**
+ * Reduce a sorted series to 101 evenly-spaced samples.
+ *
+ * Storing all 6,253 directory download counts made the persisted cache about
+ * 1 MB, and `saveSettings` rewrites the whole settings object — on every scan,
+ * every mute, and once per keystroke in the license field. A percentile only
+ * ever renders as a whole number, so 101 samples carry every bit of precision
+ * the UI can show.
+ */
+function quantiles(sorted: number[], buckets = 100): number[] {
+  if (sorted.length <= buckets + 1) return sorted;
+  const out: number[] = [];
+  for (let i = 0; i <= buckets; i++) {
+    out.push(sorted[Math.round((i / buckets) * (sorted.length - 1))]);
+  }
+  return out;
+}
+
+/**
+ * Fold a fresh (possibly partial) fetch into what we already had, so one feed
+ * failing can't discard the other's data. The two files are separate requests,
+ * and a 500 on the list alone would otherwise wipe every repo link, every
+ * delisted detection, and 25 hygiene points per plugin — for up to a day.
+ */
+export function mergeRemoteCache(
+  previous: RemoteCache | null,
+  fresh: RemoteCache
+): RemoteCache {
+  if (!previous) return fresh;
+  const merged: RemoteCache = {
+    at: fresh.at,
+    plugins: {},
+    distribution: fresh.hadStats ? fresh.distribution : previous.distribution,
+    hadStats: fresh.hadStats || previous.hadStats,
+    hadList: fresh.hadList || previous.hadList,
+  };
+  const ids = new Set([
+    ...Object.keys(previous.plugins),
+    ...Object.keys(fresh.plugins),
+  ]);
+  for (const id of ids) {
+    const before = previous.plugins[id] ?? {};
+    const now = fresh.plugins[id] ?? {};
+    merged.plugins[id] = {
+      // Stats-derived fields: take the fresh ones only if stats actually loaded.
+      downloads: fresh.hadStats ? now.downloads : before.downloads,
+      updated: fresh.hadStats ? now.updated : before.updated,
+      latest: fresh.hadStats ? now.latest : before.latest,
+      latestDownloads: fresh.hadStats ? now.latestDownloads : before.latestDownloads,
+      releases: fresh.hadStats ? now.releases : before.releases,
+      // List-derived fields likewise.
+      repo: fresh.hadList ? now.repo : before.repo,
+      listed: fresh.hadList ? now.listed : before.listed,
+    };
+  }
+  return merged;
 }
 
 /**
@@ -434,7 +504,11 @@ export function remoteFromCache(
     remote[cached.latest] = cached.latestDownloads ?? 0;
     // The maturity signal only needs the release count and the newest release's
     // share, so synthesise enough distinct keys to carry the count forward.
-    for (let i = 0; i < (cached.releases ?? 0); i++) {
+    // `cached.latest` is itself one of the counted releases, hence -1: without
+    // it every plugin gained a phantom version and the maturity threshold
+    // silently became 7 instead of 8.
+    const filler = Math.max(0, (cached.releases ?? 0) - 1);
+    for (let i = 0; i < filler; i++) {
       const key = `0.0.${i}`;
       if (!(key in remote)) remote[key] = 0;
     }

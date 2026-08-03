@@ -1,4 +1,4 @@
-import { ItemView, Menu, Notice, WorkspaceLeaf, setIcon } from "obsidian";
+import { ItemView, Menu, Notice, TFile, WorkspaceLeaf, setIcon } from "obsidian";
 import type {
   DataCoverage,
   HealthSnapshot,
@@ -6,6 +6,7 @@ import type {
   MetricScore,
   PluginHealth,
 } from "./types";
+import { SCORING_MODEL } from "./types";
 import type FlowKitHealthPlugin from "./main";
 import {
   buildInsights,
@@ -235,7 +236,14 @@ export class HealthDashboardView extends ItemView {
         updates: s.updates,
         online: coverage.stats,
         confidence: s.confidence,
+        model: SCORING_MODEL,
       });
+      // Otherwise the status bar keeps quoting the last background pass — so
+      // acting on a bulk fix left it reading "5 to fix" for hours afterwards.
+      this.plugin.updateStatusBar(
+        s.avg,
+        this.results.filter((r) => !r.muted)
+      );
     } catch (err) {
       // A rejected saveData (read-only disk, sync conflict) used to escape here
       // and leave the view stuck on the spinner with Refresh disabled, needing
@@ -478,7 +486,10 @@ export class HealthDashboardView extends ItemView {
 
   private renderHero(root: HTMLElement): void {
     const s = this.summaryStats();
-    const graded = s.confidence >= GRADE_MIN_CONFIDENCE;
+    // Strictly greater: offline coverage lands on exactly 0.60 (compatibility
+    // .30 + footprint .20 + hygiene .10), so `>=` let a vault with maintenance
+    // and popularity entirely unmeasured still print a confident letter grade.
+    const graded = s.confidence > GRADE_MIN_CONFIDENCE;
     const grade = graded
       ? gradeFor(s.avg)
       : {
@@ -576,7 +587,21 @@ export class HealthDashboardView extends ItemView {
    */
   private renderCoverageNotice(root: HTMLElement): void {
     const { stats, list, disabled, error } = this.coverage;
-    if (stats && list) return;
+
+    // A refresh that failed while a cache exists still reports full coverage,
+    // because the cached data really is complete — but the user pressed Refresh
+    // and got the same numbers back, so say why.
+    if (stats && list) {
+      if (!error) return;
+      const stale = root.createDiv({ cls: "flowkit-coverage-note" });
+      setIcon(stale.createSpan({ cls: "flowkit-coverage-icon" }), "cloud-off");
+      stale
+        .createDiv({ cls: "flowkit-coverage-body" })
+        .setText(`${error} Showing the last data FlowKit downloaded.`);
+      const again = stale.createEl("button", { text: "Retry" });
+      again.onclick = () => void this.refresh(true);
+      return;
+    }
 
     const note = root.createDiv({ cls: "flowkit-coverage-note" });
     setIcon(note.createSpan({ cls: "flowkit-coverage-icon" }), disabled ? "wifi-off" : "cloud-off");
@@ -790,7 +815,7 @@ export class HealthDashboardView extends ItemView {
         detail: this.bulkReason(r, action),
       })),
       caveat: disabling
-        ? "A plugin with no recent release isn't necessarily broken — some are simply finished. Uncheck anything you rely on by muting it instead."
+        ? "A plugin with no recent release isn't necessarily broken — some are simply finished. Cancel and disable them individually from the row menu if you'd rather keep some."
         : undefined,
       confirmLabel: disabling
         ? `Disable ${rows.length}`
@@ -836,9 +861,16 @@ export class HealthDashboardView extends ItemView {
   private async undoLastBulk(): Promise<void> {
     const last = this.lastBulk;
     if (!last) return;
-    this.lastBulk = null;
-    await last.revert();
-    new Notice("Reverted.");
+    try {
+      await last.revert();
+      // Only forget the undo once it actually succeeded — clearing it first
+      // removed the user's way back while leaving the change in place.
+      this.lastBulk = null;
+      new Notice("Reverted.");
+    } catch (err) {
+      console.error("FlowKit: undo failed", err);
+      new Notice("Couldn't undo that — see the console. The Undo button is still there.");
+    }
     await this.refresh();
   }
 
@@ -860,10 +892,12 @@ export class HealthDashboardView extends ItemView {
       text: `Vault health trend · ${windowDays} days`,
     });
 
-    // Offline readings are excluded from the line entirely rather than plotted
-    // beside full ones, where a missing signal looked like an improvement.
+    // Two exclusions, both about comparability:
+    //  - offline readings, where a missing signal looked like an improvement;
+    //  - readings from an older scoring model, which are a different scale.
     const usable = history.filter(
-      (h): h is HealthSnapshot & { avg: number } => h.avg != null && h.online !== false
+      (h): h is HealthSnapshot & { avg: number } =>
+        h.avg != null && h.online !== false && h.model === SCORING_MODEL
     );
 
     if (usable.length === 0) {
@@ -882,12 +916,15 @@ export class HealthDashboardView extends ItemView {
     }
 
     const latest = usable[usable.length - 1];
-    const prev = this.plugin.previousSnapshot(latest.at);
+    // The baseline must come from the points actually drawn. Reading it back
+    // out of the full history would quote a delta against a snapshot the chart
+    // just excluded for being incomparable.
+    const prev = usable[usable.length - 2];
     const row = section.createDiv({ cls: "flowkit-trends-row" });
     this.renderSparkline(row, usable);
 
     const delta = row.createDiv({ cls: "flowkit-trends-delta" });
-    if (prev && prev.avg != null) {
+    if (prev) {
       const d = latest.avg - prev.avg;
       const tone: Tone = d > 0 ? "good" : d < 0 ? "bad" : "unknown";
       const sign = d > 0 ? "▲" : d < 0 ? "▼" : "—";
@@ -1361,18 +1398,18 @@ export class HealthDashboardView extends ItemView {
     const content =
       format === "md" ? this.buildReportMarkdown(rows) : this.buildReportCsv(rows);
     const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    let created: TFile | null = null;
+    let createdPath = "";
     try {
       const path = await this.uniquePath(`Plugin Health Report ${stamp}`, format);
+      createdPath = path;
       // A leading BOM keeps Excel from mangling non-ASCII plugin names in the
       // CSV. Built with fromCharCode rather than written literally, so the
       // source stays free of invisible whitespace.
-      const file = await this.app.vault.create(
+      created = await this.app.vault.create(
         path,
         format === "csv" ? String.fromCharCode(0xfeff) + content : content
       );
-      if (format === "md") {
-        await this.app.workspace.getLeaf(true).openFile(file);
-      }
       if (!this.plugin.isPro) {
         this.plugin.settings.usedFreeExport = true;
         await this.plugin.saveSettings();
@@ -1381,7 +1418,21 @@ export class HealthDashboardView extends ItemView {
     } catch (err) {
       console.error("FlowKit: export failed", err);
       new Notice("Could not create the report file — see the console.");
+      return;
     }
+
+    // Opening the note is a separate concern: the file is already written, so a
+    // failure here must not be reported as "could not create the report".
+    if (format === "md" && created) {
+      try {
+        await this.app.workspace.getLeaf(true).openFile(created);
+      } catch (err) {
+        console.error("FlowKit: could not open the report", err);
+        new Notice(`Report saved to “${createdPath}”, but it couldn't be opened.`);
+      }
+    }
+    // The Export button's lock state depends on usedFreeExport.
+    this.render();
   }
 
   /**

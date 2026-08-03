@@ -136,7 +136,17 @@ export interface HealthSnapshot {
   online?: boolean;
   /** Share of metric weight available, mirroring PluginHealth.confidence. */
   confidence?: number;
+  /**
+   * Which scoring model produced `avg`. Readings from different models are not
+   * comparable and must never share a trend line: 1.0.0 reweighted everything
+   * and added hard caps, so plotting a 0.2.3 reading beside a 1.0.0 one draws a
+   * cliff the user did not cause. Absent on pre-1.0.0 entries.
+   */
+  model?: number;
 }
+
+/** Bumped whenever a change to scoring makes old `avg` values incomparable. */
+export const SCORING_MODEL = 2;
 
 /**
  * The scored fields of one community plugin, kept between sessions. Storing

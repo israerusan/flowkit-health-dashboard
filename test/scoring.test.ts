@@ -7,6 +7,7 @@ import {
   compareVersion,
   computeHealth,
   deriveMaintenanceStatus,
+  mergeRemoteCache,
   pickLatestVersion,
   rankerFromDistribution,
   releaseCount,
@@ -227,7 +228,8 @@ eq(
     b: { downloads: 20, updated: NOW, "2.0.0": 20 },
   };
   const list = { a: { repo: "own/a" } };
-  const cache = buildRemoteCache(stats, list, NOW);
+  const installed = new Set(["a", "b"]);
+  const cache = buildRemoteCache(stats, list, NOW, installed);
 
   eq("cache carries the repo from the list", cache.plugins.a.repo, "own/a");
   eq("cache records which feeds it had", cache.hadStats && cache.hadList, true);
@@ -237,13 +239,68 @@ eq(
   // In the stats feed but pulled from the list: Obsidian removed it.
   eq("in stats but not list is delisted", classifyListing("b", cache), "delisted");
   eq("in neither is local", classifyListing("c", cache), "local");
-  eq("no list at all is unknown", classifyListing("a", buildRemoteCache(stats, null, NOW)), "unknown");
+  eq(
+    "no list at all is unknown",
+    classifyListing("a", buildRemoteCache(stats, null, NOW, installed)),
+    "unknown"
+  );
+
+  // Only installed plugins are persisted — the directory has ~6,250 entries and
+  // the whole settings object is rewritten on every save.
+  {
+    const wide = { ...stats, zzz: { downloads: 999 } };
+    const slim = buildRemoteCache(wide, list, NOW, new Set(["a"]));
+    eq("uninstalled plugins are not stored", Object.keys(slim.plugins).join(","), "a");
+    eq("but they still count toward the distribution", slim.distribution.length, 3);
+  }
 
   // A cached scan must score the same as the live one it was built from.
   const revived = remoteFromCache(cache.plugins.a);
   eq("cache round-trips downloads", revived?.downloads, 10);
   eq("cache round-trips the update time", revived?.updated, NOW);
   eq("cache round-trips the latest version", pickLatestVersion(revived), "1.0.0");
+}
+
+// --- the cache must not distort the maturity signal -------------------------
+{
+  // computeAll always scores through the cache, so a round-trip that inflates
+  // the release count silently moves the maturity threshold for every user.
+  const live: Record<string, number | undefined> = { downloads: 100, updated: NOW };
+  for (let i = 0; i < 8; i++) live[`1.${i}.0`] = 5;
+  eq("live release count", releaseCount(live), 8);
+
+  const cached = buildRemoteCache({ p: live }, null, NOW, new Set(["p"]));
+  eq("cached release count", cached.plugins.p.releases, 8);
+  eq(
+    "round-tripped release count is unchanged",
+    releaseCount(remoteFromCache(cached.plugins.p)),
+    8
+  );
+}
+
+// --- a half-failed refresh must not discard the other half ------------------
+{
+  const installed = new Set(["a"]);
+  const full = buildRemoteCache(
+    { a: { downloads: 50, updated: NOW, "1.0.0": 50 } },
+    { a: { repo: "own/a" } },
+    NOW,
+    installed
+  );
+  // The community list 500s; only the stats feed answered this time.
+  const statsOnly = buildRemoteCache(
+    { a: { downloads: 60, updated: NOW, "1.1.0": 60 } },
+    null,
+    NOW + 1000,
+    installed
+  );
+  const merged = mergeRemoteCache(full, statsOnly);
+  eq("fresh stats win", merged.plugins.a.downloads, 60);
+  // Without the merge this became undefined: every GitHub link vanished, every
+  // delisted detection was lost, and hygiene dropped 25 points per plugin.
+  eq("the surviving repo is kept", merged.plugins.a.repo, "own/a");
+  eq("and the listing is still known", merged.hadList, true);
+  eq("listed survives a stats-only refresh", classifyListing("a", merged), "listed");
 }
 {
   // Delisted is a hard cap, not a chip: it outranks an otherwise perfect score.

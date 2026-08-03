@@ -5,6 +5,7 @@ import {
   buildRemoteCache,
   classifyListing,
   computeHealth,
+  mergeRemoteCache,
   rankerFromDistribution,
   remoteFromCache,
 } from "./scoring";
@@ -25,6 +26,7 @@ import type {
   PluginHealth,
   RemoteCache,
 } from "./types";
+import { SCORING_MODEL } from "./types";
 
 /** Obsidian's internal plugin registry — not in the public typings. */
 interface InternalPluginsApi {
@@ -123,7 +125,17 @@ export default class FlowKitHealthPlugin extends Plugin {
    */
   private async backgroundScan(): Promise<void> {
     try {
-      const { results, coverage } = await this.computeAll({ allowFetch: false });
+      // Monitoring is the one thing that legitimately needs the network without
+      // the user present: "this plugin was pulled from the directory" is a fact
+      // that exists only in the community list, so a pass that can't fetch can
+      // never report it. Gated on the user having explicitly switched
+      // monitoring on, and on enrichment being allowed at all; for everyone
+      // else this pass is purely local and works from whatever is cached.
+      const monitoring =
+        this.isPro &&
+        this.settings.backgroundMonitoring &&
+        this.settings.enableOnlineEnrichment;
+      const { results, coverage } = await this.computeAll({ allowFetch: monitoring });
       const active = results.filter((r) => !r.muted);
       const scored = active.map((r) => r.overall).filter((v): v is number => v != null);
       const avg = scored.length
@@ -142,6 +154,7 @@ export default class FlowKitHealthPlugin extends Plugin {
         updates: active.filter((r) => r.updateAvailable).length,
         online: coverage.stats,
         confidence,
+        model: SCORING_MODEL,
       });
 
       this.updateStatusBar(avg, active);
@@ -155,7 +168,7 @@ export default class FlowKitHealthPlugin extends Plugin {
   }
 
   /** A quiet, always-visible health readout that opens the dashboard. */
-  private updateStatusBar(avg: number | null, active: PluginHealth[]): void {
+  updateStatusBar(avg: number | null, active: PluginHealth[]): void {
     if (!this.statusBarEl) return;
     const urgent = active.filter(
       (r) => r.enabled && (r.metrics.compatibility.value === 0 || r.listing === "delisted")
@@ -182,17 +195,31 @@ export default class FlowKitHealthPlugin extends Plugin {
    */
   private async reportRegressions(active: PluginHealth[]): Promise<void> {
     const seen = new Set(this.settings.notified);
-    const fresh: string[] = [];
-    for (const r of active) {
-      if (!r.enabled) continue;
-      const bad =
-        r.metrics.compatibility.value === 0 ||
-        r.listing === "delisted" ||
-        r.maintenanceStatus === "unmaintained";
-      if (!bad) continue;
-      if (seen.has(r.id)) continue;
-      fresh.push(r.id);
+    // Everything currently in trouble, whether or not we've mentioned it.
+    const bad = active
+      .filter(
+        (r) =>
+          r.enabled &&
+          (r.metrics.compatibility.value === 0 ||
+            r.listing === "delisted" ||
+            r.maintenanceStatus === "unmaintained")
+      )
+      .map((r) => r.id);
+    const badSet = new Set(bad);
+    const fresh = bad.filter((id) => !seen.has(id));
+
+    // Remember exactly what is bad *now*, so a plugin the user fixed drops off
+    // the list and a genuine future regression is reported again. Doing this
+    // unconditionally — not only when something is fresh — is the point: the
+    // prune used to sit after an early return, and it compared against all
+    // installed ids rather than the failing ones, so an id was silently
+    // remembered forever and could never be reported a second time.
+    if (this.settings.notified.length !== badSet.size ||
+        this.settings.notified.some((id) => !badSet.has(id))) {
+      this.settings.notified = [...badSet];
+      await this.saveSettings();
     }
+
     if (!fresh.length) return;
 
     const names = active
@@ -206,12 +233,6 @@ export default class FlowKitHealthPlugin extends Plugin {
       } a look — ${names}${fresh.length > 3 ? ` +${fresh.length - 3} more` : ""}.`,
       8000
     );
-    // Only report each plugin once, and forget ones that recovered so a genuine
-    // future regression is reported again.
-    const stillBad = new Set([...seen, ...fresh]);
-    const currentIds = new Set(active.map((r) => r.id));
-    this.settings.notified = [...stillBad].filter((id) => currentIds.has(id));
-    await this.saveSettings();
   }
 
   async loadSettings(): Promise<void> {
@@ -223,6 +244,7 @@ export default class FlowKitHealthPlugin extends Plugin {
     // rather than defending at each call site.
     if (!Array.isArray(this.settings.ignored)) this.settings.ignored = [];
     if (!Array.isArray(this.settings.history)) this.settings.history = [];
+    if (!Array.isArray(this.settings.notified)) this.settings.notified = [];
   }
 
   async saveSettings(): Promise<void> {
@@ -333,7 +355,10 @@ export default class FlowKitHealthPlugin extends Plugin {
       cache = this.settings.cache;
       const stale = !cache || Date.now() - cache.at > CACHE_TTL_MS;
       if (allowFetch && (force || stale)) {
-        const fetched = await this.fetchRemoteCache(coverage);
+        const fetched = await this.fetchRemoteCache(
+          coverage,
+          new Set(manifests.map((m) => m.id))
+        );
         // Keep serving the previous projection when a refresh fails, rather
         // than dropping two of five columns because GitHub had a bad minute.
         if (fetched) cache = fetched;
@@ -377,7 +402,8 @@ export default class FlowKitHealthPlugin extends Plugin {
    * persist. Returns null when nothing usable came back.
    */
   private async fetchRemoteCache(
-    coverage: DataCoverage
+    coverage: DataCoverage,
+    installed: Set<string>
   ): Promise<RemoteCache | null> {
     const [statsRes, listRes] = await Promise.all([
       fetchRemoteStats(),
@@ -393,11 +419,15 @@ export default class FlowKitHealthPlugin extends Plugin {
     const built = buildRemoteCache(
       statsRes.ok ? statsRes.data : null,
       listRes.ok ? listRes.data : null,
-      Date.now()
+      Date.now(),
+      installed
     );
-    this.settings.cache = built;
+    // Merge rather than replace: when only one of the two feeds answered, the
+    // other half of what we already knew is still the best data we have.
+    const merged = mergeRemoteCache(this.settings.cache, built);
+    this.settings.cache = merged;
     await this.saveSettings();
-    return built;
+    return merged;
   }
 
   /**

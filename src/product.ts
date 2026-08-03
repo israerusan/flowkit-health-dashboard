@@ -30,7 +30,7 @@ export const PRO_FEATURES: string[] = [
   "Bulk fixes in one click — review exactly what will change, apply it, undo if you disagree",
   "Background monitoring — get told when a plugin turns incompatible, goes stale, or is pulled from the directory",
   "Unlimited reports — Markdown and CSV, as a document you can hand to someone",
-  "Full history — 90 days of vault health, per-metric trends, and exportable data",
+  "90 days of vault-health history, instead of the last 30",
 ];
 
 /** One-line pitch, reused across upsell surfaces. */
