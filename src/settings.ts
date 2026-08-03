@@ -1,6 +1,6 @@
-import { App, PluginSettingTab, Setting } from "obsidian";
+import { App, Notice, PluginSettingTab, Setting } from "obsidian";
 import type FlowKitHealthPlugin from "./main";
-import type { HealthSnapshot, RemoteCache } from "./types";
+import type { HealthSnapshot, PluginErrorRecord, RemoteCache } from "./types";
 import {
   PRODUCT_NAME,
   PRO_FEATURES,
@@ -37,6 +37,14 @@ export interface FlowKitHealthSettings {
   backgroundMonitoring: boolean;
   /** Ids already reported by monitoring, so the same news isn't repeated. */
   notified: string[];
+  /** Watch for runtime errors and attribute them to the plugin that threw. */
+  trackErrors: boolean;
+  /** Also capture errors plugins catch and log themselves. */
+  trackConsoleErrors: boolean;
+  /** When error watching started, so "no errors" only counts once it means something. */
+  watchingSince: number | null;
+  /** Errors observed, keyed by plugin id. Local only; never transmitted. */
+  errorLog: Record<string, PluginErrorRecord>;
 }
 
 export const DEFAULT_SETTINGS: FlowKitHealthSettings = {
@@ -51,6 +59,10 @@ export const DEFAULT_SETTINGS: FlowKitHealthSettings = {
   usedFreeExport: false,
   backgroundMonitoring: true,
   notified: [],
+  trackErrors: true,
+  trackConsoleErrors: true,
+  watchingSince: null,
+  errorLog: {},
 };
 
 export class FlowKitHealthSettingTab extends PluginSettingTab {
@@ -116,6 +128,62 @@ export class FlowKitHealthSettingTab extends PluginSettingTab {
           .onChange(async (value) => {
             this.plugin.settings.autoRefreshOnOpen = value;
             await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl).setName("Error tracking").setHeading();
+
+    const tracked = Object.keys(this.plugin.settings.errorLog).length;
+    new Setting(containerEl)
+      .setName("Watch for plugin errors")
+      .setDesc(
+        "Attribute runtime errors to the plugin that threw them. Everything " +
+          "stays on this device — error messages and stack traces are never sent anywhere."
+      )
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.trackErrors).onChange(async (value) => {
+          this.plugin.settings.trackErrors = value;
+          if (value && this.plugin.settings.watchingSince == null) {
+            this.plugin.settings.watchingSince = Date.now();
+          }
+          await this.plugin.saveSettings();
+          new Notice("Reload Obsidian for this to take effect.");
+          this.display();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("Include errors plugins log themselves")
+      .setDesc(
+        "Most plugins catch their errors and write them to the console instead " +
+          "of letting them surface. These are shown for context but never counted " +
+          "against a plugin's score — reporting a failure honestly shouldn't cost points."
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.trackConsoleErrors)
+          .setDisabled(!this.plugin.settings.trackErrors)
+          .onChange(async (value) => {
+            this.plugin.settings.trackConsoleErrors = value;
+            await this.plugin.saveSettings();
+            new Notice("Reload Obsidian for this to take effect.");
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Recorded errors")
+      .setDesc(
+        tracked
+          ? `Errors recorded for ${tracked} plugin(s). Clearing also restarts the observation window.`
+          : "Nothing recorded yet."
+      )
+      .addButton((btn) =>
+        btn
+          .setButtonText("Clear")
+          .setDisabled(tracked === 0)
+          .onClick(async () => {
+            await this.plugin.clearErrorLog();
+            this.display();
           })
       );
 

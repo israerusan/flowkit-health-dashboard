@@ -27,8 +27,9 @@ export const SUPPORT_EMAIL = "iavila01@gmail.com";
  * and being told when something changes.
  */
 export const PRO_FEATURES: string[] = [
+  "Full stack traces for every error — see exactly where a plugin broke, and file a bug report worth reading",
   "Bulk fixes in one click — review exactly what will change, apply it, undo if you disagree",
-  "Background monitoring — get told when a plugin turns incompatible, goes stale, or is pulled from the directory",
+  "Background monitoring — get told when a plugin starts erroring, turns incompatible, or is pulled from the directory",
   "Unlimited reports — Markdown and CSV, as a document you can hand to someone",
   "90 days of vault-health history, instead of the last 30",
 ];
@@ -38,6 +39,7 @@ export const PRO_TAGLINE = `${PRO_PRICE}, no subscription, no account. Verified 
 
 /** Contextual upsell copy, keyed by the feature the user reached for. */
 export const PRO_UPSELL: Record<string, string> = {
+  errors: "Stack traces are a Pro feature — FlowKit already knows which plugin threw, Pro shows you where.",
   bulk: "Applying fixes in one click is a Pro feature.",
   export: "Unlimited report export is a Pro feature.",
   history: "The full 90-day history is a Pro feature.",

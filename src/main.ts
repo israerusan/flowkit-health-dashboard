@@ -14,6 +14,8 @@ import {
   fetchCommunityList,
   fetchRemoteStats,
 } from "./dataSources";
+import { ErrorWatcher } from "./errorWatcher";
+import { pruneErrorLog } from "./errors";
 import { LicenseManager } from "./license/LicenseManager";
 import {
   DEFAULT_SETTINGS,
@@ -77,6 +79,9 @@ export default class FlowKitHealthPlugin extends Plugin {
   /** Always-visible health readout in the status bar. */
   private statusBarEl: HTMLElement | null = null;
 
+  /** Attributes runtime errors to the plugin that threw them. */
+  private errorWatcher: ErrorWatcher | null = null;
+
   async onload(): Promise<void> {
     await this.loadSettings();
     this.refreshLicense();
@@ -98,6 +103,21 @@ export default class FlowKitHealthPlugin extends Plugin {
 
     this.addSettingTab(new FlowKitHealthSettingTab(this.app, this));
 
+    if (this.settings.trackErrors) {
+      if (this.settings.watchingSince == null) {
+        this.settings.watchingSince = Date.now();
+        await this.saveSettings();
+      }
+      this.errorWatcher = new ErrorWatcher(this, {
+        installedIds: () => new Set(Object.keys(this.pluginsApi().manifests ?? {})),
+        log: () => this.settings.errorLog,
+        onChange: () => {
+          void this.saveSettings().then(() => this.refreshViews());
+        },
+      });
+      this.errorWatcher.start(this.settings.trackConsoleErrors);
+    }
+
     this.statusBarEl = this.addStatusBarItem();
     this.statusBarEl.addClass("flowkit-status-item");
     this.statusBarEl.addEventListener("click", () => void this.activateView());
@@ -115,7 +135,10 @@ export default class FlowKitHealthPlugin extends Plugin {
   }
 
   onunload(): void {
-    // Leaves of our view type are detached automatically by Obsidian.
+    // Leaves of our view type are detached automatically by Obsidian, and the
+    // error listeners went through registerDomEvent — but console.error was
+    // monkey-patched, so that one has to be put back by hand.
+    this.errorWatcher?.stop();
   }
 
   /**
@@ -171,7 +194,11 @@ export default class FlowKitHealthPlugin extends Plugin {
   updateStatusBar(avg: number | null, active: PluginHealth[]): void {
     if (!this.statusBarEl) return;
     const urgent = active.filter(
-      (r) => r.enabled && (r.metrics.compatibility.value === 0 || r.listing === "delisted")
+      (r) =>
+        r.enabled &&
+        (r.metrics.compatibility.value === 0 ||
+          r.listing === "delisted" ||
+          (r.errors?.uncaught ?? 0) > 0)
     ).length;
     this.statusBarEl.empty();
     this.statusBarEl.toggleClass("is-alert", urgent > 0);
@@ -202,6 +229,7 @@ export default class FlowKitHealthPlugin extends Plugin {
           r.enabled &&
           (r.metrics.compatibility.value === 0 ||
             r.listing === "delisted" ||
+            (r.errors?.uncaught ?? 0) > 0 ||
             r.maintenanceStatus === "unmaintained")
       )
       .map((r) => r.id);
@@ -245,6 +273,9 @@ export default class FlowKitHealthPlugin extends Plugin {
     if (!Array.isArray(this.settings.ignored)) this.settings.ignored = [];
     if (!Array.isArray(this.settings.history)) this.settings.history = [];
     if (!Array.isArray(this.settings.notified)) this.settings.notified = [];
+    if (!this.settings.errorLog || typeof this.settings.errorLog !== "object") {
+      this.settings.errorLog = {};
+    }
   }
 
   async saveSettings(): Promise<void> {
@@ -370,6 +401,14 @@ export default class FlowKitHealthPlugin extends Plugin {
     const now = Date.now();
     const ignored = new Set(this.settings.ignored);
     const rank = rankerFromDistribution(cache?.distribution);
+    // Uninstalling a plugin should also drop its error history, rather than
+    // leaving it to accumulate in data.json indefinitely.
+    const installedIds = new Set(manifests.map((m) => m.id));
+    const pruned = pruneErrorLog(this.settings.errorLog, installedIds);
+    if (Object.keys(pruned).length !== Object.keys(this.settings.errorLog).length) {
+      this.settings.errorLog = pruned;
+      await this.saveSettings();
+    }
     const results: PluginHealth[] = [];
     for (const manifest of manifests) {
       const enabled = enabledSet.has(manifest.id);
@@ -388,6 +427,8 @@ export default class FlowKitHealthPlugin extends Plugin {
             bundleBytes: await this.measureBundle(manifest),
             downloadPercentile: rank(cached?.downloads),
             listing: classifyListing(manifest.id, cache),
+            errors: this.settings.errorLog[manifest.id],
+            observedMs: this.observedMs(),
             muted: ignored.has(manifest.id),
           },
           now
@@ -455,6 +496,20 @@ export default class FlowKitHealthPlugin extends Plugin {
       }
     }
     return sawAny ? total : undefined;
+  }
+
+  /** How long error watching has been running, or 0 when it's off. */
+  observedMs(): number {
+    if (!this.settings.trackErrors || this.settings.watchingSince == null) return 0;
+    return Math.max(0, Date.now() - this.settings.watchingSince);
+  }
+
+  /** Forget everything observed so far and start the clock again. */
+  async clearErrorLog(): Promise<void> {
+    this.settings.errorLog = {};
+    this.settings.watchingSince = this.settings.trackErrors ? Date.now() : null;
+    await this.saveSettings();
+    this.refreshViews(true);
   }
 
   /** Whether Obsidian currently has this plugin enabled. */

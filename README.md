@@ -21,11 +21,12 @@ keeping a record, and being told when something changes.
 
 | Metric | What it measures | Weight | Source |
 |---|---|---:|---|
-| **Compatibility** | `minAppVersion` vs. your Obsidian version; desktop-only on mobile | 30% | Measured (local) |
-| **Maintenance** | How recently it was released, allowing for plugins that are simply finished | 30% | Measured (online) |
-| **Footprint** | Code and styles the plugin loads at startup, read from disk | 20% | Measured (local) |
-| **Manifest hygiene** | What the plugin's manifest declares | 10% | Measured (local) |
-| **Popularity** | Download rank within the directory — context, not health | 10% | Measured (online) |
+| **Compatibility** | `minAppVersion` vs. your Obsidian version; desktop-only on mobile | 25% | Measured (local) |
+| **Reliability** | Errors the plugin actually threw, on your machine | 25% | Measured (local) |
+| **Maintenance** | How recently it was released, allowing for plugins that are simply finished | 25% | Measured (online) |
+| **Footprint** | Code and styles the plugin loads at startup, read from disk | 15% | Measured (local) |
+| **Manifest hygiene** | What the plugin's manifest declares | 5% | Measured (local) |
+| **Popularity** | Download rank within the directory — context, not health | 5% | Measured (online) |
 
 **Overall** is a weighted blend of those five, renormalised over whatever data
 is actually available, and shown alongside a **confidence** figure so a score
@@ -40,6 +41,27 @@ quantities worth averaging:
 
 A missing signal can never raise a score. Select any row in the dashboard to
 see each metric's value, weight, and the evidence behind it.
+
+### Reliability — errors, traced back to the plugin that threw them
+
+When something in Obsidian throws, FlowKit reads the stack trace, works out
+which plugin the failing code belongs to, and records it. Over time that turns
+"Obsidian's been weird lately" into "Templater has thrown 40 errors this week,
+here's the one that keeps repeating."
+
+- **Uncaught exceptions and unhandled rejections** are what the score is built
+  from.
+- **Errors a plugin catches and logs itself** are recorded and shown for
+  context, but deliberately *never* counted against its score — a plugin that
+  reports its failures honestly shouldn't rank below one that swallows them.
+- Reliability reads **unavailable** until FlowKit has been watching for a few
+  hours. A plugin that hasn't thrown in ninety seconds isn't thereby reliable.
+- Errors that can't be traced to a specific installed plugin are **discarded**,
+  not guessed at.
+
+All of it stays on your machine. Error messages and stack traces can quote file
+paths and note titles, so they are never transmitted anywhere, and you can turn
+the whole thing off or clear the log in settings.
 
 ### Maintained or not
 
@@ -90,6 +112,7 @@ The whole diagnosis is free. Pro is for *acting* on it.
 ### Free
 
 - The **complete ranked "What to fix" list** — every finding, not a teaser
+- **Which plugins are throwing errors**, how many, how often, and the messages
 - The full **five-metric scorecard**, weighted overall, and confidence figure
 - **Select any row** to see why it scored what it did: each metric's value,
   weight, and evidence
@@ -103,6 +126,8 @@ The whole diagnosis is free. Pro is for *acting* on it.
 
 ### Pro ($9 one-time)
 
+- **Full stack traces** for every recorded error — see exactly where a plugin
+  broke, and file a bug report the author can act on
 - **Bulk fixes in one click** — review exactly which plugins will change and
   why, apply it together, and **undo** if you disagree
 - **Background monitoring** — get told when a plugin turns incompatible, goes

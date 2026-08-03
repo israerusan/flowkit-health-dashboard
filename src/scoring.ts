@@ -1,9 +1,15 @@
 import { apiVersion } from "obsidian";
 import type { PluginManifest } from "obsidian";
+import {
+  errorRatePerDay,
+  MIN_OBSERVATION_MS,
+  reliabilityScore,
+} from "./errors";
 import type {
   CachedPlugin,
   MaintenanceStatus,
   MetricScore,
+  PluginErrorRecord,
   PluginHealth,
   RemoteCache,
   RemotePluginStat,
@@ -56,11 +62,17 @@ export function compareVersion(a: string, b: string): number {
  * coverage is reported to the user as a confidence figure.
  */
 export const WEIGHTS = {
-  compatibility: 0.3,
-  maintenance: 0.3,
-  footprint: 0.2,
-  hygiene: 0.1,
-  popularity: 0.1,
+  compatibility: 0.25,
+  /**
+   * Errors this plugin actually threw on this machine. Weighted alongside
+   * compatibility and maintenance because it is the only signal here that
+   * observes the plugin *running* rather than describing it.
+   */
+  reliability: 0.25,
+  maintenance: 0.25,
+  footprint: 0.15,
+  hygiene: 0.05,
+  popularity: 0.05,
 } as const;
 
 export type MetricKey = keyof typeof WEIGHTS;
@@ -90,6 +102,10 @@ export interface ScoreInput {
   downloadPercentile?: number;
   /** Where the plugin sits relative to the community directory. */
   listing?: ListingStatus;
+  /** Runtime errors attributed to this plugin, when any have been seen. */
+  errors?: PluginErrorRecord;
+  /** How long FlowKit has been watching for errors, in ms. */
+  observedMs?: number;
   /** User has muted this plugin. */
   muted?: boolean;
 }
@@ -266,6 +282,55 @@ export function deriveMaintenanceStatus(
   if (ageDays <= 180) return "maintained";
   if (ageDays <= 540) return "aging";
   return isMatureStable(remote) ? "stable" : "unmaintained";
+}
+
+/**
+ * Reliability — MEASURED, and the only metric that watches the plugin run.
+ *
+ * Reports itself unavailable until FlowKit has been watching long enough for
+ * silence to mean something: a plugin that hasn't thrown in ninety seconds is
+ * not thereby reliable, and a fabricated 100 would be exactly the kind of
+ * confident-looking nonsense the rest of this rework removed.
+ */
+function scoreReliability(i: ScoreInput): MetricScore {
+  const observed = i.observedMs ?? 0;
+  if (observed < MIN_OBSERVATION_MS) {
+    return UNAVAILABLE(
+      "FlowKit hasn't been watching long enough to judge this yet."
+    );
+  }
+  const record = i.errors;
+  const rate = errorRatePerDay(record, observed);
+  const value = reliabilityScore(rate);
+
+  if (!record || record.uncaught === 0) {
+    const logged = record?.logged ?? 0;
+    return {
+      value,
+      source: "measured",
+      detail: logged
+        ? `No unhandled errors. It logged ${logged} error${logged === 1 ? "" : "s"} itself, which it appears to be handling.`
+        : "No errors observed while FlowKit has been watching.",
+    };
+  }
+
+  const per = rate >= 1 ? `about ${Math.round(rate)} a day` : "occasionally";
+  return {
+    value,
+    source: "measured",
+    detail: `${record.uncaught} unhandled error${
+      record.uncaught === 1 ? "" : "s"
+    } — ${per}. Last seen ${describeAge(Date.now() - record.lastAt)}.`,
+  };
+}
+
+/** Rough age phrasing for error recency. */
+function describeAge(ms: number): string {
+  const hours = ms / 3_600_000;
+  if (hours < 1) return "in the last hour";
+  if (hours < 24) return `${Math.round(hours)} hours ago`;
+  const days = Math.round(hours / 24);
+  return days === 1 ? "yesterday" : `${days} days ago`;
 }
 
 /** Human-readable byte size for the footprint tooltip. */
@@ -547,8 +612,16 @@ export function computeHealth(i: ScoreInput, now: number): PluginHealth {
   const maintenance = scoreMaintenance(i, now);
   const footprint = scoreFootprint(i);
   const hygiene = scoreHygiene(i);
+  const reliability = scoreReliability(i);
 
-  const metrics = { compatibility, maintenance, footprint, hygiene, popularity };
+  const metrics = {
+    compatibility,
+    reliability,
+    maintenance,
+    footprint,
+    hygiene,
+    popularity,
+  };
 
   // Weighted mean, renormalised over whatever is actually available. The
   // available weight doubles as the confidence figure shown to the user.
@@ -560,6 +633,10 @@ export function computeHealth(i: ScoreInput, now: number): PluginHealth {
     weighted += value * WEIGHTS[key];
     coverage += WEIGHTS[key];
   }
+
+  // Summing six fractional weights leaves float noise (0.7500000000000001),
+  // which would show up in the displayed confidence percentage.
+  coverage = Math.round(coverage * 10_000) / 10_000;
 
   let overall: number | null = coverage > 0 ? Math.round(weighted / coverage) : null;
 
@@ -603,5 +680,6 @@ export function computeHealth(i: ScoreInput, now: number): PluginHealth {
     overall,
     confidence: coverage,
     metrics,
+    errors: i.errors,
   };
 }

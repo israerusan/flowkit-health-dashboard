@@ -81,6 +81,23 @@ export function buildInsights(results: PluginHealth[]): Insight[] {
     });
   }
 
+  // Ranked high because it is the only finding here derived from watching the
+  // plugin actually run, and the only one the user has probably already felt.
+  const erroring = live
+    .filter((r) => r.enabled && (r.errors?.uncaught ?? 0) > 0)
+    .sort((a, b) => (b.errors?.uncaught ?? 0) - (a.errors?.uncaught ?? 0));
+  if (erroring.length) {
+    const total = erroring.reduce((n, r) => n + (r.errors?.uncaught ?? 0), 0);
+    insights.push({
+      id: "erroring",
+      tone: "bad",
+      icon: "bug",
+      title: `${erroring.length} plugin${erroring.length > 1 ? "s are" : " is"} throwing errors`,
+      detail: `${total} unhandled error${total === 1 ? "" : "s"} traced back to ${names(erroring)}. This is happening in your vault right now.`,
+      ids: erroring.map((r) => r.id),
+    });
+  }
+
   const incompatible = live.filter((r) => r.enabled && isIncompatible(r));
   if (incompatible.length) {
     insights.push({

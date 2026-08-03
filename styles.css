@@ -684,6 +684,89 @@
   margin-top: 10px;
 }
 
+/* Errors in the detail panel ---------------------------------------------- */
+.flowkit-detail-errors {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--background-modifier-border);
+}
+.flowkit-detail-errors-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.82em;
+  color: var(--text-muted);
+  margin-bottom: 8px;
+}
+.flowkit-detail-errors-icon {
+  display: inline-flex;
+  color: var(--color-red, #c62828);
+}
+.flowkit-error-item {
+  margin-bottom: 8px;
+}
+.flowkit-error-line {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 0.84em;
+}
+.flowkit-error-kind {
+  flex: 0 0 auto;
+  font-size: 0.85em;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  padding: 1px 5px;
+  border-radius: 4px;
+  border: 1px solid currentColor;
+  color: var(--color-red, #c62828);
+}
+.flowkit-error-kind.is-console {
+  color: var(--text-muted);
+}
+.flowkit-error-message {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: var(--font-monospace);
+  word-break: break-word;
+}
+.flowkit-error-count {
+  flex: 0 0 auto;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+.flowkit-error-stack summary {
+  cursor: pointer;
+  font-size: 0.8em;
+  color: var(--text-muted);
+  margin: 2px 0 0 4px;
+}
+.flowkit-error-stack pre {
+  max-height: 220px;
+  overflow: auto;
+  font-size: 0.78em;
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  padding: 8px;
+  margin: 4px 0 0;
+}
+.flowkit-error-locked {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin: 2px 0 0 4px;
+}
+.flowkit-error-locked button {
+  font-size: 0.78em;
+  padding: 2px 8px;
+  box-shadow: none;
+  background: transparent;
+  color: var(--text-accent, var(--interactive-accent));
+  cursor: pointer;
+}
+
 /* Clickable insight cards. */
 .flowkit-insight.is-clickable {
   cursor: pointer;

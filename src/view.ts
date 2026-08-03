@@ -31,6 +31,7 @@ type FilterKey =
   | "attention"
   | "unmaintained"
   | "incompatible"
+  | "erroring"
   | "delisted"
   | "sideloaded"
   | "update"
@@ -44,24 +45,29 @@ const METRIC_COLUMNS: Array<{ key: MetricKey; label: string; hint: string }> = [
     hint: "Whether it can run on your Obsidian, on this device. Weighted 30%.",
   },
   {
+    key: "reliability",
+    label: "Reliability",
+    hint: "Errors this plugin actually threw on this machine. Weighted 25%.",
+  },
+  {
     key: "maintenance",
     label: "Maintenance",
-    hint: "How recently it was released, allowing for plugins that are simply finished. Weighted 30%.",
+    hint: "How recently it was released, allowing for plugins that are simply finished. Weighted 25%.",
   },
   {
     key: "footprint",
     label: "Footprint",
-    hint: "Code and styles loaded at startup, measured on disk. Weighted 20%.",
+    hint: "Code and styles loaded at startup, measured on disk. Weighted 15%.",
   },
   {
     key: "hygiene",
     label: "Hygiene",
-    hint: "What the plugin's manifest declares. Weighted 10%.",
+    hint: "What the plugin's manifest declares. Weighted 5%.",
   },
   {
     key: "popularity",
     label: "Popularity",
-    hint: "Download rank within the directory — context, not health. Weighted 10%.",
+    hint: "Download rank within the directory — context, not health. Weighted 5%.",
   },
 ];
 
@@ -70,6 +76,7 @@ const FILTERS: Array<{ key: FilterKey; label: string }> = [
   { key: "attention", label: "Needs attention" },
   { key: "unmaintained", label: "No recent release" },
   { key: "incompatible", label: "Incompatible" },
+  { key: "erroring", label: "Throwing errors" },
   { key: "delisted", label: "Delisted" },
   { key: "sideloaded", label: "Local installs" },
   { key: "update", label: "Update available" },
@@ -295,6 +302,8 @@ export class HealthDashboardView extends ItemView {
           return r.maintenanceStatus === "unmaintained";
         case "incompatible":
           return isIncompatible(r);
+        case "erroring":
+          return (r.errors?.uncaught ?? 0) > 0;
         case "delisted":
           return r.listing === "delisted";
         case "sideloaded":
@@ -730,6 +739,8 @@ export class HealthDashboardView extends ItemView {
         return "delisted";
       case "incompatible":
         return "incompatible";
+      case "erroring":
+        return "erroring";
       case "unmaintained":
         return "unmaintained";
       case "at-risk":
@@ -822,6 +833,52 @@ export class HealthDashboardView extends ItemView {
         : `Mute ${rows.length}`,
       onConfirm: () => void this.applyBulk(action, rows.map((r) => r.id)),
     }).open();
+  }
+
+  /**
+   * The errors traced to one plugin.
+   *
+   * Free sees the diagnosis — which errors, how many, how recently — because
+   * that is the whole point of the feature and matches how the rest of the tier
+   * split works. Pro gets the stack traces, which is what you need to file a
+   * useful bug report or decide whether it's your setup or their code.
+   */
+  private renderErrorDetail(panel: HTMLElement, r: PluginHealth): void {
+    const rec = r.errors;
+    if (!rec || !rec.signatures.length) return;
+
+    const box = panel.createDiv({ cls: "flowkit-detail-errors" });
+    const head = box.createDiv({ cls: "flowkit-detail-errors-head" });
+    setIcon(head.createSpan({ cls: "flowkit-detail-errors-icon" }), "bug");
+    head.createSpan({
+      text: `${rec.uncaught} unhandled${rec.logged ? `, ${rec.logged} logged` : ""} — most recent first`,
+    });
+
+    const shown = [...rec.signatures].sort((a, b) => b.lastAt - a.lastAt).slice(0, 5);
+    for (const sig of shown) {
+      const item = box.createDiv({ cls: "flowkit-error-item" });
+      const line = item.createDiv({ cls: "flowkit-error-line" });
+      line.createSpan({
+        cls: `flowkit-error-kind is-${sig.kind}`,
+        text: sig.kind === "console" ? "logged" : sig.kind,
+      });
+      line.createSpan({ cls: "flowkit-error-message", text: sig.message });
+      if (sig.count > 1) {
+        line.createSpan({ cls: "flowkit-error-count", text: `×${sig.count}` });
+      }
+
+      if (!sig.stack) continue;
+      if (this.plugin.isPro) {
+        const details = item.createEl("details", { cls: "flowkit-error-stack" });
+        details.createEl("summary", { text: "Stack trace" });
+        details.createEl("pre").createEl("code", { text: sig.stack });
+      } else {
+        const locked = item.createDiv({ cls: "flowkit-error-locked" });
+        setIcon(locked.createSpan({ cls: "flowkit-lock-icon" }), "lock");
+        const btn = locked.createEl("button", { text: "See the stack trace with Pro" });
+        btn.onclick = () => this.openUpgrade("errors");
+      }
+    }
   }
 
   /** The evidence for one row appearing in a bulk list. */
@@ -1107,6 +1164,8 @@ export class HealthDashboardView extends ItemView {
       row.createSpan({ cls: "flowkit-detail-metric-detail", text: m.detail });
     }
 
+    this.renderErrorDetail(panel, r);
+
     const facts = panel.createDiv({ cls: "flowkit-detail-facts" });
     facts.createDiv({
       text: `Installed v${r.version}${
@@ -1202,6 +1261,15 @@ export class HealthDashboardView extends ItemView {
         "Update",
         "warn",
         `Newer version available${r.latestVersion ? ` (v${r.latestVersion})` : ""}.`
+      );
+    }
+    const errs = r.errors?.uncaught ?? 0;
+    if (errs > 0) {
+      this.badge(
+        nameRow,
+        `${errs} error${errs === 1 ? "" : "s"}`,
+        "bad",
+        "Unhandled errors traced to this plugin while FlowKit has been watching."
       );
     }
     if (r.listing === "delisted") {
@@ -1332,8 +1400,9 @@ export class HealthDashboardView extends ItemView {
     legend.createEl("strong", { text: "How to read this: " });
     legend.createSpan({
       text:
-        "Scores are 0–100. Overall is a weighted blend — Compatibility 30%, " +
-        "Maintenance 30%, Footprint 20%, Hygiene 10%, Popularity 10% — " +
+        "Scores are 0–100. Overall is a weighted blend — Compatibility 25%, " +
+        "Reliability 25%, Maintenance 25%, Footprint 15%, Hygiene 5%, " +
+        "Popularity 5% — " +
         "renormalised over whatever data is actually available, with the " +
         "confidence figure above showing how much that was. A plugin that " +
         "can't load is capped at 20 regardless of its other scores, and one " +
@@ -1346,7 +1415,9 @@ export class HealthDashboardView extends ItemView {
   // --- upgrade + export -----------------------------------------------------
 
   /** The one way to reach the upgrade path, from anywhere in the view. */
-  private openUpgrade(feature?: "bulk" | "export" | "history" | "monitoring"): void {
+  private openUpgrade(
+    feature?: "bulk" | "export" | "history" | "monitoring" | "errors"
+  ): void {
     const insights = buildInsights(this.results);
     const affected = new Set(
       insights.filter((i) => i.action && i.ids.length).flatMap((i) => i.ids)
@@ -1489,28 +1560,28 @@ export class HealthDashboardView extends ItemView {
     lines.push("## Scorecard");
     lines.push("");
     lines.push(
-      "| Plugin | Version | Status | Overall | Compatibility | Maintenance | Footprint | Hygiene | Popularity |"
+      "| Plugin | Version | Status | Overall | Compatibility | Reliability | Maintenance | Footprint | Hygiene | Popularity |"
     );
-    lines.push("| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |");
+    lines.push("| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
     for (const r of rows) {
       const m = r.metrics;
       const flags = this.flagText(r);
       lines.push(
         `| ${md(r.name)} | ${md(r.version)} | ${md(flags)} | ${cell(r.overall)} | ${cell(
           m.compatibility.value
-        )} | ${cell(m.maintenance.value)} | ${cell(m.footprint.value)} | ${cell(
-          m.hygiene.value
-        )} | ${cell(m.popularity.value)} |`
+        )} | ${cell(m.reliability.value)} | ${cell(m.maintenance.value)} | ${cell(
+          m.footprint.value
+        )} | ${cell(m.hygiene.value)} | ${cell(m.popularity.value)} |`
       );
     }
     lines.push("");
     lines.push("---");
     lines.push("");
     lines.push(
-      "Overall is a weighted blend — Compatibility 30%, Maintenance 30%, " +
-        "Footprint 20%, Hygiene 10%, Popularity 10% — renormalised over the " +
-        "signals available. A plugin that can't load is capped at 20; one " +
-        "removed from the community directory at 30."
+      "Overall is a weighted blend — Compatibility 25%, Reliability 25%, " +
+        "Maintenance 25%, Footprint 15%, Hygiene 5%, Popularity 5% — " +
+        "renormalised over the signals available. A plugin that can't load is " +
+        "capped at 20; one removed from the community directory at 30."
     );
     lines.push("");
     lines.push(
@@ -1535,6 +1606,8 @@ export class HealthDashboardView extends ItemView {
       "Overall",
       "Confidence",
       "Compatibility",
+      "Reliability",
+      "Errors",
       "Maintenance",
       "Footprint",
       "Hygiene",
@@ -1554,6 +1627,8 @@ export class HealthDashboardView extends ItemView {
           num(r.overall),
           `${Math.round(r.confidence * 100)}%`,
           num(m.compatibility.value),
+          num(m.reliability.value),
+          String(r.errors?.uncaught ?? 0),
           num(m.maintenance.value),
           num(m.footprint.value),
           num(m.hygiene.value),

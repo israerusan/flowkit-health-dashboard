@@ -78,7 +78,10 @@ export interface PluginHealth {
     footprint: MetricScore;
     popularity: MetricScore;
     compatibility: MetricScore;
+    reliability: MetricScore;
   };
+  /** Errors attributed to this plugin, when any have been observed. */
+  errors?: PluginErrorRecord;
 }
 
 /**
@@ -146,7 +149,38 @@ export interface HealthSnapshot {
 }
 
 /** Bumped whenever a change to scoring makes old `avg` values incomparable. */
-export const SCORING_MODEL = 2;
+export const SCORING_MODEL = 3;
+
+/**
+ * Where an error came from.
+ * - `uncaught` — an exception nobody handled.
+ * - `rejection` — a promise rejection nobody handled.
+ * - `console`   — the plugin caught it and logged it itself. Counted and shown,
+ *                 but deliberately excluded from the reliability score.
+ */
+export type ErrorKind = "uncaught" | "rejection" | "console";
+
+/** One distinct error, with how often it has recurred. */
+export interface ErrorSignature {
+  key: string;
+  kind: ErrorKind;
+  message: string;
+  stack?: string;
+  count: number;
+  firstAt: number;
+  lastAt: number;
+}
+
+/** Everything observed about one plugin's runtime failures. */
+export interface PluginErrorRecord {
+  /** Uncaught exceptions + unhandled rejections. This is what gets scored. */
+  uncaught: number;
+  /** console.error calls attributed to this plugin. Context only. */
+  logged: number;
+  firstAt: number;
+  lastAt: number;
+  signatures: ErrorSignature[];
+}
 
 /**
  * The scored fields of one community plugin, kept between sessions. Storing

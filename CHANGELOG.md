@@ -3,6 +3,39 @@
 All notable changes to FlowKit Plugin Health Dashboard are documented here. This
 project follows [Semantic Versioning](https://semver.org/).
 
+## [1.1.0] - 2026-08-03
+
+### Errors, traced back to the plugin that caused them
+
+FlowKit now watches for runtime errors and works out which plugin they came
+from, by reading the stack trace. "Obsidian's been weird lately" becomes
+"Templater threw 40 errors this week, and here's the one that keeps repeating."
+
+- **New Reliability metric**, weighted 25% — the only score here derived from
+  watching a plugin actually run rather than reading its metadata.
+- **Errors a plugin catches and logs itself are shown but never scored.** A
+  plugin that reports its failures honestly shouldn't rank below one that
+  swallows them.
+- **Reliability stays blank until FlowKit has watched for a few hours.** A
+  plugin that hasn't thrown in ninety seconds isn't thereby reliable.
+- Errors that can't be traced to a specific installed plugin are discarded
+  rather than blamed on something.
+- New "Throwing errors" filter, a row badge with the count, and the messages in
+  each plugin's detail panel.
+- **Pro** adds the full stack traces, and background monitoring now also tells
+  you when a plugin *starts* erroring.
+
+Everything stays on your machine. Stack traces can quote file paths and note
+titles, so nothing is ever transmitted; you can turn the watcher off or clear
+the log in settings.
+
+### Changed
+
+- Weights are now Compatibility 25%, Reliability 25%, Maintenance 25%,
+  Footprint 15%, Hygiene 5%, Popularity 5%. Because that changes what a score
+  means, trend history from 1.0.0 is kept but starts a fresh line — the same
+  guard added in 1.0.0.
+
 ## [1.0.0] - 2026-08-03
 
 The scoring model is rebuilt, the free tier now includes the complete

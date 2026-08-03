@@ -14,6 +14,15 @@ import {
   remoteFromCache,
   type ScoreInput,
 } from "../src/scoring";
+import {
+  attributeStack,
+  errorRatePerDay,
+  errorSignature,
+  MIN_OBSERVATION_MS,
+  pruneErrorLog,
+  recordError,
+  reliabilityScore,
+} from "../src/errors";
 import nacl from "tweetnacl";
 import { verifyLicense } from "../src/shared/verifyLicense.mjs";
 import { buildInsights } from "../src/insights";
@@ -55,6 +64,8 @@ function input(overrides: Partial<ScoreInput>): ScoreInput {
     enabled: true,
     isMobile: false,
     bundleBytes: 50_000, // the footprint anchor: scores exactly 100
+    // Long enough that "no errors seen" is a real reading rather than a shrug.
+    observedMs: MIN_OBSERVATION_MS,
     ...overrides,
   };
 }
@@ -342,9 +353,11 @@ eq(
   // because the condemning metric left the denominator: it is capped at what a
   // neutral maintenance reading would earn, and confidence says how thin the
   // evidence is. (Previously: 100 offline, presented with a grade and no caveat.)
+  // Offline, the four local metrics all read 100, so the raw blend would be a
+  // flat 100. The neutral-maintenance cap pulls it to (70 + 12.5) / 0.95 ≈ 87.
   check(
     "a missing signal cannot push a score to full marks",
-    offline.overall != null && offline.overall <= 85,
+    offline.overall != null && offline.overall <= 90,
     `offline ${offline.overall}`
   );
   check(
@@ -461,6 +474,7 @@ function ph(overrides: Partial<PluginHealth>): PluginHealth {
       footprint: metric(90),
       popularity: metric(90),
       compatibility: metric(100),
+      reliability: metric(100),
     },
     ...overrides,
   };
@@ -563,6 +577,169 @@ eq("prerelease vs prerelease", compareVersion("1.0.0-alpha", "1.0.0-beta"), -1);
   const both = buildInsights([on, off]).find((i) => i.id === "unmaintained");
   eq("only enabled plugins listed", both?.ids.length, 1);
   eq("and it is the enabled one", both?.ids[0], "on");
+}
+
+// --- error attribution ------------------------------------------------------
+{
+  const installed = new Set(["dataview", "templater-obsidian", "flowkit-health-dashboard"]);
+
+  // Obsidian tags plugin code with `//# sourceURL=plugin:<id>`.
+  eq(
+    "attributes via the sourceURL marker",
+    attributeStack(
+      "TypeError: x is undefined\n    at eval (plugin:dataview:8123:15)\n    at App.onload (app://obsidian.md/app.js:1:1)",
+      installed
+    ),
+    "dataview"
+  );
+
+  // And via the on-disk path, in case that marker ever changes.
+  eq(
+    "attributes via the plugin path",
+    attributeStack(
+      "Error: boom\n    at t (/home/u/vault/.obsidian/plugins/templater-obsidian/main.js:99:1)",
+      installed
+    ),
+    "templater-obsidian"
+  );
+  eq(
+    "attributes via a Windows plugin path",
+    attributeStack(
+      "Error: boom\n    at t (C:\\vault\\.obsidian\\plugins\\dataview\\main.js:99:1)",
+      installed
+    ),
+    "dataview"
+  );
+
+  // Never blame a plugin that isn't installed, and never guess.
+  eq(
+    "ignores unknown plugin ids",
+    attributeStack("at eval (plugin:some-other-thing:1:1)", installed),
+    null
+  );
+  eq(
+    "core Obsidian frames are not attributed",
+    attributeStack("at Workspace.onLayoutReady (app://obsidian.md/app.js:1:1)", installed),
+    null
+  );
+  eq("no stack means no attribution", attributeStack(undefined, installed), null);
+
+  // The innermost plugin frame wins: whoever actually threw owns the error.
+  eq(
+    "innermost plugin frame wins",
+    attributeStack(
+      "Error\n    at inner (plugin:templater-obsidian:5:5)\n    at outer (plugin:dataview:9:9)",
+      installed
+    ),
+    "templater-obsidian"
+  );
+}
+
+// --- error signatures + accumulation ----------------------------------------
+{
+  const stackA = "Error: nope\n    at f (plugin:dataview:100:5)";
+  const stackB = "Error: nope\n    at f (plugin:dataview:214:9)";
+  // Line numbers drift between versions; the same bug must stay one entry.
+  eq(
+    "line numbers don't fragment a signature",
+    errorSignature("nope", stackA),
+    errorSignature("nope", stackB)
+  );
+  check(
+    "different messages are different signatures",
+    errorSignature("nope", stackA) !== errorSignature("other", stackA),
+    "messages must separate"
+  );
+
+  let rec = recordError(undefined, {
+    pluginId: "dataview",
+    kind: "uncaught",
+    message: "nope",
+    stack: stackA,
+    at: 1000,
+  });
+  rec = recordError(rec, {
+    pluginId: "dataview",
+    kind: "uncaught",
+    message: "nope",
+    stack: stackB,
+    at: 2000,
+  });
+  eq("repeat errors increment one signature", rec.signatures.length, 1);
+  eq("and the count follows", rec.signatures[0].count, 2);
+  eq("uncaught count accumulates", rec.uncaught, 2);
+  eq("lastAt tracks the newest", rec.lastAt, 2000);
+
+  rec = recordError(rec, {
+    pluginId: "dataview",
+    kind: "console",
+    message: "handled it",
+    stack: stackA,
+    at: 3000,
+  });
+  eq("console errors are counted separately", rec.logged, 1);
+  eq("and don't inflate the uncaught count", rec.uncaught, 2);
+
+  // A record must not be mutated in place — the caller decides when to persist.
+  const before = recordError(undefined, {
+    pluginId: "x",
+    kind: "uncaught",
+    message: "m",
+    at: 1,
+  });
+  const after = recordError(before, {
+    pluginId: "x",
+    kind: "uncaught",
+    message: "m",
+    at: 2,
+  });
+  eq("recordError does not mutate its input", before.uncaught, 1);
+  eq("and returns the updated copy", after.uncaught, 2);
+}
+
+// --- reliability scoring ----------------------------------------------------
+{
+  eq("silence scores 100", reliabilityScore(0), 100);
+  check("one error a day is a dent, not a death", reliabilityScore(1) > 60 && reliabilityScore(1) < 85, `got ${reliabilityScore(1)}`);
+  check("constant throwing bottoms out", reliabilityScore(200) < 15, `got ${reliabilityScore(200)}`);
+
+  const day = 86_400_000;
+  const rec = { uncaught: 10, logged: 99, firstAt: 0, lastAt: day, signatures: [] };
+  eq("rate is per day", Math.round(errorRatePerDay(rec, 2 * day)), 5);
+  // The console count must not move the score, or plugins that report their
+  // failures honestly would rank below ones that swallow them.
+  eq("console errors are excluded from the rate", errorRatePerDay({ ...rec, uncaught: 0 }, day), 0);
+
+  // Until we've watched long enough, silence proves nothing.
+  const fresh = computeHealth(input({ observedMs: 60_000 }), NOW);
+  eq("reliability unavailable while still watching", fresh.metrics.reliability.value, null);
+  const watched = computeHealth(input({ observedMs: MIN_OBSERVATION_MS }), NOW);
+  eq("and measured once we have", watched.metrics.reliability.value, 100);
+  eq("with the weight to match", watched.metrics.reliability.source, "measured");
+
+  // An erroring plugin must actually lose points.
+  const erroring = computeHealth(
+    input({
+      observedMs: 7 * day,
+      errors: { uncaught: 70, logged: 0, firstAt: NOW - 7 * day, lastAt: NOW, signatures: [] },
+    }),
+    NOW
+  );
+  check(
+    "errors drag the overall down",
+    erroring.overall != null && watched.overall != null && erroring.overall < watched.overall,
+    `clean ${watched.overall}, erroring ${erroring.overall}`
+  );
+}
+
+// --- pruning ----------------------------------------------------------------
+{
+  const log = {
+    kept: { uncaught: 1, logged: 0, firstAt: 0, lastAt: 0, signatures: [] },
+    gone: { uncaught: 5, logged: 0, firstAt: 0, lastAt: 0, signatures: [] },
+  };
+  const pruned = pruneErrorLog(log, new Set(["kept"]));
+  eq("uninstalled plugins are forgotten", Object.keys(pruned).join(","), "kept");
 }
 
 // --- report -----------------------------------------------------------------
