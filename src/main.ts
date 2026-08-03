@@ -2,7 +2,11 @@ import { Platform, Plugin, WorkspaceLeaf } from "obsidian";
 import type { PluginManifest } from "obsidian";
 import { HealthDashboardView, VIEW_TYPE_HEALTH } from "./view";
 import { computeHealth } from "./scoring";
-import { fetchCommunityList, fetchRemoteStats } from "./dataSources";
+import {
+  describeFailure,
+  fetchCommunityList,
+  fetchRemoteStats,
+} from "./dataSources";
 import { LicenseManager } from "./license/LicenseManager";
 import {
   DEFAULT_SETTINGS,
@@ -11,6 +15,7 @@ import {
 } from "./settings";
 import type {
   CommunityList,
+  DataCoverage,
   HealthSnapshot,
   PluginHealth,
   RemoteStats,
@@ -81,25 +86,51 @@ export default class FlowKitHealthPlugin extends Plugin {
     // `loadData()` is typed `any`; narrow it before merging so the assignment is type-safe.
     const data = (await this.loadData()) as Partial<FlowKitHealthSettings> | null;
     this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
+    // A hand-edited or sync-mangled data.json can carry `null` where an array
+    // belongs; every read below assumes array methods exist, so coerce once here
+    // rather than defending at each call site.
+    if (!Array.isArray(this.settings.ignored)) this.settings.ignored = [];
+    if (!Array.isArray(this.settings.history)) this.settings.history = [];
   }
 
   async saveSettings(): Promise<void> {
     await this.saveData(this.settings);
   }
 
-  /** Re-verify the stored license key and update the Pro entitlement flags. */
-  refreshLicense(): void {
+  /**
+   * Re-verify the stored license key and update the Pro entitlement flags.
+   * Returns whether `isPro` actually flipped, so callers can rebuild UI only
+   * when entitlement really moved rather than on every keystroke.
+   */
+  refreshLicense(): boolean {
+    const wasPro = this.isPro;
     const key = this.settings.licenseKey?.trim();
     if (!key) {
       this.isPro = false;
       this.licenseEmail = undefined;
       this.licenseError = undefined;
-      return;
+      return wasPro !== this.isPro;
     }
     const result = LicenseManager.verify(key);
     this.isPro = result.valid;
     this.licenseEmail = result.valid ? result.email : undefined;
     this.licenseError = result.valid ? undefined : result.error;
+    return wasPro !== this.isPro;
+  }
+
+  /**
+   * Push a settings or entitlement change into any open dashboard. Without this
+   * a user who pastes a license key, or toggles a setting, sits looking at a
+   * stale view and concludes nothing happened — at precisely the moment they
+   * have just paid.
+   */
+  refreshViews(rescan = false): void {
+    for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_HEALTH)) {
+      const view = leaf.view;
+      if (!(view instanceof HealthDashboardView)) continue;
+      if (rescan) void view.refresh();
+      else view.rerender();
+    }
   }
 
   /** Reveal the dashboard in the right sidebar, creating it if needed. */
@@ -117,34 +148,66 @@ export default class FlowKitHealthPlugin extends Plugin {
     if (leaf) void this.app.workspace.revealLeaf(leaf);
   }
 
+  /** Obsidian's plugin registry, defaulted so a shape change degrades to an empty scan. */
+  private pluginsApi(): InternalPluginsApi {
+    const api = (this.app as unknown as AppInternals).plugins;
+    if (!api || typeof api !== "object") {
+      console.error("FlowKit: Obsidian's internal plugin registry is unavailable.");
+      return { manifests: {}, enabledPlugins: new Set<string>() };
+    }
+    return api;
+  }
+
   /**
-   * Score every installed community plugin. Returns whether online enrichment
-   * actually succeeded so the UI can label its confidence honestly.
+   * Score every installed community plugin. Returns which enrichment sources
+   * loaded so the UI can label its confidence honestly — the two community
+   * files fail independently.
    *
    * @param forceRefresh re-download community data instead of using the cache.
    */
   async computeAll(
     forceRefresh = false
-  ): Promise<{ results: PluginHealth[]; online: boolean }> {
-    const api = (this.app as unknown as AppInternals).plugins;
+  ): Promise<{ results: PluginHealth[]; coverage: DataCoverage }> {
+    const api = this.pluginsApi();
     const manifests = Object.values(api.manifests ?? {});
     const enabledSet = api.enabledPlugins ?? new Set<string>();
     const enabledCount = enabledSet.size;
 
     let stats: RemoteStats | null = null;
     let list: CommunityList | null = null;
-    let online = false;
+    const coverage: DataCoverage = {
+      stats: false,
+      list: false,
+      disabled: !this.settings.enableOnlineEnrichment,
+    };
+
     if (this.settings.enableOnlineEnrichment) {
       if (forceRefresh || !this.remoteCache) {
-        const [fetchedStats, fetchedList] = await Promise.all([
+        const [statsRes, listRes] = await Promise.all([
           fetchRemoteStats(),
           fetchCommunityList(),
         ]);
-        this.remoteCache = { stats: fetchedStats, list: fetchedList };
+        if (!statsRes.ok) {
+          coverage.error = describeFailure(statsRes.reason, statsRes.status);
+        } else if (!listRes.ok) {
+          coverage.error = describeFailure(listRes.reason, listRes.status);
+        }
+        // Only remember a scan that produced something. Caching a total failure
+        // would pin the whole session offline: `{stats:null,list:null}` is
+        // truthy, so every later non-forced call would short-circuit on it.
+        if (statsRes.ok || listRes.ok) {
+          this.remoteCache = {
+            stats: statsRes.ok ? statsRes.data : null,
+            list: listRes.ok ? listRes.data : null,
+          };
+        } else {
+          this.remoteCache = null;
+        }
       }
-      stats = this.remoteCache.stats;
-      list = this.remoteCache.list;
-      online = stats != null;
+      stats = this.remoteCache?.stats ?? null;
+      list = this.remoteCache?.list ?? null;
+      coverage.stats = stats != null;
+      coverage.list = list != null;
     } else {
       // Enrichment turned off — drop any cached data so re-enabling refetches.
       this.remoteCache = null;
@@ -173,24 +236,45 @@ export default class FlowKitHealthPlugin extends Plugin {
         )
       );
     }
-    return { results, online };
+    return { results, coverage };
+  }
+
+  /** Whether Obsidian currently has this plugin enabled. */
+  isEnabled(id: string): boolean {
+    return this.pluginsApi().enabledPlugins?.has(id) ?? false;
   }
 
   /** Enable or disable a plugin via Obsidian's internal API. */
   async setPluginEnabled(id: string, enabled: boolean): Promise<void> {
-    const api = (this.app as unknown as AppInternals).plugins;
+    const api = this.pluginsApi();
     if (enabled) await api.enablePluginAndSave?.(id);
     else await api.disablePluginAndSave?.(id);
   }
 
-  /** Bulk-disable a set of plugins (Pro bulk actions). Returns the count. */
-  async disableMany(ids: string[]): Promise<number> {
-    let count = 0;
+  /**
+   * Bulk-disable a set of plugins. Returns the ids that were actually enabled
+   * beforehand — that's both the honest count to report and exactly what Undo
+   * needs to re-enable, so undo can't switch on something the user had off.
+   */
+  async disableMany(ids: string[]): Promise<string[]> {
+    const changed: string[] = [];
     for (const id of ids) {
+      if (!this.isEnabled(id)) continue;
       await this.setPluginEnabled(id, false);
-      count++;
+      changed.push(id);
     }
-    return count;
+    return changed;
+  }
+
+  /** Re-enable a set of plugins (the Undo half of a bulk disable). */
+  async enableMany(ids: string[]): Promise<string[]> {
+    const changed: string[] = [];
+    for (const id of ids) {
+      if (this.isEnabled(id)) continue;
+      await this.setPluginEnabled(id, true);
+      changed.push(id);
+    }
+    return changed;
   }
 
   /** Open Obsidian's settings window to a plugin's own tab, if it has one. */
@@ -209,14 +293,31 @@ export default class FlowKitHealthPlugin extends Plugin {
     await this.saveSettings();
   }
 
-  /** Mute several plugins at once, persisting a single time (Pro bulk action). */
-  async muteMany(ids: string[]): Promise<number> {
+  /**
+   * Mute several plugins at once, persisting a single time. Returns the ids
+   * that weren't already muted, so Undo only unmutes what this action did.
+   */
+  async muteMany(ids: string[]): Promise<string[]> {
     const set = new Set(this.settings.ignored);
-    const before = set.size;
-    for (const id of ids) set.add(id);
-    this.settings.ignored = [...set];
-    await this.saveSettings();
-    return set.size - before;
+    const changed = ids.filter((id) => !set.has(id));
+    for (const id of changed) set.add(id);
+    if (changed.length) {
+      this.settings.ignored = [...set];
+      await this.saveSettings();
+    }
+    return changed;
+  }
+
+  /** Unmute a set of plugins (the Undo half of a bulk mute). */
+  async unmuteMany(ids: string[]): Promise<string[]> {
+    const set = new Set(this.settings.ignored);
+    const changed = ids.filter((id) => set.has(id));
+    for (const id of changed) set.delete(id);
+    if (changed.length) {
+      this.settings.ignored = [...set];
+      await this.saveSettings();
+    }
+    return changed;
   }
 
   isIgnored(id: string): boolean {
@@ -225,9 +326,16 @@ export default class FlowKitHealthPlugin extends Plugin {
 
   // --- Pro: health-trend history ------------------------------------------
 
-  /** The most recent snapshot recorded before `at`, for delta display. */
+  /**
+   * The most recent snapshot recorded before `at`, for delta display. Sorted
+   * rather than trusting insertion order — history survives in data.json across
+   * syncs and hand edits, and an out-of-order entry would silently pick the
+   * wrong baseline for every delta the user sees.
+   */
   previousSnapshot(at: number): HealthSnapshot | null {
-    const prior = this.settings.history.filter((s) => s.at < at);
+    const prior = this.settings.history
+      .filter((s) => s.at < at)
+      .sort((a, b) => a.at - b.at);
     return prior.length ? prior[prior.length - 1] : null;
   }
 

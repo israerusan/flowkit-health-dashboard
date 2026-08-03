@@ -386,12 +386,14 @@
   text-align: center;
   white-space: nowrap;
 }
+/* Not sticky: the header above is itself sticky and its height varies with
+   wrapping (title, status, up to three buttons), so any fixed `top` offset here
+   was wrong at most widths — leaving a dead scrollport band or overlapping the
+   first row. */
 .flowkit-health-table th {
   color: var(--text-muted);
   font-weight: 600;
   background: var(--background-primary);
-  position: sticky;
-  top: 52px;
 }
 .flowkit-health-table th.sortable {
   cursor: pointer;
@@ -517,17 +519,24 @@
   margin-left: 1px;
 }
 
-/* Tone applied to plain text (summary tiles, gauge, deltas). */
-.tone-good {
+/* Tone applied to plain text (summary tiles, gauge, deltas). Scoped to our own
+   roots: `.tone-good` unscoped is a global class name, and styles.css is loaded
+   app-wide, so it would repaint any other plugin's element that happens to use
+   the same word. */
+.flowkit-health .tone-good,
+.flowkit-pro-banner .tone-good {
   color: var(--color-green, #2e7d32);
 }
-.tone-warn {
+.flowkit-health .tone-warn,
+.flowkit-pro-banner .tone-warn {
   color: var(--color-yellow, #b8860b);
 }
-.tone-bad {
+.flowkit-health .tone-bad,
+.flowkit-pro-banner .tone-bad {
   color: var(--color-red, #c62828);
 }
-.tone-unknown {
+.flowkit-health .tone-unknown,
+.flowkit-pro-banner .tone-unknown {
   color: var(--text-muted);
 }
 
@@ -552,6 +561,89 @@
   font-size: 0.78em;
   color: var(--text-muted);
   line-height: 1.5;
+}
+
+/* Scan error / coverage / undo ------------------------------------------- */
+.flowkit-health-error,
+.flowkit-coverage-note,
+.flowkit-undo-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  margin: 0 0 12px;
+  font-size: 0.85em;
+}
+.flowkit-health-error {
+  border: 1px solid var(--color-red, #c62828);
+  background: color-mix(in srgb, var(--color-red, #c62828) 8%, transparent);
+}
+.flowkit-error-icon {
+  display: inline-flex;
+  color: var(--color-red, #c62828);
+}
+.flowkit-error-detail {
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+.flowkit-coverage-note {
+  border: 1px dashed var(--background-modifier-border);
+  background: var(--background-secondary);
+  color: var(--text-muted);
+}
+.flowkit-coverage-icon {
+  display: inline-flex;
+  flex: 0 0 auto;
+}
+.flowkit-coverage-body {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.flowkit-undo-bar {
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-secondary);
+}
+.flowkit-undo-icon {
+  display: inline-flex;
+  color: var(--text-muted);
+}
+.flowkit-undo-label {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* Bulk confirmation modal ------------------------------------------------- */
+.flowkit-bulk-intro {
+  margin-bottom: 10px;
+}
+.flowkit-bulk-list {
+  max-height: 260px;
+  overflow-y: auto;
+  margin: 0 0 10px;
+  padding-left: 18px;
+}
+.flowkit-bulk-list li {
+  margin: 6px 0;
+}
+.flowkit-bulk-name {
+  font-weight: 600;
+}
+.flowkit-bulk-detail {
+  font-size: 0.85em;
+  color: var(--text-muted);
+}
+.flowkit-bulk-caveat {
+  font-size: 0.85em;
+  color: var(--text-muted);
+  border-left: 3px solid var(--color-yellow, #b8860b);
+  padding-left: 10px;
+  margin-bottom: 12px;
+}
+.flowkit-bulk-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
 /* Settings: Pro section -------------------------------------------------- */
@@ -587,6 +679,12 @@
   font-size: 0.82em;
   margin: -4px 0 12px;
 }
-.flowkit-locked-setting {
-  opacity: 0.7;
+.flowkit-license-error:empty {
+  margin: 0;
+}
+.flowkit-pro-trust {
+  font-size: 0.82em;
+  color: var(--text-muted);
+  margin: -4px 0 14px;
+  line-height: 1.6;
 }

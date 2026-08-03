@@ -83,6 +83,23 @@ export interface RemotePluginStat {
 export type RemoteStats = Record<string, RemotePluginStat>;
 
 /**
+ * Which enrichment sources actually loaded for a scan. The two community files
+ * fail independently — stats drives Popularity/Maintenance, the list drives
+ * sideload detection and repo links — so "online" is not one boolean. Calling a
+ * half-loaded scan "full metrics" is the kind of small lie that costs trust.
+ */
+export interface DataCoverage {
+  /** community-plugin-stats.json loaded. */
+  stats: boolean;
+  /** community-plugins.json loaded. */
+  list: boolean;
+  /** Enrichment is deliberately switched off in settings. */
+  disabled: boolean;
+  /** Why enrichment is incomplete, when it failed rather than being off. */
+  error?: string;
+}
+
+/**
  * A point-in-time reading of overall vault health, used by the Pro trend
  * tracker. Stored in plugin data; the list is capped to a recent window.
  */

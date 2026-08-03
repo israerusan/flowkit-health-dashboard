@@ -9,27 +9,85 @@ const STATS_URL =
 const LIST_URL =
   "https://raw.githubusercontent.com/obsidianmd/obsidian-releases/master/community-plugins.json";
 
-/** Community download counts + last-updated timestamps, keyed by plugin id. */
-export async function fetchRemoteStats(): Promise<RemoteStats | null> {
+/** Give up on a wedged request rather than leaving the view spinning forever. */
+const FETCH_TIMEOUT_MS = 10_000;
+
+/**
+ * Why a fetch failed, so the UI can say something truer than "Offline". A
+ * blocked corporate proxy, a GitHub outage, and a malformed payload all need
+ * different words — and only `network` is worth suggesting a retry for.
+ */
+export type FetchFailure = "http" | "network" | "parse" | "timeout";
+
+export type FetchOutcome<T> =
+  | { ok: true; data: T }
+  | { ok: false; reason: FetchFailure; status?: number };
+
+/** Resolve `null` if `promise` hasn't settled within `ms`, clearing the timer either way. */
+async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T | null> {
+  let timer: number | undefined;
   try {
-    const res = await requestUrl({ url: STATS_URL, throw: false });
-    if (res.status !== 200) return null;
-    return res.json as RemoteStats;
-  } catch {
-    return null;
+    return await Promise.race([
+      promise,
+      new Promise<null>((resolve) => {
+        timer = window.setTimeout(() => resolve(null), ms);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) window.clearTimeout(timer);
   }
 }
 
-/** The community-plugins list, reshaped into a map keyed by plugin id. */
-export async function fetchCommunityList(): Promise<CommunityList | null> {
+/** Fetch and parse one JSON document, classifying every failure mode. */
+async function fetchJson<T>(url: string): Promise<FetchOutcome<T>> {
+  let res: Awaited<ReturnType<typeof requestUrl>> | null;
   try {
-    const res = await requestUrl({ url: LIST_URL, throw: false });
-    if (res.status !== 200) return null;
-    const arr = res.json as CommunityListEntry[];
-    const map: CommunityList = {};
-    for (const entry of arr) map[entry.id] = entry;
-    return map;
-  } catch {
-    return null;
+    res = await withTimeout(requestUrl({ url, throw: false }), FETCH_TIMEOUT_MS);
+  } catch (err) {
+    console.error("FlowKit: request failed", url, err);
+    return { ok: false, reason: "network" };
+  }
+  if (res == null) {
+    console.error("FlowKit: request timed out", url);
+    return { ok: false, reason: "timeout" };
+  }
+  if (res.status !== 200) {
+    console.error("FlowKit: unexpected status", url, res.status);
+    return { ok: false, reason: "http", status: res.status };
+  }
+  try {
+    return { ok: true, data: res.json as T };
+  } catch (err) {
+    console.error("FlowKit: could not parse response", url, err);
+    return { ok: false, reason: "parse" };
+  }
+}
+
+/** Community download counts + last-updated timestamps, keyed by plugin id. */
+export function fetchRemoteStats(): Promise<FetchOutcome<RemoteStats>> {
+  return fetchJson<RemoteStats>(STATS_URL);
+}
+
+/** The community-plugins list, reshaped into a map keyed by plugin id. */
+export async function fetchCommunityList(): Promise<FetchOutcome<CommunityList>> {
+  const res = await fetchJson<CommunityListEntry[]>(LIST_URL);
+  if (!res.ok) return res;
+  if (!Array.isArray(res.data)) return { ok: false, reason: "parse" };
+  const map: CommunityList = {};
+  for (const entry of res.data) map[entry.id] = entry;
+  return { ok: true, data: map };
+}
+
+/** One-line, human-facing reason a fetch failed. */
+export function describeFailure(reason: FetchFailure, status?: number): string {
+  switch (reason) {
+    case "timeout":
+      return "GitHub didn't respond in time.";
+    case "http":
+      return `GitHub returned an unexpected response${status ? ` (${status})` : ""}.`;
+    case "parse":
+      return "GitHub's community data couldn't be read.";
+    default:
+      return "Couldn't reach GitHub.";
   }
 }

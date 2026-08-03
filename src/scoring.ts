@@ -13,17 +13,37 @@ function clamp(n: number, lo = 0, hi = 100): number {
   return Math.max(lo, Math.min(hi, n));
 }
 
-/** Semver-ish compare. Returns -1, 0, or 1. Missing parts count as 0. */
+/** A version key that names a stable release — no prerelease tag, no build metadata. */
+const STABLE_VERSION_KEY = /^\d+\.\d+(?:\.\d+)?$/;
+
+/** Split `v1.2.3-beta.1` into its numeric parts and its prerelease tag. */
+function parseVersion(value: string): { parts: number[]; pre: string } {
+  const trimmed = String(value ?? "").trim().replace(/^v/i, "");
+  const cut = trimmed.search(/[-+]/);
+  const core = cut === -1 ? trimmed : trimmed.slice(0, cut);
+  const pre = cut === -1 ? "" : trimmed.slice(cut + 1);
+  return { parts: core.split(".").map((x) => parseInt(x, 10) || 0), pre };
+}
+
+/**
+ * Semver-ish compare. Returns -1, 0, or 1. Missing parts count as 0, a leading
+ * `v` is ignored, and a prerelease sorts below its own release (1.0.0-beta <
+ * 1.0.0) — which is what stops a `-beta` key in the community stats from being
+ * read as a newer version than the stable release the user actually has.
+ */
 export function compareVersion(a: string, b: string): number {
-  const pa = a.split(".").map((x) => parseInt(x, 10) || 0);
-  const pb = b.split(".").map((x) => parseInt(x, 10) || 0);
-  const len = Math.max(pa.length, pb.length);
+  const pa = parseVersion(a);
+  const pb = parseVersion(b);
+  const len = Math.max(pa.parts.length, pb.parts.length);
   for (let i = 0; i < len; i++) {
-    const x = pa[i] ?? 0;
-    const y = pb[i] ?? 0;
+    const x = pa.parts[i] ?? 0;
+    const y = pb.parts[i] ?? 0;
     if (x !== y) return x < y ? -1 : 1;
   }
-  return 0;
+  if (pa.pre === pb.pre) return 0;
+  if (!pa.pre) return 1; // a is the release, b is a prerelease of it
+  if (!pb.pre) return -1;
+  return pa.pre < pb.pre ? -1 : 1;
 }
 
 /** Everything the scorer needs about one plugin. */
@@ -47,9 +67,14 @@ export interface ScoreInput {
 }
 
 /**
- * Pick the highest published version from a community-stats entry. The entry
- * mixes `downloads`/`updated` fields with one numeric key per version, so we
- * keep only version-shaped keys (those starting with a digit).
+ * Pick the highest published *stable* version from a community-stats entry. The
+ * entry mixes `downloads`/`updated` fields with one numeric key per version, so
+ * we keep only strictly version-shaped keys.
+ *
+ * Prereleases are excluded deliberately: plugins like Calendar, Linter and
+ * Periodic Notes publish `-beta` builds into the same object, and counting one
+ * as "latest" shows an Update badge for a release the user can't install from
+ * the community browser.
  */
 export function pickLatestVersion(
   remote: RemotePluginStat | undefined
@@ -57,7 +82,7 @@ export function pickLatestVersion(
   if (!remote) return undefined;
   let latest: string | undefined;
   for (const key of Object.keys(remote)) {
-    if (!/^\d/.test(key)) continue; // skip "downloads", "updated"
+    if (!STABLE_VERSION_KEY.test(key)) continue; // skip "downloads", "updated", "1.0.0-beta"
     if (latest == null || compareVersion(key, latest) > 0) latest = key;
   }
   return latest;

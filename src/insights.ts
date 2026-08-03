@@ -30,6 +30,33 @@ const names = (rows: PluginHealth[], max = 3): string => {
   return extra > 0 ? `${shown.join(", ")} +${extra} more` : shown.join(", ");
 };
 
+// --- shared predicates ------------------------------------------------------
+// The dashboard's filter dropdown and this insight builder must agree about what
+// "incompatible" or "at risk" means. They used to carry separate copies, which
+// let a row appear under a filter but not in the matching insight (and vice
+// versa). One definition each, exported, used by both.
+
+/** Declares a minimum Obsidian version we don't meet, or is desktop-only on mobile. */
+export function isIncompatible(r: PluginHealth): boolean {
+  return r.metrics.compatibility.value === 0;
+}
+
+/** Scores below the "needs a look" line. */
+export function isAtRisk(r: PluginHealth): boolean {
+  return r.overall != null && r.overall < 50;
+}
+
+/** Worth the user's attention — excluding anything they've explicitly muted. */
+export function needsAttention(r: PluginHealth): boolean {
+  if (r.muted) return false;
+  return (
+    isAtRisk(r) ||
+    r.maintenanceStatus === "unmaintained" ||
+    isIncompatible(r) ||
+    r.updateAvailable
+  );
+}
+
 /**
  * Build the ranked insight list. Muted plugins are ignored throughout so a user
  * who has acknowledged a plugin doesn't keep getting nagged about it. Returned
@@ -39,9 +66,7 @@ export function buildInsights(results: PluginHealth[]): Insight[] {
   const live = results.filter((r) => !r.muted);
   const insights: Insight[] = [];
 
-  const incompatible = live.filter(
-    (r) => r.enabled && r.metrics.compatibility.value === 0
-  );
+  const incompatible = live.filter((r) => r.enabled && isIncompatible(r));
   if (incompatible.length) {
     insights.push({
       id: "incompatible",
@@ -55,23 +80,27 @@ export function buildInsights(results: PluginHealth[]): Insight[] {
     });
   }
 
-  const unmaintained = live.filter((r) => r.maintenanceStatus === "unmaintained");
+  // Enabled-only, like every other cohort here. Offering to "disable" plugins
+  // that are already disabled inflated the count and did nothing.
+  const unmaintained = live.filter(
+    (r) => r.enabled && r.maintenanceStatus === "unmaintained"
+  );
   if (unmaintained.length) {
     insights.push({
       id: "unmaintained",
       tone: "bad",
       icon: "clock-alert",
-      title: `${unmaintained.length} plugin${unmaintained.length > 1 ? "s look" : " looks"} abandoned`,
-      detail: `No update in 18+ months: ${names(unmaintained)}. Consider replacing them.`,
+      title: `${unmaintained.length} plugin${unmaintained.length > 1 ? "s have" : " has"} no recent release`,
+      // Deliberately an observation, not a verdict. Release age alone cannot
+      // establish abandonment — plenty of good plugins are simply finished.
+      detail: `No recorded update in 18+ months: ${names(unmaintained)}. Worth checking whether they still work for you.`,
       ids: unmaintained.map((r) => r.id),
       action: "disable-unmaintained",
-      actionLabel: "Disable these",
+      actionLabel: "Review and disable",
     });
   }
 
-  const atRisk = live.filter(
-    (r) => r.enabled && r.overall != null && r.overall < 50
-  );
+  const atRisk = live.filter((r) => r.enabled && isAtRisk(r));
   if (atRisk.length) {
     insights.push({
       id: "at-risk",

@@ -1,7 +1,20 @@
 import { ItemView, Menu, Notice, WorkspaceLeaf, setIcon } from "obsidian";
-import type { MaintenanceStatus, MetricScore, PluginHealth } from "./types";
+import type {
+  DataCoverage,
+  MaintenanceStatus,
+  MetricScore,
+  PluginHealth,
+} from "./types";
 import type FlowKitHealthPlugin from "./main";
-import { buildInsights, type BulkAction, type Insight } from "./insights";
+import {
+  buildInsights,
+  isAtRisk,
+  isIncompatible,
+  needsAttention,
+  type BulkAction,
+  type Insight,
+} from "./insights";
+import { BulkConfirmModal } from "./ui/BulkConfirmModal";
 import { PRO_PRICE, PURCHASE_URL } from "./product";
 
 export const VIEW_TYPE_HEALTH = "flowkit-health-dashboard";
@@ -95,21 +108,6 @@ function gradeFor(avg: number | null): { letter: string; tone: Tone; verdict: st
   return { letter: "F", tone: "bad", verdict: "Your plugin set needs some cleanup." };
 }
 
-function isIncompatible(r: PluginHealth): boolean {
-  return r.metrics.compatibility.value === 0;
-}
-
-/** A plugin worth the user's attention (excluding ones they've muted). */
-function needsAttention(r: PluginHealth): boolean {
-  if (r.muted) return false;
-  return (
-    (r.overall != null && r.overall < 50) ||
-    r.maintenanceStatus === "unmaintained" ||
-    isIncompatible(r) ||
-    r.updateAvailable
-  );
-}
-
 function svgEl<K extends keyof SVGElementTagNameMap>(
   parent: Element,
   tag: K,
@@ -132,8 +130,12 @@ interface SummaryStats {
 export class HealthDashboardView extends ItemView {
   private plugin: FlowKitHealthPlugin;
   private results: PluginHealth[] = [];
-  private online = false;
+  private coverage: DataCoverage = { stats: false, list: false, disabled: false };
   private loading = false;
+  /** Set when a scan threw, so the view offers a way out instead of a dead spinner. */
+  private scanError: string | null = null;
+  /** The last bulk action, so it can be undone for the rest of the session. */
+  private lastBulk: { label: string; revert: () => Promise<void> } | null = null;
 
   // View controls
   private search = "";
@@ -159,19 +161,23 @@ export class HealthDashboardView extends ItemView {
   }
 
   async onOpen(): Promise<void> {
-    await this.refresh(this.plugin.isPro && this.plugin.settings.autoRefreshOnOpen);
+    await this.refresh(this.plugin.settings.autoRefreshOnOpen);
+  }
+
+  /** Re-render from the results already in hand, without rescanning. */
+  rerender(): void {
+    this.render();
   }
 
   /** Recompute all scores and re-render. Pass `force` to re-download data. */
   async refresh(force = false): Promise<void> {
     this.loading = true;
+    this.scanError = null;
     this.render();
-    const { results, online } = await this.plugin.computeAll(force);
-    this.results = results;
-    this.online = online;
-    this.loading = false;
-    // Pro: record a trend snapshot of this scan.
-    if (this.plugin.isPro) {
+    try {
+      const { results, coverage } = await this.plugin.computeAll(force);
+      this.results = results;
+      this.coverage = coverage;
       const s = this.summaryStats();
       await this.plugin.recordSnapshot({
         at: Date.now(),
@@ -181,8 +187,17 @@ export class HealthDashboardView extends ItemView {
         unmaintained: s.unmaintained,
         updates: s.updates,
       });
+    } catch (err) {
+      // A rejected saveData (read-only disk, sync conflict) used to escape here
+      // and leave the view stuck on the spinner with Refresh disabled, needing
+      // an Obsidian restart to clear.
+      console.error("FlowKit: scan failed", err);
+      this.scanError =
+        err instanceof Error ? err.message : "Something went wrong during the scan.";
+    } finally {
+      this.loading = false;
+      this.render();
     }
-    this.render();
   }
 
   // --- data shaping ---------------------------------------------------------
@@ -198,7 +213,7 @@ export class HealthDashboardView extends ItemView {
     return {
       count: active.length,
       avg,
-      atRisk: active.filter((r) => r.overall != null && r.overall < 50).length,
+      atRisk: active.filter(isAtRisk).length,
       unmaintained: active.filter((r) => r.maintenanceStatus === "unmaintained")
         .length,
       updates: active.filter((r) => r.updateAvailable).length,
@@ -274,6 +289,17 @@ export class HealthDashboardView extends ItemView {
       return;
     }
 
+    if (this.scanError) {
+      const card = root.createDiv({ cls: "flowkit-health-error" });
+      setIcon(card.createSpan({ cls: "flowkit-error-icon" }), "alert-triangle");
+      const body = card.createDiv();
+      body.createEl("strong", { text: "The scan didn't finish." });
+      body.createDiv({ cls: "flowkit-error-detail", text: this.scanError });
+      const retry = card.createEl("button", { cls: "mod-cta", text: "Try again" });
+      retry.onclick = () => void this.refresh(true);
+      return;
+    }
+
     if (this.results.length === 0) {
       root.createDiv({
         cls: "flowkit-health-empty",
@@ -283,6 +309,8 @@ export class HealthDashboardView extends ItemView {
     }
 
     this.renderHero(root);
+    this.renderCoverageNotice(root);
+    this.renderUndoBar(root);
     this.renderSummary(root);
     this.renderInsights(root);
     if (this.plugin.isPro) this.renderTrends(root);
@@ -310,14 +338,20 @@ export class HealthDashboardView extends ItemView {
 
     const actions = header.createDiv({ cls: "flowkit-health-actions" });
     const status = actions.createSpan({ cls: "flowkit-health-status" });
+    // The two community files fail independently, so "online" was never one
+    // boolean — the header used to claim "full metrics" whenever stats loaded,
+    // even with sideload detection and repo links silently missing.
+    const full = this.coverage.stats && this.coverage.list;
     status.setText(
       this.loading
         ? "Scoring…"
-        : this.online
-          ? "Online — full metrics"
-          : "Offline — local metrics only"
+        : full
+          ? "Online — all signals"
+          : this.coverage.stats || this.coverage.list
+            ? "Online — some signals unavailable"
+            : "Local signals only"
     );
-    status.addClass(this.online ? "is-online" : "is-offline");
+    status.addClass(full ? "is-online" : "is-offline");
 
     if (!this.loading && this.results.length > 0) {
       const exportBtn = actions.createEl("button", { cls: "flowkit-health-btn" });
@@ -391,9 +425,40 @@ export class HealthDashboardView extends ItemView {
     text.createEl("p", {
       cls: "flowkit-hero-sub",
       text: `Vault health across ${s.count} plugin${s.count === 1 ? "" : "s"} · ${
-        this.online ? "measured + estimated signals" : "local signals only"
+        this.coverage.stats ? "measured + estimated signals" : "local signals only"
       }.`,
     });
+  }
+
+  /**
+   * Say plainly when enrichment is incomplete, and why. Silently dropping two of
+   * five columns and relabelling the header is the kind of thing users notice
+   * and mistrust.
+   */
+  private renderCoverageNotice(root: HTMLElement): void {
+    const { stats, list, disabled, error } = this.coverage;
+    if (stats && list) return;
+
+    const note = root.createDiv({ cls: "flowkit-coverage-note" });
+    setIcon(note.createSpan({ cls: "flowkit-coverage-icon" }), disabled ? "wifi-off" : "cloud-off");
+    const body = note.createDiv({ cls: "flowkit-coverage-body" });
+
+    if (disabled) {
+      body.createDiv({
+        text: "Online enrichment is off — Popularity and Maintenance can't be measured.",
+      });
+      const btn = note.createEl("button", { text: "Turn on" });
+      btn.onclick = () => {
+        this.plugin.settings.enableOnlineEnrichment = true;
+        void this.plugin.saveSettings().then(() => this.refresh(true));
+      };
+      return;
+    }
+
+    const missing = !stats && !list ? "Popularity, Maintenance and sideload detection" : !stats ? "Popularity and Maintenance" : "sideload detection and repository links";
+    body.createDiv({ text: `${error ?? "Couldn't reach GitHub."} ${missing} unavailable for this scan.` });
+    const btn = note.createEl("button", { text: "Retry" });
+    btn.onclick = () => void this.refresh(true);
   }
 
   private renderSummary(root: HTMLElement): void {
@@ -408,6 +473,16 @@ export class HealthDashboardView extends ItemView {
       s.unmaintained > 0 ? "bad" : "good"
     );
     this.statTile(summary, "At risk", String(s.atRisk), s.atRisk > 0 ? "bad" : "good");
+  }
+
+  /** A standing way back from the last bulk action, for the rest of the session. */
+  private renderUndoBar(root: HTMLElement): void {
+    if (!this.lastBulk) return;
+    const bar = root.createDiv({ cls: "flowkit-undo-bar" });
+    setIcon(bar.createSpan({ cls: "flowkit-undo-icon" }), "rotate-ccw");
+    bar.createSpan({ cls: "flowkit-undo-label", text: this.lastBulk.label });
+    const btn = bar.createEl("button", { text: "Undo" });
+    btn.onclick = () => void this.undoLastBulk();
   }
 
   private statTile(parent: HTMLElement, label: string, value: string, tone: Tone): void {
@@ -466,21 +541,84 @@ export class HealthDashboardView extends ItemView {
     if (pro && ins.action && ins.ids.length) {
       const btn = card.createEl("button", { cls: "flowkit-insight-action" });
       btn.setText(ins.actionLabel ?? "Apply");
-      btn.onclick = () => void this.runBulk(ins);
+      btn.onclick = () => this.runBulk(ins);
     }
   }
 
-  private async runBulk(ins: Insight): Promise<void> {
+  /** Show what a bulk action will do, then do it — and keep a way back. */
+  private runBulk(ins: Insight): void {
     if (!this.plugin.isPro || !ins.action || !ins.ids.length) return;
     const action: BulkAction = ins.action;
-    let count = 0;
-    if (action === "disable-unmaintained" || action === "disable-incompatible") {
-      count = await this.plugin.disableMany(ins.ids);
-      new Notice(`Disabled ${count} plugin${count === 1 ? "" : "s"}.`);
-    } else if (action === "mute-sideloaded") {
-      count = await this.plugin.muteMany(ins.ids);
-      new Notice(`Muted ${count} plugin${count === 1 ? "" : "s"}.`);
+    const affected = this.results.filter((r) => ins.ids.includes(r.id));
+    const disabling = action !== "mute-sideloaded";
+    // Only rows the action would actually change — disabling something already
+    // disabled is a no-op that used to be counted and reported anyway.
+    const rows = disabling ? affected.filter((r) => r.enabled) : affected.filter((r) => !r.muted);
+
+    if (!rows.length) {
+      new Notice("Nothing to change — those plugins are already in that state.");
+      return;
     }
+
+    new BulkConfirmModal(this.app, {
+      title: disabling ? "Disable these plugins?" : "Mute these plugins?",
+      intro: disabling
+        ? `FlowKit will turn off ${rows.length} plugin${rows.length === 1 ? "" : "s"}. Nothing is uninstalled, and you can undo this straight after.`
+        : `FlowKit will hide ${rows.length} plugin${rows.length === 1 ? "" : "s"} from the at-risk counts. Their scores stay visible.`,
+      rows: rows.map((r) => ({
+        name: r.name,
+        detail: this.bulkReason(r, action),
+      })),
+      caveat: disabling
+        ? "A plugin with no recent release isn't necessarily broken — some are simply finished. Uncheck anything you rely on by muting it instead."
+        : undefined,
+      confirmLabel: disabling
+        ? `Disable ${rows.length}`
+        : `Mute ${rows.length}`,
+      onConfirm: () => void this.applyBulk(action, rows.map((r) => r.id)),
+    }).open();
+  }
+
+  /** The evidence for one row appearing in a bulk list. */
+  private bulkReason(r: PluginHealth, action: BulkAction): string {
+    if (action === "disable-incompatible") {
+      return r.metrics.compatibility.detail;
+    }
+    if (action === "disable-unmaintained") {
+      return r.metrics.maintenance.detail || "No recorded update in over 18 months.";
+    }
+    return "Not in Obsidian's community list.";
+  }
+
+  private async applyBulk(action: BulkAction, ids: string[]): Promise<void> {
+    if (action === "mute-sideloaded") {
+      const changed = await this.plugin.muteMany(ids);
+      this.lastBulk = {
+        label: `Muted ${changed.length} plugin${changed.length === 1 ? "" : "s"}`,
+        revert: async () => {
+          await this.plugin.unmuteMany(changed);
+        },
+      };
+      new Notice(`Muted ${changed.length} plugin${changed.length === 1 ? "" : "s"}.`);
+    } else {
+      const changed = await this.plugin.disableMany(ids);
+      this.lastBulk = {
+        label: `Disabled ${changed.length} plugin${changed.length === 1 ? "" : "s"}`,
+        revert: async () => {
+          await this.plugin.enableMany(changed);
+        },
+      };
+      new Notice(`Disabled ${changed.length} plugin${changed.length === 1 ? "" : "s"}.`);
+    }
+    await this.refresh();
+  }
+
+  private async undoLastBulk(): Promise<void> {
+    const last = this.lastBulk;
+    if (!last) return;
+    this.lastBulk = null;
+    await last.revert();
+    new Notice("Reverted.");
     await this.refresh();
   }
 
@@ -659,7 +797,14 @@ export class HealthDashboardView extends ItemView {
     const meta = nameCell.createDiv({ cls: "flowkit-plugin-meta" });
     meta.setText(`${r.author} · v${r.version}${r.enabled ? "" : " · disabled"}`);
 
-    this.scoreCell(tr, r.overall, "measured");
+    // Overall is a blend of measured and estimated inputs, so it is never itself
+    // "measured" — claiming so overstated confidence on the headline number.
+    this.scoreCell(
+      tr,
+      r.overall,
+      "estimated",
+      "Blended from the five metrics in this row."
+    );
     for (const col of METRIC_COLUMNS) {
       const metric = r.metrics[col.key];
       this.scoreCell(tr, metric.value, metric.source, metric.detail);
@@ -789,9 +934,15 @@ export class HealthDashboardView extends ItemView {
     const content =
       format === "md" ? this.buildReportMarkdown(rows) : this.buildReportCsv(rows);
     const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-    const path = `Plugin Health Report ${stamp}.${format}`;
     try {
-      const file = await this.app.vault.create(path, content);
+      const path = await this.uniquePath(`Plugin Health Report ${stamp}`, format);
+      // A leading BOM keeps Excel from mangling non-ASCII plugin names in the
+      // CSV. Built with fromCharCode rather than written literally, so the
+      // source stays free of invisible whitespace.
+      const file = await this.app.vault.create(
+        path,
+        format === "csv" ? String.fromCharCode(0xfeff) + content : content
+      );
       if (format === "md") {
         await this.app.workspace.getLeaf(true).openFile(file);
       }
@@ -802,16 +953,31 @@ export class HealthDashboardView extends ItemView {
     }
   }
 
+  /**
+   * A path that doesn't already exist. The stamp is second-resolution, so two
+   * exports inside the same second used to collide and throw.
+   */
+  private async uniquePath(base: string, format: string): Promise<string> {
+    let path = `${base}.${format}`;
+    let n = 2;
+    while (await this.app.vault.adapter.exists(path)) {
+      path = `${base} (${n++}).${format}`;
+    }
+    return path;
+  }
+
   private buildReportMarkdown(rows: PluginHealth[]): string {
     const when = new Date().toLocaleString();
     const cell = (v: number | null) => (v == null ? "—" : String(v));
+    // Plugin names legitimately contain pipes; unescaped they split the table.
+    const md = (v: string) => v.replace(/\|/g, "\\|");
     const s = this.summaryStats();
     const grade = gradeFor(s.avg);
     const lines: string[] = [];
     lines.push("# Plugin Health Report");
     lines.push("");
     lines.push(
-      `> Generated by FlowKit on ${when} · ${this.online ? "online" : "offline"} · ${rows.length} plugin(s)`
+      `> Generated by FlowKit on ${when} · ${this.coverage.stats ? "online" : "local signals only"} · ${rows.length} plugin(s)`
     );
     lines.push("");
     lines.push(
@@ -826,7 +992,7 @@ export class HealthDashboardView extends ItemView {
       const m = r.metrics;
       const flags = this.flagText(r);
       lines.push(
-        `| ${r.name} | ${r.version} | ${flags} | ${cell(r.overall)} | ${cell(
+        `| ${md(r.name)} | ${md(r.version)} | ${md(flags)} | ${cell(r.overall)} | ${cell(
           m.quality.value
         )} | ${cell(m.maintenance.value)} | ${cell(m.performance.value)} | ${cell(
           m.popularity.value

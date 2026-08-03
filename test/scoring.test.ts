@@ -291,6 +291,51 @@ function ph(overrides: Partial<PluginHealth>): PluginHealth {
   );
 }
 
+// --- version parsing regressions (0.3.0) ------------------------------------
+// Plugins like Calendar, Linter and Periodic Notes publish `-beta` builds into
+// the same stats object; counting one as "latest" showed an Update badge for a
+// release the user cannot install from the community browser.
+eq(
+  "prerelease keys are not 'latest'",
+  pickLatestVersion({ downloads: 9, updated: 1, "1.5.10": 100, "2.0.0-beta.2": 5 }),
+  "1.5.10"
+);
+eq(
+  "build-metadata keys are not 'latest'",
+  pickLatestVersion({ "1.2.0": 1, "1.3.0+build.5": 2 }),
+  "1.2.0"
+);
+eq("v-prefix ignored", compareVersion("v1.2.3", "1.2.3"), 0);
+eq("prerelease sorts below its release", compareVersion("1.0.0-beta", "1.0.0"), -1);
+eq("release sorts above its prerelease", compareVersion("1.0.0", "1.0.0-beta"), 1);
+eq("prerelease vs prerelease", compareVersion("1.0.0-alpha", "1.0.0-beta"), -1);
+{
+  // A vault pinned to the stable release must not be told an update is waiting
+  // just because a beta of the same version exists.
+  const h = computeHealth(
+    input({
+      manifest: manifest({ id: "x", version: "1.3.0" }),
+      remote: { downloads: 10, updated: NOW, "1.3.0": 5, "1.4.0-beta.1": 1 },
+    }),
+    NOW
+  );
+  eq("no update for a beta-only newer version", h.updateAvailable, false);
+}
+
+// --- insights cohort consistency (0.3.0) ------------------------------------
+{
+  // Every other cohort is enabled-only; unmaintained was not, so "Disable these"
+  // counted plugins that were already off.
+  const off = ph({ id: "off", enabled: false, maintenanceStatus: "unmaintained" });
+  const unmaintained = buildInsights([off]).find((i) => i.id === "unmaintained");
+  eq("disabled plugins excluded from unmaintained insight", unmaintained, undefined);
+
+  const on = ph({ id: "on", enabled: true, maintenanceStatus: "unmaintained" });
+  const both = buildInsights([on, off]).find((i) => i.id === "unmaintained");
+  eq("only enabled plugins listed", both?.ids.length, 1);
+  eq("and it is the enabled one", both?.ids[0], "on");
+}
+
 // --- report -----------------------------------------------------------------
 if (failures.length) {
   console.error(`\n✗ ${failures.length} failed, ${passed} passed:`);
