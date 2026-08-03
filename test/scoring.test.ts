@@ -48,6 +48,7 @@ import {
   desiredState,
   restoreState,
   roundsNeeded,
+  searchableCandidates,
   type BisectState,
 } from "../src/bisect";
 import {
@@ -1352,6 +1353,33 @@ eq("prerelease vs prerelease", compareVersion("1.0.0-alpha", "1.0.0-beta"), -1);
     const stepped: BisectState = bisectStep(done, true);
     eq("and stepping it does nothing", stepped, done);
   }
+}
+
+// A search must never be able to switch off the thing running the search.
+// Without this, bisect eventually unloads FlowKit: the view vanishes mid-run,
+// the session survives on disk describing a half-disabled vault, and the only
+// thing that knows how to restore it is now disabled.
+{
+  const enabled = ["alpha", "flowkit-health-dashboard", "beta"];
+  const searchable = searchableCandidates(enabled, "flowkit-health-dashboard");
+  eq("the searcher is never a candidate", searchable.join(), "alpha,beta");
+  eq(
+    "and it is never switched off",
+    beginBisect(searchable, enabled, 1).disabled.includes("flowkit-health-dashboard"),
+    false
+  );
+  // It stays enabled throughout, because it is in originalEnabled but never
+  // in the disabled set.
+  const state = beginBisect(searchable, enabled, 1);
+  check(
+    "it stays running for the whole search",
+    desiredState(state).enable.includes("flowkit-health-dashboard")
+  );
+  eq(
+    "filtering is a no-op when it isn't in the list",
+    searchableCandidates(["alpha"], "flowkit-health-dashboard").join(),
+    "alpha"
+  );
 }
 
 // --- timeline ----------------------------------------------------------------

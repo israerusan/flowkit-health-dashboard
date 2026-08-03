@@ -65,6 +65,24 @@ function halfOf(candidates: string[]): string[] {
 }
 
 /**
+ * The plugins a search may switch off.
+ *
+ * Excludes the searcher itself, which is not fastidiousness — it is the
+ * difference between a feature and a disaster. Bisect disables half its
+ * candidates each round, so a run that included FlowKit would eventually
+ * unload FlowKit: the view disappears mid-search, the session state survives
+ * on disk describing a vault with half its plugins switched off, and the only
+ * thing that knows how to put them back is now disabled. The user would be
+ * re-enabling by hand, guessing at what had been on to begin with.
+ */
+export function searchableCandidates(
+  enabled: readonly string[],
+  selfId: string
+): string[] {
+  return enabled.filter((id) => id !== selfId);
+}
+
+/**
  * Open a session. `candidates` is what will be searched; anything enabled but
  * not a candidate stays on throughout, so the vault keeps working as normally
  * as it can while the search runs.

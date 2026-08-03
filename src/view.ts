@@ -33,7 +33,12 @@ import { conflictsFor, describeConflict, type Conflict } from "./conflicts";
 import { describeMute } from "./mutes";
 import { formatBytes, formatPeriod, pollPenalty, startupCost } from "./runtime";
 import { rankSafeDisable } from "./triage";
-import { describeRound, remainingText, roundsNeeded } from "./bisect";
+import {
+  describeRound,
+  remainingText,
+  roundsNeeded,
+  searchableCandidates,
+} from "./bisect";
 import { describeEvent, describeGap } from "./timeline";
 import { AUTO_SNAPSHOT, isNoop, type PluginProfile } from "./profiles";
 import { findKnownIssues } from "./issueSearch";
@@ -2476,10 +2481,15 @@ export class HealthDashboardView extends ItemView {
       this.openUpgrade("bisect");
       return;
     }
-    const candidates = this.results
-      .filter((r) => r.enabled)
-      .sort((a, b) => (a.overall ?? 100) - (b.overall ?? 100))
-      .map((r) => r.id);
+    // FlowKit is filtered out before the count and the round estimate, so the
+    // modal promises a search over the plugins that will actually be tested.
+    const candidates = searchableCandidates(
+      this.results
+        .filter((r) => r.enabled)
+        .sort((a, b) => (a.overall ?? 100) - (b.overall ?? 100))
+        .map((r) => r.id),
+      this.plugin.manifest.id
+    );
 
     if (candidates.length < 2) {
       new Notice("Bisect needs at least two enabled plugins to search.");

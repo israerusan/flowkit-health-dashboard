@@ -34,6 +34,7 @@ import {
   bisectStep,
   desiredState,
   restoreState,
+  searchableCandidates,
   type BisectState,
 } from "./bisect";
 import {
@@ -943,6 +944,9 @@ export default class FlowKitHealthPlugin extends Plugin {
    * than to be offered.
    */
   async startBisect(candidates: string[], symptom?: string): Promise<BisectState> {
+    // Enforced here rather than at the call site, so no future caller can hand
+    // this a list containing FlowKit and switch off the search itself.
+    const searchable = searchableCandidates(candidates, this.manifest.id);
     const enabled = [...(this.pluginsApi().enabledPlugins ?? new Set<string>())];
     this.settings.profiles = saveProfile(
       this.settings.profiles,
@@ -950,7 +954,7 @@ export default class FlowKitHealthPlugin extends Plugin {
       enabled,
       Date.now()
     );
-    const state = beginBisect(candidates, enabled, Date.now(), symptom);
+    const state = beginBisect(searchable, enabled, Date.now(), symptom);
     this.settings.bisect = state;
     await this.saveSettings();
     await this.applyBisectState(state);
