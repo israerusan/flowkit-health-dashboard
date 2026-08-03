@@ -27,7 +27,9 @@
 }
 .flowkit-health-header h2 {
   margin: 0;
-  font-size: 1.1em;
+  font-size: 1.35em;
+  font-weight: 700;
+  letter-spacing: -0.01em;
 }
 
 .flowkit-pro-pill {
@@ -77,16 +79,22 @@
   background: var(--interactive-accent-hover);
 }
 
-/* Hero: gauge + verdict -------------------------------------------------- */
+/* Hero: gauge + verdict --------------------------------------------------
+   The one element on the page that is allowed to be large. Everything else
+   here is deliberately quiet, so the verdict has to carry the weight or the
+   dashboard opens as an undifferentiated wall of 0.8em text. */
 .flowkit-hero {
   display: flex;
   align-items: center;
-  gap: 16px;
-  padding: 14px;
-  margin: 6px 0 12px;
+  gap: 20px;
+  padding: 20px 22px;
+  margin: 8px 0 16px;
   background: var(--background-secondary);
   border: 1px solid var(--background-modifier-border);
-  border-radius: 12px;
+  border-radius: 14px;
+  /* A single soft shadow and a hairline highlight: enough to lift the card off
+     the page in both themes without inventing colours a theme didn't choose. */
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04), 0 6px 20px -12px rgba(0, 0, 0, 0.28);
 }
 /* The score, without the ring. */
 .flowkit-hero-score {
@@ -95,29 +103,34 @@
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  min-width: 74px;
+  min-width: 88px;
+  padding-right: 20px;
+  border-right: 1px solid var(--background-modifier-border);
 }
 .flowkit-hero-number {
-  font-size: 2.1em;
+  font-size: 2.9em;
   font-weight: 800;
   line-height: 1;
+  letter-spacing: -0.02em;
   font-variant-numeric: tabular-nums;
 }
 /* The grade letter is the most memorable thing in the product; it used to be
    rendered smaller and greyer than the digits above it. */
 .flowkit-hero-grade {
-  font-size: 1em;
+  font-size: 0.78em;
   font-weight: 700;
-  margin-top: 2px;
-  letter-spacing: 0.02em;
+  margin-top: 6px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 }
 .flowkit-hero-text {
   min-width: 0;
 }
 .flowkit-hero-text h3 {
-  margin: 0 0 4px;
-  font-size: 1.02em;
-  line-height: 1.3;
+  margin: 0 0 6px;
+  font-size: 1.16em;
+  line-height: 1.32;
+  letter-spacing: -0.01em;
 }
 .flowkit-hero-sub {
   margin: 0;
@@ -1593,5 +1606,251 @@
   .flowkit-bisect-progress {
     margin-left: 0;
     width: 100%;
+  }
+}
+
+/* Loading: the shape of the answer, and what is actually happening ---------
+   A centred spinner over a blank page tells the user nothing, so a slow scan
+   and a hung one look identical. The skeleton reserves the layout the results
+   will occupy, and the caption underneath is reported by the scan itself
+   rather than being a fixed script of stages it may never run. */
+.flowkit-loading {
+  padding: 20px 0 8px;
+}
+.flowkit-loading-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.9em;
+  color: var(--text-muted);
+  margin-bottom: 10px;
+}
+.flowkit-loading-label {
+  font-variant-numeric: tabular-nums;
+}
+.flowkit-loading-bar {
+  height: 3px;
+  border-radius: 999px;
+  background: var(--background-modifier-border);
+  overflow: hidden;
+  margin-bottom: 18px;
+}
+.flowkit-loading-fill {
+  height: 100%;
+  width: var(--flowkit-progress, 0%);
+  background: var(--interactive-accent);
+  border-radius: inherit;
+  transition: width 180ms ease;
+}
+/* No proportion to report yet: sweep rather than assert a percentage. */
+.flowkit-loading-bar.is-indeterminate .flowkit-loading-fill {
+  width: 34%;
+  animation: flowkit-sweep 1100ms ease-in-out infinite;
+}
+@keyframes flowkit-sweep {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(320%);
+  }
+}
+
+.flowkit-skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.flowkit-skeleton-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.flowkit-skeleton-name {
+  flex: 1 1 auto;
+  height: 12px;
+  border-radius: 4px;
+}
+.flowkit-skeleton-chip {
+  flex: 0 0 auto;
+  width: 34px;
+  height: 12px;
+  border-radius: 999px;
+}
+.flowkit-skeleton-name,
+.flowkit-skeleton-chip {
+  background: linear-gradient(
+    90deg,
+    var(--background-modifier-border) 25%,
+    var(--background-modifier-hover) 37%,
+    var(--background-modifier-border) 63%
+  );
+  background-size: 400% 100%;
+  animation: flowkit-shimmer 1400ms ease-in-out infinite;
+}
+/* Rows further down start later, so the placeholder reads as a list settling
+   rather than as one block pulsing. */
+.flowkit-skeleton-row:nth-child(2) * {
+  animation-delay: 90ms;
+}
+.flowkit-skeleton-row:nth-child(3) * {
+  animation-delay: 180ms;
+}
+.flowkit-skeleton-row:nth-child(4) * {
+  animation-delay: 270ms;
+}
+.flowkit-skeleton-row:nth-child(n + 5) * {
+  animation-delay: 360ms;
+}
+@keyframes flowkit-shimmer {
+  0% {
+    background-position: 100% 50%;
+  }
+  100% {
+    background-position: 0 50%;
+  }
+}
+
+/* Empty and blank states --------------------------------------------------
+   Three different situations produce "nothing here", and the way out of each
+   is different, so they are no longer one line of grey text. */
+.flowkit-blank {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  text-align: center;
+  padding: 40px 20px;
+  color: var(--text-muted);
+}
+.flowkit-blank-icon {
+  display: inline-flex;
+  color: var(--text-faint, var(--text-muted));
+  opacity: 0.7;
+  transform: scale(1.6);
+  margin-bottom: 10px;
+}
+.flowkit-blank-title {
+  font-size: 1.02em;
+  font-weight: 600;
+  color: var(--text-normal);
+}
+.flowkit-blank-body {
+  font-size: 0.86em;
+  max-width: 42ch;
+  line-height: 1.5;
+}
+.flowkit-blank button {
+  margin-top: 10px;
+  cursor: pointer;
+}
+
+/* A bisect transition that could not be established, and the salvage card. */
+.flowkit-bisect-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 9px 11px;
+  font-size: 0.85em;
+  line-height: 1.45;
+  border-radius: 8px;
+  color: var(--text-normal);
+  background: color-mix(in srgb, var(--color-red, #c62828) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--color-red, #c62828) 35%, transparent);
+}
+.flowkit-bisect-error-icon {
+  display: inline-flex;
+  flex: 0 0 auto;
+  margin-top: 1px;
+  color: var(--color-red, #c62828);
+}
+.flowkit-bisect-salvage {
+  border-color: color-mix(in srgb, var(--color-orange, #e07b39) 45%, transparent);
+}
+.flowkit-coverage-note.is-bad {
+  border-color: color-mix(in srgb, var(--color-red, #c62828) 35%, transparent);
+  background: color-mix(in srgb, var(--color-red, #c62828) 8%, transparent);
+}
+
+/* Motion ------------------------------------------------------------------
+   Enough to make a state change legible, and nothing that makes the user wait
+   on it. Every duration here is under 200ms, and the whole layer is removed
+   for anyone who has asked for reduced motion — including the looping
+   skeleton and spinner, which are the ones that actually cause trouble. */
+.flowkit-detail {
+  animation: flowkit-reveal 140ms ease-out;
+}
+@keyframes flowkit-reveal {
+  from {
+    opacity: 0;
+    transform: translateY(-3px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.flowkit-insight,
+.flowkit-stat,
+.flowkit-health-btn,
+.flowkit-menu-btn,
+.flowkit-plugin-name {
+  transition:
+    background-color 120ms ease,
+    border-color 120ms ease,
+    color 120ms ease,
+    transform 120ms ease;
+}
+.flowkit-insight.is-clickable:hover {
+  transform: translateY(-1px);
+  border-color: var(--background-modifier-border-hover, var(--interactive-accent));
+}
+.flowkit-stat:active {
+  transform: translateY(1px);
+}
+.flowkit-health-table tbody tr {
+  transition: background-color 100ms ease;
+}
+/* The score chip is the thing being compared across a row, so it gets the one
+   piece of decoration in the table: a hairline that firms up under the cursor
+   rather than a colour change that would fight the tone. */
+.flowkit-chip {
+  transition:
+    border-color 120ms ease,
+    background-color 120ms ease;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .flowkit-detail,
+  .flowkit-skeleton-name,
+  .flowkit-skeleton-chip,
+  .flowkit-loading-bar.is-indeterminate .flowkit-loading-fill,
+  .flowkit-spin {
+    animation: none;
+  }
+  .flowkit-insight,
+  .flowkit-stat,
+  .flowkit-health-btn,
+  .flowkit-menu-btn,
+  .flowkit-plugin-name,
+  .flowkit-health-table tbody tr,
+  .flowkit-chip,
+  .flowkit-loading-fill,
+  .flowkit-health.is-busy .flowkit-rows {
+    transition: none;
+  }
+  .flowkit-insight.is-clickable:hover,
+  .flowkit-stat:active {
+    transform: none;
+  }
+  /* Still needs to read as a placeholder without the shimmer. */
+  .flowkit-skeleton-name,
+  .flowkit-skeleton-chip {
+    background: var(--background-modifier-border);
+  }
+  .flowkit-loading-bar.is-indeterminate .flowkit-loading-fill {
+    width: 100%;
+    opacity: 0.5;
   }
 }

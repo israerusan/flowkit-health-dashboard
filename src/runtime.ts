@@ -30,12 +30,20 @@ export interface RuntimeProfile {
   /** How many repeating timers this plugin currently holds. */
   timers?: number;
   /**
-   * Longest single run of one of those timer callbacks, in milliseconds.
+   * Longest single SYNCHRONOUS run of one of those timer callbacks, in
+   * milliseconds.
    *
    * This is the number that actually explains a laggy vault. Obsidian's UI is
    * single-threaded, so a callback that takes 180 ms is 180 ms in which nothing
    * you type appears — and a plugin can hold a slow callback on a slow timer
    * and still look cheap by every other measure here.
+   *
+   * Synchronous is the honest word, and the limit is deliberate. The wrapper
+   * that produces this sits in front of every timer tick in the vault, so it
+   * times the callback and stops — a callback that returns a promise is
+   * measured up to that return. Following the promise would mean measuring
+   * network latency and scheduling delay as though they were time the interface
+   * spent frozen, which is the opposite of what this number is for.
    */
   maxTickMs?: number;
   /** How many callback runs that maximum was drawn from. */
@@ -199,7 +207,9 @@ export function readFootprint(
   if (tick != null && Number.isFinite(tick) && tick > TICK_FREE_MS) {
     sawRuntime = true;
     scores.push(tickScore(tick));
-    parts.push(`blocks the interface for ${Math.round(tick)} ms each time that timer fires`);
+    parts.push(
+      `blocks the interface for ${Math.round(tick)} ms of work each time that timer fires`
+    );
   }
 
   if (!scores.length) {

@@ -18,7 +18,7 @@ import {
 import { ErrorWatcher } from "./errorWatcher";
 import { pruneErrorLog } from "./errors";
 import { diffTrouble, sameKinds } from "./changes";
-import { RuntimeWatcher } from "./runtimeWatcher";
+import { RuntimeWatcher, type ProfileRunResult } from "./runtimeWatcher";
 import { pruneProfiles, type RuntimeProfiles } from "./runtime";
 import { buildMute, migrateMutes, sweepMutes, type MuteRecord } from "./mutes";
 import {
@@ -53,6 +53,7 @@ import {
   type ProfileDelta,
 } from "./profiles";
 import { LicenseManager } from "./license/LicenseManager";
+import { SaveQueue, cloneState, isUsableCache, mapWithConcurrency } from "./persistence";
 import {
   DEFAULT_SETTINGS,
   FlowKitHealthSettingTab,
@@ -96,6 +97,34 @@ type AppInternals = {
   hotkeyManager?: { customKeys?: Record<string, Hotkey[]> };
 };
 
+/** Where a scan has got to, for a loading state that says something true. */
+export interface ScanPhase {
+  label: string;
+  done?: number;
+  total?: number;
+}
+
+export type ScanPhaseReporter = (phase: ScanPhase) => void;
+
+/** One plugin that would not move, and why. */
+export interface LifecycleFailure {
+  id: string;
+  error: unknown;
+}
+
+/**
+ * What a bulk enable/disable actually did.
+ *
+ * `changed` used to be the whole return value, and it was appended to on faith:
+ * the internal API call was optional-chained, so a build without those methods
+ * resolved having done nothing and every caller reported a change that never
+ * happened. Undo, saved sets and bisect all rest on this list being true.
+ */
+export interface LifecycleResult {
+  changed: string[];
+  failed: LifecycleFailure[];
+}
+
 /** Cap on stored trend snapshots — plenty for a readable history. */
 const MAX_HISTORY = 90;
 
@@ -124,6 +153,17 @@ const LOCAL_RESCAN_THROTTLE_MS = 15_000;
 
 /** A displayed scan older than this is refreshed when the view is next looked at. */
 const STALE_SCAN_MS = 30_000;
+
+/**
+ * How many plugins a scan inspects on disk at once.
+ *
+ * Deliberately small. Each plugin means two `adapter.stat` calls, so this is
+ * already up to eight outstanding filesystem operations — and the adapter
+ * underneath may be a phone, a network share, or a folder a sync client is
+ * currently walking, none of which get faster by being asked for more at once.
+ * The win here is removing the serial chain, not saturating the disk.
+ */
+const SCAN_CONCURRENCY = 4;
 
 export default class FlowKitHealthPlugin extends Plugin {
   settings: FlowKitHealthSettings = DEFAULT_SETTINGS;
@@ -154,6 +194,41 @@ export default class FlowKitHealthPlugin extends Plugin {
 
   /** When the last watcher-triggered local rescan ran. */
   private lastLocalRescan = 0;
+
+  /** A rescan deferred by the throttle, so a burst still lands once it passes. */
+  private trailingRescan: number | null = null;
+
+  /**
+   * One writer for data.json.
+   *
+   * `await saveSettings()` is used as a durability barrier where it genuinely
+   * matters — the bisect recovery record is written before a single plugin is
+   * switched off — so writes may be serialised and collapsed, but that
+   * guarantee has to survive it. See `SaveQueue`.
+   */
+  private readonly saveQueue = new SaveQueue<FlowKitHealthSettings>(
+    () => cloneState(this.settings),
+    (state) => this.saveData(state)
+  );
+
+  /**
+   * Set when `data.json` could not be read. Automatic saves are then suppressed
+   * for the session: continuing to run on defaults is fine, but writing those
+   * defaults back over a file that is merely locked, half-synced or briefly
+   * unreadable would turn a recoverable problem into permanent data loss —
+   * including the bisect recovery record for a vault that is currently half
+   * switched off.
+   */
+  settingsUnreadable = false;
+
+  /** A bisect record that survived to disk in a shape we can't act on. */
+  bisectSalvage: unknown = null;
+
+  /** Why the last bisect transition failed, when one did. */
+  bisectError: string | null = null;
+
+  /** Set while a bisect round is being established; answers are refused until it clears. */
+  private bisectApplying = false;
 
   /**
    * Mutes that lapsed during the last scan. Surfaced once, so a plugin
@@ -214,7 +289,13 @@ export default class FlowKitHealthPlugin extends Plugin {
         onChange: () => {
           // Re-score, not just repaint: an error that just landed changes
           // Reliability, and repainting the previous scan hides it.
-          void this.saveSettings().then(() => this.requestLocalRescan());
+          //
+          // The rescan is not conditional on the write. An observation that is
+          // in memory is worth showing whether or not it reached disk, and
+          // chaining them meant a read-only vault silently stopped updating the
+          // dashboard as well as its history.
+          this.saveQuietly();
+          this.requestLocalRescan();
         },
       });
       this.errorWatcher.start(this.settings.trackConsoleErrors);
@@ -229,7 +310,8 @@ export default class FlowKitHealthPlugin extends Plugin {
           // The first flush lands ~5s after startup, by which time a polling
           // plugin has actually polled — which is the only reason the runtime
           // signals ever appear on a dashboard opened at launch.
-          void this.saveSettings().then(() => this.requestLocalRescan());
+          this.saveQuietly();
+          this.requestLocalRescan();
         },
       });
       // Started before anything else touches the plugin registry, so the
@@ -245,6 +327,14 @@ export default class FlowKitHealthPlugin extends Plugin {
     // now it registered a ribbon icon and one command and nothing else, so
     // plugin health was a curiosity satisfied exactly once: install, see a
     // grade, disable two things, never reopen.
+    if (this.settingsUnreadable) {
+      new Notice(
+        "FlowKit couldn't read its own settings file, so it has started with defaults and " +
+          "won't save over it. Your history, licence and saved sets are still on disk.",
+        12_000
+      );
+    }
+
     this.app.workspace.onLayoutReady(() => {
       void this.checkAppVersion().then(() => this.backgroundScan());
     });
@@ -260,6 +350,10 @@ export default class FlowKitHealthPlugin extends Plugin {
     // be put back by hand.
     this.errorWatcher?.stop();
     this.runtimeWatcher?.stop();
+    if (this.trailingRescan != null) {
+      window.clearTimeout(this.trailingRescan);
+      this.trailingRescan = null;
+    }
   }
 
   /**
@@ -580,7 +674,19 @@ export default class FlowKitHealthPlugin extends Plugin {
 
   async loadSettings(): Promise<void> {
     // `loadData()` is typed `any`; narrow it before merging so the assignment is type-safe.
-    const data = (await this.loadData()) as Partial<FlowKitHealthSettings> | null;
+    //
+    // A rejection here used to escape `onload` and stop the plugin loading at
+    // all — a corrupt or momentarily unreadable data.json took the whole
+    // dashboard with it. Start from defaults instead, and remember that we did,
+    // because writing those defaults back would destroy the file we couldn't
+    // read.
+    let data: Partial<FlowKitHealthSettings> | null = null;
+    try {
+      data = (await this.loadData()) as Partial<FlowKitHealthSettings> | null;
+    } catch (err) {
+      console.error("FlowKit: could not read data.json", err);
+      this.settingsUnreadable = true;
+    }
     this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
     // A hand-edited or sync-mangled data.json can carry `null` where an array
     // belongs; every read below assumes array methods exist, so coerce once here
@@ -604,8 +710,12 @@ export default class FlowKitHealthPlugin extends Plugin {
     if (!this.settings.seenPlugins || typeof this.settings.seenPlugins !== "object") {
       this.settings.seenPlugins = {};
     }
-    // A half-written bisect is worse than none: it would claim a set of
-    // plugins to restore that it can't actually name.
+    // A half-written bisect can't be acted on: it would claim a set of plugins
+    // to restore that it can't actually name. But it must not simply be
+    // deleted, because the vault it describes may right now be half switched
+    // off — and throwing the record away strands it with nothing left that
+    // knows what "back to normal" meant. Keep it aside and offer the automatic
+    // snapshot as a way out.
     const bisect = this.settings.bisect;
     if (
       bisect &&
@@ -613,7 +723,18 @@ export default class FlowKitHealthPlugin extends Plugin {
         !Array.isArray(bisect.originalEnabled) ||
         !Array.isArray(bisect.disabled))
     ) {
+      this.bisectSalvage = bisect;
       this.settings.bisect = null;
+    }
+    // The persisted community projection is read without further checking all
+    // through `computeAll` — `cache?.plugins[id]` optional-chains the cache and
+    // not the map inside it — so a sync-mangled object took the whole scan
+    // down. Validate the entire contract or drop it: a half-valid cache is
+    // worse than none, because it also suppresses the refetch that would
+    // replace it, and reports coverage it doesn't have.
+    if (this.settings.cache && !isUsableCache(this.settings.cache)) {
+      console.error("FlowKit: the stored community cache was malformed; discarding it.");
+      this.settings.cache = null;
     }
     if (!this.settings.runtimeProfiles || typeof this.settings.runtimeProfiles !== "object") {
       this.settings.runtimeProfiles = {};
@@ -631,8 +752,43 @@ export default class FlowKitHealthPlugin extends Plugin {
     );
   }
 
+  /**
+   * Persist settings, one write at a time.
+   *
+   * Five different things write this file — the foreground scan, the six-hourly
+   * background pass, both watchers, the detached repository lookups, and every
+   * user action — and none of them coordinated. Overlapping `saveData` calls
+   * can complete out of order, which means an older state can be the one that
+   * lands last.
+   *
+   * Concurrent requests collapse into a single write, which is also what stops
+   * one scan rewriting data.json several times. What must NOT collapse is the
+   * promise: `await saveSettings()` is a durability barrier before the bisect
+   * touches a plugin, so a caller is only resolved once a write that included
+   * its mutations actually completed. Hence the revision counter rather than a
+   * shared "there is a save pending" flag.
+   */
   async saveSettings(): Promise<void> {
-    await this.saveData(this.settings);
+    // Refusing to write is the point: see `settingsUnreadable`. Silently
+    // dropping the write is still better than overwriting the file, and the
+    // dashboard says so rather than pretending the setting stuck.
+    if (this.settingsUnreadable) return;
+    await this.saveQueue.save();
+  }
+
+  /**
+   * Save without making the caller responsible for the outcome.
+   *
+   * A write failure now rejects every caller the write would have covered,
+   * which is the correct semantics and means a fire-and-forget `void save()`
+   * would surface as an unhandled rejection — in a plugin whose own error
+   * watcher is listening for exactly those. Background bookkeeping uses this;
+   * anything that needs the write to have happened awaits `saveSettings`.
+   */
+  private saveQuietly(): void {
+    void this.saveSettings().catch((err) => {
+      console.error("FlowKit: could not save settings", err);
+    });
   }
 
   /**
@@ -677,10 +833,25 @@ export default class FlowKitHealthPlugin extends Plugin {
    * network could answer.
    */
   requestLocalRescan(): void {
+    // With no dashboard on screen there is nothing to rescan, and consuming the
+    // throttle window here meant the next observation — the one that lands
+    // while the user is actually looking — could be held back by fifteen
+    // seconds of work that never happened.
+    if (!this.hasOpenDashboard()) return;
     const now = Date.now();
     if (now - this.lastLocalRescan < LOCAL_RESCAN_THROTTLE_MS) {
-      // Too soon to re-score, but the newest counts are still worth painting.
-      this.refreshViews();
+      // Leading edge already fired. Repainting here was pointless — `rerender()`
+      // redraws the same PluginHealth objects, and every signal a watcher
+      // observes lives inside those objects — so the observation was silently
+      // dropped, which is the whole of what "background monitoring" is meant to
+      // do. Hold one trailing pass instead.
+      if (this.trailingRescan != null) return;
+      const wait = LOCAL_RESCAN_THROTTLE_MS - (now - this.lastLocalRescan);
+      this.trailingRescan = window.setTimeout(() => {
+        this.trailingRescan = null;
+        this.lastLocalRescan = Date.now();
+        this.refreshViews(true, false);
+      }, wait);
       return;
     }
     this.lastLocalRescan = now;
@@ -691,6 +862,13 @@ export default class FlowKitHealthPlugin extends Plugin {
   scanIsStale(): boolean {
     const last = this.settings.lastScanAt ?? 0;
     return Date.now() - last > STALE_SCAN_MS;
+  }
+
+  /** Whether a dashboard is on screen for a rescan to land in. */
+  private hasOpenDashboard(): boolean {
+    return this.app.workspace
+      .getLeavesOfType(VIEW_TYPE_HEALTH)
+      .some((leaf) => leaf.view instanceof HealthDashboardView);
   }
 
   refreshViews(rescan = false, allowFetch = false): void {
@@ -772,9 +950,16 @@ export default class FlowKitHealthPlugin extends Plugin {
    *   actually asked for.
    */
   async computeAll(
-    opts: { force?: boolean; allowFetch?: boolean } = {}
+    opts: { force?: boolean; allowFetch?: boolean; onPhase?: ScanPhaseReporter } = {}
   ): Promise<{ results: PluginHealth[]; coverage: DataCoverage }> {
-    const { force = false, allowFetch = true } = opts;
+    const { force = false, allowFetch = true, onPhase } = opts;
+    // Reported, not invented. A progress line that names stages the code cannot
+    // observe is worse than a spinner: it looks like information and is
+    // theatre, and the one stage that genuinely takes seconds — downloading
+    // ~3.7 MB of community data — is the one a fixed script would get wrong,
+    // because most scans skip it entirely.
+    const phase = (label: string, done?: number, total?: number): void =>
+      onPhase?.({ label, done, total });
     const api = this.pluginsApi();
     const manifests = Object.values(api.manifests ?? {});
     const enabledSet = api.enabledPlugins ?? new Set<string>();
@@ -790,6 +975,7 @@ export default class FlowKitHealthPlugin extends Plugin {
       cache = this.settings.cache;
       const stale = !cache || Date.now() - cache.at > CACHE_TTL_MS;
       if (allowFetch && (force || stale)) {
+        phase("Downloading the community plugin directory…");
         const fetched = await this.fetchRemoteCache(
           coverage,
           new Set(manifests.map((m) => m.id))
@@ -809,6 +995,12 @@ export default class FlowKitHealthPlugin extends Plugin {
     // A mute with an expiry has to actually expire, and the user has to be able
     // to find out that it did — otherwise a plugin silently rejoins the counts
     // and the change reads as a scoring glitch.
+    // One scan used to rewrite data.json up to five times — expired mutes,
+    // pruned stores, recorded events, then the view's snapshot and change diff.
+    // On a synced vault that is five sync events for one Refresh. Collect the
+    // bookkeeping and write it once, at the end.
+    let dirty = false;
+
     const sweep = sweepMutes(this.settings.mutes, now, apiVersion);
     if (sweep.expired.length) {
       this.settings.mutes = sweep.active;
@@ -816,14 +1008,14 @@ export default class FlowKitHealthPlugin extends Plugin {
       this.settings.ignored = this.settings.ignored.filter(
         (id) => !sweep.expired.includes(id)
       );
-      await this.saveSettings();
+      dirty = true;
     }
     const mutes = this.settings.mutes;
     const watchedIds = new Set(this.settings.watched);
 
     // Uninstalling a plugin should also drop everything recorded about it,
     // rather than leaving it to accumulate in data.json indefinitely.
-    await this.pruneStores(installedIds);
+    if (this.pruneStores(installedIds)) dirty = true;
 
     if (
       this.settings.checkRepoActivity &&
@@ -844,46 +1036,72 @@ export default class FlowKitHealthPlugin extends Plugin {
     const runtime: RuntimeProfiles =
       this.runtimeWatcher?.snapshot() ?? this.settings.runtimeProfiles;
 
-    const results: PluginHealth[] = [];
-    for (const manifest of manifests) {
-      const enabled = enabledSet.has(manifest.id);
-      if (!enabled && !this.settings.showDisabled) continue;
+    // Every scoring input is read once, here, so that the rows below all
+    // describe the same moment. They used to be read per plugin inside the
+    // loop, which was harmless while the loop was strictly serial and stops
+    // being harmless the moment any of it overlaps: a background repository
+    // lookup landing mid-scan would give the first half of the table one set of
+    // facts and the second half another.
+    const errorLog = this.settings.errorLog;
+    const repoActivity = this.settings.repoActivity;
+    const observedMs = this.observedMs();
+    const isMobile = Platform.isMobile;
+    const scored = manifests.filter(
+      (m) => enabledSet.has(m.id) || this.settings.showDisabled
+    );
 
+    // Bundle sizes are the one asynchronous input, and they were measured
+    // strictly one plugin after another: on a large vault that is a couple of
+    // hundred adapter round trips in series before anything renders. Run a few
+    // at a time and write each result into its own slot, so row order stays
+    // exactly the manifest order regardless of which stat finishes first.
+    let inspected = 0;
+    phase("Measuring what each plugin loads…", 0, scored.length);
+    const bundles = await mapWithConcurrency(scored, SCAN_CONCURRENCY, async (m) => {
+      const bytes = await this.measureBundle(m);
+      phase("Measuring what each plugin loads…", ++inspected, scored.length);
+      return bytes;
+    });
+    phase("Scoring…");
+
+    const results: PluginHealth[] = scored.map((manifest, i) => {
       const cached = cache?.plugins[manifest.id];
-      const remote = remoteFromCache(cached);
-      results.push(
-        computeHealth(
-          {
-            manifest,
-            enabled,
-            isMobile: Platform.isMobile,
-            repo: cached?.repo,
-            remote,
-            bundleBytes: await this.measureBundle(manifest),
-            downloadPercentile: rank(cached?.downloads),
-            listing: classifyListing(manifest.id, cache),
-            errors: this.settings.errorLog[manifest.id],
-            observedMs: this.observedMs(),
-            muted: manifest.id in mutes,
-            mute: mutes[manifest.id],
-            watched: watchedIds.has(manifest.id),
-            runtime: runtime[manifest.id],
-            repoActivity: this.settings.repoActivity[manifest.id],
-          },
-          now
-        )
+      return computeHealth(
+        {
+          manifest,
+          enabled: enabledSet.has(manifest.id),
+          isMobile,
+          repo: cached?.repo,
+          remote: remoteFromCache(cached),
+          bundleBytes: bundles[i],
+          downloadPercentile: rank(cached?.downloads),
+          listing: classifyListing(manifest.id, cache),
+          errors: errorLog[manifest.id],
+          observedMs,
+          muted: manifest.id in mutes,
+          mute: mutes[manifest.id],
+          watched: watchedIds.has(manifest.id),
+          runtime: runtime[manifest.id],
+          repoActivity: repoActivity[manifest.id],
+        },
+        now
       );
-    }
+    });
     this.settings.lastScanAt = now;
     // Recorded last, so an event is only ever written for a scan that actually
     // produced results — a scan that threw halfway would otherwise move the
     // baseline forward and lose the change it was in the middle of noticing.
-    await this.recordEvents(manifests, enabledSet, now);
+    if (this.recordEvents(manifests, enabledSet, now)) dirty = true;
+    if (dirty) await this.saveSettings();
     return { results, coverage };
   }
 
-  /** Forget everything recorded about plugins that are no longer installed. */
-  private async pruneStores(installed: Set<string>): Promise<void> {
+  /**
+   * Forget everything recorded about plugins that are no longer installed.
+   * Returns whether anything changed, so the caller can fold the write into the
+   * scan's single save.
+   */
+  private pruneStores(installed: Set<string>): boolean {
     let dirty = false;
     const errors = pruneErrorLog(this.settings.errorLog, installed);
     if (Object.keys(errors).length !== Object.keys(this.settings.errorLog).length) {
@@ -902,7 +1120,7 @@ export default class FlowKitHealthPlugin extends Plugin {
       this.settings.repoActivity = repos;
       dirty = true;
     }
-    if (dirty) await this.saveSettings();
+    return dirty;
   }
 
   /**
@@ -962,15 +1180,26 @@ export default class FlowKitHealthPlugin extends Plugin {
     if (!wanted.length) return;
 
     const byId = new Map(rows.map((r) => [r.id, r]));
-    const next: RepoActivityMap = { ...this.settings.repoActivity };
+    const fetched: RepoActivityMap = {};
     // Sequential on purpose: six parallel requests to one API is how a soft
     // rate limit becomes a hard one, and nothing here is time-critical.
     for (const id of wanted) {
       const repo = byId.get(id)?.repo;
       if (!repo) continue;
-      next[id] = await fetchRepoActivity(repo, now);
+      fetched[id] = await fetchRepoActivity(repo, now);
     }
-    this.settings.repoActivity = next;
+    // Merged into whatever the map is NOW, not into the copy taken before these
+    // requests went out. Each of them takes seconds; a scan finishing in the
+    // meantime prunes the entries for plugins that have since been uninstalled,
+    // and writing back the pre-request copy would put every one of them
+    // straight back — an invariant undone by a slow network call.
+    const installed = new Set(Object.keys(this.pluginsApi().manifests ?? {}));
+    const merged: RepoActivityMap = { ...this.settings.repoActivity };
+    for (const [id, activity] of Object.entries(fetched)) {
+      if (!installed.has(id)) continue;
+      merged[id] = activity;
+    }
+    this.settings.repoActivity = merged;
     await this.saveSettings();
     // The readings only reach the user through a rescan — and this one is
     // local-only, so a lookup landing can't trigger another download.
@@ -980,8 +1209,11 @@ export default class FlowKitHealthPlugin extends Plugin {
   /**
    * Plugins competing for the same shortcut or command name.
    *
-   * Read fresh on every render rather than cached: hotkeys change the moment
-   * the user rebinds one, and a stale conflict list is worse than none.
+   * Read fresh on every SCAN, not on every render — which the comment here used
+   * to claim and the view has never done. Walking the whole command registry
+   * and the custom-key map on each repaint is real work for a signal that only
+   * moves when the user opens Obsidian's hotkey settings, and a rebind is
+   * followed by coming back to this tab, which is itself a rescan.
    */
   detectConflicts(): Conflict[] {
     const internals = this.app as unknown as AppInternals;
@@ -1013,6 +1245,11 @@ export default class FlowKitHealthPlugin extends Plugin {
     return ms;
   }
 
+  /** Every installed plugin's manifest, for the states that have no scan yet. */
+  installedManifests(): Record<string, PluginManifest> {
+    return this.pluginsApi().manifests ?? {};
+  }
+
   /** Whether runtime measurement is switched on and running. */
   get runtimeTracking(): boolean {
     return this.runtimeWatcher != null;
@@ -1032,7 +1269,28 @@ export default class FlowKitHealthPlugin extends Plugin {
    * switch off half your plugins" needs the way back to already exist rather
    * than to be offered.
    */
-  async startBisect(candidates: string[], symptom?: string): Promise<BisectState> {
+  /**
+   * Whether an operation whose safety rests on a recovery record may run.
+   *
+   * Bisect's entire safety argument is "the way back is written down before
+   * anything moves". With settings unreadable, `saveSettings` is a no-op — so
+   * that sentence becomes false while every step still reports success, and
+   * FlowKit would switch half a vault off with nothing on disk that knows how
+   * to put it back. Refusing is the only honest answer.
+   */
+  get canPersist(): boolean {
+    return !this.settingsUnreadable;
+  }
+
+  async startBisect(candidates: string[], symptom?: string): Promise<BisectState | null> {
+    if (!this.canPersist) {
+      new Notice(
+        "FlowKit can't start a search while it can't save: the record of which plugins to " +
+          "put back afterwards wouldn't survive a restart. Restart Obsidian and try again.",
+        10_000
+      );
+      return null;
+    }
     // Enforced here rather than at the call site, so no future caller can hand
     // this a list containing FlowKit and switch off the search itself.
     const searchable = searchableCandidates(candidates, this.manifest.id);
@@ -1050,10 +1308,20 @@ export default class FlowKitHealthPlugin extends Plugin {
     return state;
   }
 
-  /** Answer the current round and move to the next. */
+  /**
+   * Answer the current round and move to the next.
+   *
+   * The new round is persisted BEFORE any plugin moves, and that ordering is
+   * deliberate: the state is expressed as a target rather than a diff, so a
+   * crash between the write and the toggles leaves a record that reconciles
+   * itself on the next load. Writing after the toggles would leave the old
+   * round on disk describing a vault that is no longer in it.
+   */
   async answerBisect(gone: boolean): Promise<BisectState | null> {
     const current = this.settings.bisect;
-    if (!current) return null;
+    // An answer arriving mid-transition would be an answer about a vault that
+    // is still being rearranged.
+    if (!current || this.bisectApplying) return null;
     const next = bisectStep(current, gone);
     this.settings.bisect = next;
     await this.saveSettings();
@@ -1061,15 +1329,33 @@ export default class FlowKitHealthPlugin extends Plugin {
     return next;
   }
 
-  /** Abandon the search and put everything back. */
+  /**
+   * Abandon the search and put everything back.
+   *
+   * Restore first, then clear. The other order looks tidier and is the one
+   * thing that must never happen: `originalEnabled` is the only record of what
+   * this vault looked like, and erasing it before the plugins are actually back
+   * on strands a half-disabled vault with nothing left that knows what normal
+   * was.
+   */
   async cancelBisect(): Promise<void> {
     const current = this.settings.bisect;
-    if (!current) return;
-    const { enable } = restoreState(current);
-    this.settings.bisect = null;
-    await this.saveSettings();
-    await this.enableMany(enable);
-    this.refreshViews(true, false);
+    if (!current || this.bisectApplying) return;
+    this.bisectApplying = true;
+    try {
+      const { enable } = restoreState(current);
+      const result = await this.enableMany(enable);
+      if (result.failed.length) {
+        this.bisectError = restoreFailureMessage(result.failed);
+        return;
+      }
+      this.settings.bisect = null;
+      this.bisectError = null;
+      await this.saveSettings();
+    } finally {
+      this.bisectApplying = false;
+      this.refreshViews(true, false);
+    }
   }
 
   /**
@@ -1077,43 +1363,113 @@ export default class FlowKitHealthPlugin extends Plugin {
    * else back on. Keeping the culprit off is the whole point — re-enabling the
    * plugin we just proved is the problem, in order to offer to disable it,
    * would be pure ceremony.
+   *
+   * Expressed as one target state rather than "restore, then also disable one":
+   * a failure partway through the second step would otherwise leave the culprit
+   * running with the record already cleared.
    */
   async finishBisect(keepCulpritOff = true): Promise<void> {
     const current = this.settings.bisect;
-    if (!current) return;
-    const culprit = current.culprit;
-    const enable = current.originalEnabled.filter(
-      (id) => !(keepCulpritOff && culprit && id === culprit)
-    );
-    this.settings.bisect = null;
-    await this.saveSettings();
-    await this.enableMany(enable);
-    if (keepCulpritOff && culprit) await this.disableMany([culprit]);
-    this.refreshViews(true, false);
+    if (!current || this.bisectApplying) return;
+    this.bisectApplying = true;
+    try {
+      const culprit = keepCulpritOff ? current.culprit : undefined;
+      const enable = current.originalEnabled.filter((id) => id !== culprit);
+      const on = await this.enableMany(enable);
+      const off = culprit
+        ? await this.disableMany([culprit])
+        : { changed: [], failed: [] };
+      const failed = [...on.failed, ...off.failed];
+      if (failed.length) {
+        this.bisectError = restoreFailureMessage(failed);
+        return;
+      }
+      this.settings.bisect = null;
+      this.bisectError = null;
+      await this.saveSettings();
+    } finally {
+      this.bisectApplying = false;
+      this.refreshViews(true, false);
+    }
   }
 
   /**
-   * Bring the vault to what this round needs.
+   * Bring the vault to what this round needs, and confirm it got there.
    *
    * Expressed as a target rather than a diff so the session converges after an
    * Obsidian restart, or after the user toggles something by hand mid-search —
    * either of which would leave a diff-based approach quietly wrong about what
    * is running, and therefore wrong about the culprit.
+   *
+   * A failure here is not a partial success to report and move on from. If even
+   * one plugin didn't move, the vault is not the set the next question is
+   * about, and an answer given against it can convict an innocent plugin — so
+   * the round is marked unestablished and the UI refuses to take an answer.
    */
-  private async applyBisectState(state: BisectState): Promise<void> {
+  private async applyBisectState(state: BisectState): Promise<boolean> {
     const { enable, disable } = desiredState(state);
-    await this.disableMany(disable);
-    await this.enableMany(enable);
-    this.refreshViews(true, false);
+    this.bisectApplying = true;
+    this.bisectError = null;
+    try {
+      const off = await this.disableMany(disable);
+      const on = await this.enableMany(enable);
+      const failed = [...off.failed, ...on.failed];
+      if (failed.length) {
+        this.bisectError =
+          `FlowKit couldn't set your vault up for this round — ${failed
+            .map((f) => f.id)
+            .join(", ")} wouldn't switch. Answering now would be answering about ` +
+          `the wrong set of plugins, so the search is paused. Try again, or stop and restore.`;
+        return false;
+      }
+      return true;
+    } finally {
+      this.bisectApplying = false;
+      this.refreshViews(true, false);
+    }
+  }
+
+  /**
+   * Whether the vault matches the round the persisted search is on.
+   *
+   * Deliberately a question and not a repair. Re-applying the round
+   * automatically on startup looks like the obvious use of a target-shaped
+   * state, and it is the wrong thing: FlowKit cannot tell an interrupted
+   * transition from a user who went into Community Plugins, switched their
+   * plugins back on by hand, and restarted to get out of a search that was
+   * going badly. Silently undoing that — before they have even seen the
+   * dashboard — is the worst thing this feature could do to somebody already
+   * having a bad day. So the drift is surfaced, with both answers offered, and
+   * neither is taken for them.
+   */
+  bisectDrifted(): boolean {
+    const state = this.settings.bisect;
+    if (!state || state.done) return false;
+    const { enable, disable } = desiredState(state);
+    return disable.some((id) => this.isEnabled(id)) || enable.some((id) => !this.isEnabled(id));
+  }
+
+  /** Put the vault back into the round, at the user's explicit request. */
+  async resumeBisect(): Promise<boolean> {
+    const state = this.settings.bisect;
+    if (!state || state.done) return false;
+    return this.applyBisectState(state);
+  }
+
+  /** Whether a bisect transition is in flight, so the UI can lock its controls. */
+  get bisectBusy(): boolean {
+    return this.bisectApplying;
   }
 
   // --- plugin sets ----------------------------------------------------------
 
-  /** Capture the current enabled set under a name. */
-  async saveCurrentProfile(name: string): Promise<void> {
+  /** Capture the current enabled set under a name. Returns whether it stuck. */
+  async saveCurrentProfile(name: string): Promise<boolean> {
+    if (!this.canPersist) return false;
     const enabled = [...(this.pluginsApi().enabledPlugins ?? new Set<string>())];
     this.settings.profiles = saveProfile(this.settings.profiles, name, enabled, Date.now());
     await this.saveSettings();
+    return true;
   }
 
   async removeProfile(name: string): Promise<void> {
@@ -1131,12 +1487,23 @@ export default class FlowKitHealthPlugin extends Plugin {
     );
   }
 
-  /** Switch to a saved set. Returns what it actually changed, for Undo. */
-  async applyProfile(profile: PluginProfile): Promise<ProfileDelta> {
+  /**
+   * Switch to a saved set. Returns what it actually changed, for Undo, plus
+   * anything that refused to move so the caller can say so rather than
+   * reporting a clean switch over a vault that is halfway there.
+   */
+  async applyProfile(
+    profile: PluginProfile
+  ): Promise<ProfileDelta & { failed: LifecycleFailure[] }> {
     const delta = this.deltaFor(profile);
     const disabled = await this.disableMany(delta.disable);
     const enabled = await this.enableMany(delta.enable);
-    return { enable: enabled, disable: disabled, missing: delta.missing };
+    return {
+      enable: enabled.changed,
+      disable: disabled.changed,
+      missing: delta.missing,
+      failed: [...disabled.failed, ...enabled.failed],
+    };
   }
 
   // --- change timeline ------------------------------------------------------
@@ -1149,11 +1516,11 @@ export default class FlowKitHealthPlugin extends Plugin {
    * fabricate forty events that never happened — the same mistake the change
    * log was fixed for in 1.2.0.
    */
-  private async recordEvents(
+  private recordEvents(
     manifests: PluginManifest[],
     enabledSet: Set<string>,
     now: number
-  ): Promise<void> {
+  ): boolean {
     // A bisect switches plugins off and on by design. Recording those as user
     // events would bury a month of real history under one search's noise, and
     // then offer the toggles back as "what changed in your vault".
@@ -1162,7 +1529,7 @@ export default class FlowKitHealthPlugin extends Plugin {
     // sits in settings until the user acknowledges the result, and gating on
     // its mere presence meant a found-but-unacknowledged culprit switched off
     // change tracking indefinitely.
-    if (this.recordingSuspended()) return;
+    if (this.recordingSuspended()) return false;
 
     const { events, seen } = diffInstalled(
       this.settings.seenPlugins,
@@ -1181,12 +1548,11 @@ export default class FlowKitHealthPlugin extends Plugin {
     this.settings.seenPlugins = seen;
     if (!this.settings.eventBaselineSet) {
       this.settings.eventBaselineSet = true;
-      await this.saveSettings();
-      return;
+      return true;
     }
-    if (!events.length) return;
+    if (!events.length) return false;
     this.settings.events = pruneEvents([...this.settings.events, ...events], now);
-    await this.saveSettings();
+    return true;
   }
 
   /**
@@ -1215,7 +1581,7 @@ export default class FlowKitHealthPlugin extends Plugin {
   async profileAll(
     ids: string[],
     onProgress?: (done: number, total: number, id: string) => void
-  ): Promise<{ measured: number; failed: string[] } | null> {
+  ): Promise<ProfileRunResult | null> {
     if (!this.runtimeWatcher) return null;
     const watcher = this.runtimeWatcher;
     // Never profile ourselves. Restarting FlowKit mid-run orphans this very
@@ -1294,18 +1660,24 @@ export default class FlowKitHealthPlugin extends Plugin {
   ): Promise<number | undefined> {
     const dir = (manifest as PluginManifest & { dir?: string }).dir;
     if (!dir) return undefined;
+    // The two files are independent, so there is no reason to wait for the
+    // first before asking for the second.
+    const stats = await Promise.all(
+      ["main.js", "styles.css"].map(async (file) => {
+        try {
+          return await this.app.vault.adapter.stat(`${dir}/${file}`);
+        } catch {
+          // Missing styles.css is normal; an unreadable main.js just means no score.
+          return null;
+        }
+      })
+    );
     let total = 0;
     let sawAny = false;
-    for (const file of ["main.js", "styles.css"]) {
-      try {
-        const stat = await this.app.vault.adapter.stat(`${dir}/${file}`);
-        if (stat?.type === "file") {
-          total += stat.size;
-          sawAny = true;
-        }
-      } catch {
-        // Missing styles.css is normal; an unreadable main.js just means no score.
-      }
+    for (const stat of stats) {
+      if (stat?.type !== "file") continue;
+      total += stat.size;
+      sawAny = true;
     }
     return sawAny ? total : undefined;
   }
@@ -1329,37 +1701,75 @@ export default class FlowKitHealthPlugin extends Plugin {
     return this.pluginsApi().enabledPlugins?.has(id) ?? false;
   }
 
-  /** Enable or disable a plugin via Obsidian's internal API. */
+  /**
+   * Enable or disable a plugin via Obsidian's internal API, and confirm it
+   * happened.
+   *
+   * Both halves matter. The call used to be optional-chained, so on any build
+   * where those internals are absent or renamed it resolved successfully having
+   * done nothing — and every caller went on to report a change that never
+   * occurred. And the API resolving is not the same as the registry having
+   * moved, which is the only thing bisect's next question is valid against.
+   */
   async setPluginEnabled(id: string, enabled: boolean): Promise<void> {
     const api = this.pluginsApi();
-    if (enabled) await api.enablePluginAndSave?.(id);
-    else await api.disablePluginAndSave?.(id);
+    const fn = enabled ? api.enablePluginAndSave : api.disablePluginAndSave;
+    if (typeof fn !== "function") {
+      throw new Error(
+        `Obsidian's plugin controls aren't available to FlowKit, so it can't ${
+          enabled ? "enable" : "disable"
+        } ${id}. Use Settings → Community plugins instead.`
+      );
+    }
+    await fn.call(api, id);
+    // Bounded settle. The registry projection is not documented to update
+    // before the promise resolves, and reporting a successful change as a
+    // failure is not a harmless conservatism here — it pauses a bisect and
+    // tells the user to go and fix something by hand that is already fine.
+    // One turn, then give up: this is insurance against ordering, not a poll.
+    if (this.isEnabled(id) !== enabled) await Promise.resolve();
+    if (this.isEnabled(id) !== enabled) {
+      throw new Error(`${id} did not ${enabled ? "turn on" : "turn off"}.`);
+    }
   }
 
   /**
-   * Bulk-disable a set of plugins. Returns the ids that were actually enabled
-   * beforehand — that's both the honest count to report and exactly what Undo
+   * Switch a set of plugins to `enabled`, one at a time, reporting per-plugin
+   * outcomes rather than stopping at the first failure with the vault half
+   * moved.
+   *
+   * Deliberately sequential. Plugin lifecycle calls mutate a shared registry
+   * and can depend on each other; the win from parallelising them is small and
+   * the failure mode is a vault in a state nobody asked for.
+   */
+  private async setMany(ids: string[], enabled: boolean): Promise<LifecycleResult> {
+    const changed: string[] = [];
+    const failed: LifecycleFailure[] = [];
+    for (const id of ids) {
+      if (this.isEnabled(id) === enabled) continue;
+      try {
+        await this.setPluginEnabled(id, enabled);
+        changed.push(id);
+      } catch (err) {
+        console.error("FlowKit: could not change", id, err);
+        failed.push({ id, error: err });
+      }
+    }
+    return { changed, failed };
+  }
+
+  /**
+   * Bulk-disable a set of plugins. `changed` is the ids that were verifiably
+   * switched off — that's both the honest count to report and exactly what Undo
    * needs to re-enable, so undo can't switch on something the user had off.
    */
-  async disableMany(ids: string[]): Promise<string[]> {
-    const changed: string[] = [];
-    for (const id of ids) {
-      if (!this.isEnabled(id)) continue;
-      await this.setPluginEnabled(id, false);
-      changed.push(id);
-    }
-    return changed;
+  async disableMany(ids: string[]): Promise<LifecycleResult> {
+    return this.setMany(ids, false);
   }
 
   /** Re-enable a set of plugins (the Undo half of a bulk disable). */
-  async enableMany(ids: string[]): Promise<string[]> {
-    const changed: string[] = [];
-    for (const id of ids) {
-      if (this.isEnabled(id)) continue;
-      await this.setPluginEnabled(id, true);
-      changed.push(id);
-    }
-    return changed;
+  async enableMany(ids: string[]): Promise<LifecycleResult> {
+    return this.setMany(ids, true);
   }
 
   /** Open Obsidian's settings window to a plugin's own tab, if it has one. */
@@ -1509,6 +1919,17 @@ export default class FlowKitHealthPlugin extends Plugin {
     this.settings.history = history;
     await this.saveSettings();
   }
+}
+
+/** What to say when plugins wouldn't go back the way they were. */
+function restoreFailureMessage(failed: LifecycleFailure[]): string {
+  const names = failed.map((f) => f.id).join(", ");
+  return (
+    `FlowKit couldn't switch ${names} back on. Your original setup is still ` +
+    `recorded, so nothing is lost — try again, or turn ${
+      failed.length === 1 ? "it" : "them"
+    } on from Settings → Community plugins.`
+  );
 }
 
 function sameDay(a: number, b: number): boolean {

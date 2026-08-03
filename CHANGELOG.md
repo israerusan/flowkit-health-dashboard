@@ -3,6 +3,92 @@
 All notable changes to FlowKit Plugin Health Dashboard are documented here. This
 project follows [Semantic Versioning](https://semver.org/).
 
+## [1.5.0] - 2026-08-03
+
+A hardening and polish release. No new features — this is the pass that makes
+the diagnostic tools safe to trust, the numbers agree with each other, and the
+dashboard feel like something built rather than assembled.
+
+### The diagnostics can no longer change your vault behind your back
+
+- **Every plugin FlowKit switches is now verified.** The internal Obsidian call
+  used to be optional-chained: on any build where those methods are absent it
+  resolved successfully having done nothing, and bulk fixes, saved sets, Undo
+  and bisect all reported changes that never happened. FlowKit now requires the
+  API, checks the registry afterwards, and reports exactly what moved.
+- **Measuring a plugin's load time restores it, whatever happens.** If the
+  restart failed halfway, the plugin was left switched off and the only word
+  about it was "couldn't measure that one". Restoration now happens either way,
+  in both directions — measuring a *disabled* plugin no longer leaves it
+  running — and if it can't, profiling stops and names the plugin.
+- **A search round that couldn't be set up is no longer answerable.** If any
+  plugin refused to switch, the vault isn't the set the question is about, and
+  an answer could convict an innocent plugin. FlowKit says so and pauses.
+- **Stopping a search restores first and forgets second.** The recovery record
+  used to be cleared before the plugins were actually back on, so a failure
+  there left a half-disabled vault with nothing that knew what normal was.
+- **A damaged search record is no longer deleted on sight** — it may describe a
+  vault that is switched off right now. FlowKit keeps it and offers to restore
+  the snapshot it took when the search began.
+- **If your plugins don't match the round a search was on**, FlowKit asks
+  rather than silently putting them back. It cannot tell an interrupted
+  transition from someone who fixed their own vault by hand and restarted.
+- **FlowKit will not start a search when it can't save.** The whole safety
+  argument is that the way back is written down first.
+
+### It cannot overwrite a settings file it failed to read
+
+- An unreadable or corrupt `data.json` used to stop the plugin loading. FlowKit
+  now starts on defaults, refuses to write for the session, and says so — so a
+  file that is merely locked or mid-sync isn't replaced with an empty one.
+- All settings writes go through one queue. Five separate things wrote that
+  file with no coordination, and an older state could land last.
+- A malformed community cache is discarded rather than taken down the scan
+  with it.
+
+### Numbers that agree with each other
+
+- The exported report and Copy summary **withhold the letter grade under
+  exactly the rule the dashboard uses**. The screen would say "not enough
+  signal to grade this vault" while the report pasted into someone's issue
+  tracker confidently said "Grade B".
+- The Plugins tile counted muted plugins while the headline didn't, so one
+  screen showed two different totals. It now reconciles them.
+- The table described five metrics and scored six — Reliability was missing
+  from the caption, the Overall tooltip, and the plugin description.
+- Compatibility's tooltip said it was weighted 30%. It is 25%.
+- "FlowKit re-checked all your plugins" is no longer said when disabled ones
+  were never looked at.
+- A finished search no longer says "It's X" as though elimination were proof.
+
+### Faster on a large vault
+
+- Plugin file sizes are read a few at a time instead of one after another —
+  previously a couple of hundred filesystem round trips in series before
+  anything appeared.
+- One settings write per scan instead of up to five.
+- Typing in the search box no longer rebuilds the whole table on every
+  keystroke, and opening one plugin's reasoning no longer rebuilds every row.
+- Vault totals and the findings list are computed once per change rather than
+  a dozen times per repaint.
+- Pressing Retry during another scan no longer silently downgrades it to an
+  offline one.
+- A runtime observation arriving inside the 15-second window is now picked up
+  when the window passes, instead of being dropped.
+
+### Looks like it was designed
+
+- A **real loading state**: skeleton rows and a progress line reported by the
+  scan itself, so a slow vault no longer looks like a hung one.
+- **Three distinct empty states** — nothing installed, everything hidden by a
+  setting, nothing matching a search — each with the way out.
+- A running search now genuinely owns the page rather than sitting above a
+  health report about a vault that is deliberately half switched off.
+- Motion on row expansion, cards and buttons, fully removed under
+  `prefers-reduced-motion`.
+- A larger, quieter hero and header; **Diagnose** now carries the accent.
+- "Share" is called **Export**, because that is what it does.
+
 ## [1.4.0] - 2026-08-03
 
 FlowKit stops being a scorecard you read once and becomes the thing you open

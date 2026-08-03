@@ -198,7 +198,17 @@ export function desiredState(state: BisectState): {
   };
 }
 
-/** Putting everything back exactly as it was. */
+/**
+ * Switching back on everything the search switched off.
+ *
+ * Not "exactly as it was", which is what this used to claim, and the difference
+ * matters. A search only ever disables plugins from `originalEnabled` — it
+ * never enables one that was off — so undoing its own work is entirely the
+ * `enable` side. What it deliberately does NOT do is switch off something the
+ * user turned on themselves during the search: FlowKit didn't do that, and
+ * quietly reversing a decision somebody made by hand is a worse failure than
+ * leaving it alone.
+ */
 export function restoreState(state: BisectState): {
   enable: string[];
   disable: string[];

@@ -21,6 +21,7 @@ import {
   type BisectState,
 } from "../src/bisect";
 import type { RuntimeProfiles } from "../src/runtime";
+import { SaveQueue, isUsableCache, mapWithConcurrency } from "../src/persistence";
 
 let passed = 0;
 const failures: string[] = [];
@@ -364,17 +365,38 @@ async function loadTests(): Promise<void> {
     ["slow", "quick", "third"].every((id) => app.enabledPlugins.has(id))
   );
 
-  // A plugin that can't be re-enabled is reported, not silently skipped. The
-  // watcher logs that to the console by design, so it is muted here — a passing
-  // run that prints a stack trace reads like a failing one.
+  // A plugin that measuring cannot switch back on is not a failed sample — it
+  // is a vault that is no longer what the user left it as. The run has to stop
+  // on it and say which plugin, rather than restarting another forty on top of
+  // it and reporting a tally. The watcher logs to the console by design, so it
+  // is muted here: a passing run that prints a stack trace reads like a failing
+  // one.
   app.failing.add("third");
   const realError = console.error;
   console.error = () => undefined;
-  const partial = await watcher.profileAll(["third"]);
+  const partial = await watcher.profileAll(["third", "quick"]);
   console.error = realError;
-  eq("a failure is counted", partial.failed.join(), "third");
-  eq("and the rest of the run is unaffected", partial.measured, 0);
+  check("a plugin left switched off is reported", partial.stranded != null);
+  eq("naming the plugin", partial.stranded?.pluginId, "third");
+  check("and recording what its state had been", partial.stranded?.wasEnabled === true);
+  eq("the run stops rather than continuing", partial.measured, 0);
+  check(
+    "so the plugins after it are never touched",
+    app.enabledPlugins.has("quick"),
+    "quick should not have been restarted"
+  );
   app.failing.delete("third");
+
+  // Measuring a plugin that was switched off must leave it switched off. It
+  // used to enable unconditionally, turning a measurement into a decision to
+  // run something the user had deliberately turned off.
+  app.install("dormant", "1.0.0");
+  app.enabledPlugins.delete("dormant");
+  await watcher.measureLoad("dormant");
+  check(
+    "measuring a disabled plugin leaves it disabled",
+    !app.enabledPlugins.has("dormant")
+  );
 
   check("changes were flagged for persistence", changes >= 0);
   watcher.stop();
@@ -469,10 +491,176 @@ function bisectTests(): void {
   }
 }
 
+// --- persistence: the save queue, the scan pool, the cache guard ------------
+//
+// The save queue is the highest-risk code in the plugin that isn't touching
+// somebody's plugins: it collapses concurrent writes, and the thing it must not
+// collapse is the promise. `await saveSettings()` is a durability barrier
+// before bisect switches anything off, so a caller resolving early would mean
+// the recovery record might not be on disk when the vault starts changing.
+async function persistenceTests(): Promise<void> {
+  // A caller only ever resolves after a write that included its own state.
+  {
+    let state = 0;
+    const written: number[] = [];
+    const gate: { release: () => void } = { release: () => undefined };
+    const queue = new SaveQueue<number>(
+      () => state,
+      async (snapshot) => {
+        await new Promise<void>((resolve) => {
+          gate.release = () => {
+            written.push(snapshot);
+            resolve();
+          };
+        });
+      }
+    );
+
+    state = 1;
+    const first = queue.save();
+    await sleep(0); // let the write start and capture state 1
+    state = 2;
+    const second = queue.save();
+    state = 3;
+    const third = queue.save();
+
+    gate.release();
+    await first;
+    eq("the first write persisted the state it started with", written.join(), "1");
+    check("and the later callers are not resolved by it", !queue.settled);
+
+    // The follow-up write is now in flight; let it through.
+    await sleep(0);
+    gate.release();
+    await Promise.all([second, third]);
+    eq("one further write covers both later callers", written.join(), "1,3");
+    check("everything requested is now on disk", queue.settled);
+  }
+
+  // The reason the snapshot is taken when save() is CALLED and not when the
+  // write runs. State here is replaced wholesale, not only added to — the
+  // bisect recovery record is set and cleared — so a write that reads the live
+  // object at its own start can contain LESS than the caller that asked for it,
+  // and would then resolve that caller over a disk state its mutation never
+  // reached.
+  {
+    let state = "idle";
+    const written: string[] = [];
+    const gate: { release: () => void } = { release: () => undefined };
+    const queue = new SaveQueue<string>(
+      () => state,
+      async (snapshot) => {
+        await new Promise<void>((resolve) => {
+          gate.release = () => {
+            written.push(snapshot);
+            resolve();
+          };
+        });
+      }
+    );
+
+    // A write is already running when the record is set.
+    const blocking = queue.save();
+    await sleep(0);
+    state = "recovery-record";
+    const barrier = queue.save();
+    // …and something clears it again before the queued write gets its turn,
+    // without asking for a save of its own.
+    state = "cleared";
+
+    gate.release();
+    await blocking;
+    await sleep(0);
+    gate.release();
+    await barrier;
+    check(
+      "the barrier caller's own state reached disk",
+      written.includes("recovery-record"),
+      `wrote ${written.join(" then ")}`
+    );
+  }
+
+  // Concurrent requests collapse: this is what stops one scan rewriting
+  // data.json five times.
+  {
+    let writes = 0;
+    const queue = new SaveQueue<number>(
+      () => writes,
+      async () => {
+        writes++;
+        await sleep(1);
+      }
+    );
+    await Promise.all([queue.save(), queue.save(), queue.save(), queue.save()]);
+    check("four concurrent saves collapse into fewer writes", writes <= 2, `${writes}`);
+    check("and all of them are satisfied", queue.settled);
+  }
+
+  // A failed write must reject the callers it would have covered — they are
+  // entitled to know their state is not on disk — and leave the queue usable.
+  {
+    let fail = true;
+    let writes = 0;
+    const queue = new SaveQueue<number>(
+      () => writes,
+      async () => {
+        writes++;
+        if (fail) throw new Error("disk is read-only");
+      }
+    );
+    let rejected = false;
+    await queue.save().catch(() => {
+      rejected = true;
+    });
+    check("a failed write rejects its caller", rejected);
+    check("and nothing is claimed as saved", !queue.settled);
+    fail = false;
+    await queue.save();
+    check("the queue still works afterwards", queue.settled, `${writes} writes`);
+  }
+
+  // The scan pool must return results in input order whatever finishes first,
+  // or equal-scoring plugins reshuffle on every scan.
+  {
+    const items = [40, 5, 30, 1, 20, 2, 10, 3];
+    const order = await mapWithConcurrency(items, 4, async (ms) => {
+      await sleep(ms);
+      return ms;
+    });
+    eq("the pool preserves input order", order.join(), items.join());
+
+    let live = 0;
+    let peak = 0;
+    await mapWithConcurrency(new Array(12).fill(0), 3, async () => {
+      peak = Math.max(peak, ++live);
+      await sleep(2);
+      live--;
+      return 0;
+    });
+    check("and never exceeds its limit", peak <= 3, `peak ${peak}`);
+    eq("an empty list is fine", (await mapWithConcurrency([], 4, async () => 1)).length, 0);
+  }
+
+  // The cache guard is all-or-nothing: a half-valid cache keeps an `at` that
+  // suppresses the refetch and `hadStats` flags the header reports as coverage.
+  {
+    const good = { at: 1, plugins: {}, distribution: [1, 2], hadStats: true, hadList: false };
+    check("a complete cache is usable", isUsableCache(good));
+    check("no cache at all is not", !isUsableCache(null));
+    check("a cache with no plugin map is not", !isUsableCache({ ...good, plugins: null }));
+    check("nor one whose plugin map is an array", !isUsableCache({ ...good, plugins: [] }));
+    check("nor one with no timestamp", !isUsableCache({ ...good, at: undefined }));
+    check("nor one with a junk timestamp", !isUsableCache({ ...good, at: NaN }));
+    check("nor one with a junk distribution", !isUsableCache({ ...good, distribution: [1, "x"] }));
+    check("nor one missing its coverage flags", !isUsableCache({ ...good, hadStats: undefined }));
+  }
+}
+
 // --- run --------------------------------------------------------------------
 await timerTests();
 await loadTests();
 bisectTests();
+await persistenceTests();
 clearAllTimers();
 
 if (failures.length) {

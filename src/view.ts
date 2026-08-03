@@ -18,6 +18,7 @@ import type {
 } from "./types";
 import { SCORING_MODEL } from "./types";
 import type FlowKitHealthPlugin from "./main";
+import type { LifecycleFailure, ScanPhase } from "./main";
 import {
   buildInsights,
   isAtRisk,
@@ -72,7 +73,7 @@ const METRIC_COLUMNS: Array<{ key: MetricKey; label: string; hint: string }> = [
   {
     key: "compatibility",
     label: "Compatibility",
-    hint: "Whether it can run on your Obsidian, on this device. Weighted 30%.",
+    hint: "Whether it can run on your Obsidian, on this device. Weighted 25%.",
   },
   {
     key: "reliability",
@@ -213,6 +214,21 @@ interface SummaryStats {
  */
 const GRADE_MIN_CONFIDENCE = 0.6;
 
+/**
+ * How long typing is allowed to run ahead of the table.
+ *
+ * Short enough that the list still feels live, long enough that a burst of
+ * keystrokes is one rebuild rather than six.
+ */
+const SEARCH_DEBOUNCE_MS = 90;
+
+/** What is shown where a grade would be when there isn't the signal for one. */
+const GRADE_WITHHELD: { letter: string; tone: Tone; verdict: string } = {
+  letter: "—",
+  tone: "unknown",
+  verdict: "Not enough signal to grade this vault yet.",
+};
+
 export class HealthDashboardView extends ItemView {
   private plugin: FlowKitHealthPlugin;
   private results: PluginHealth[] = [];
@@ -224,6 +240,18 @@ export class HealthDashboardView extends ItemView {
   private refreshing = false;
   /** A scan requested while one was in flight, to be run once it finishes. */
   private pendingRefresh = false;
+  /**
+   * What that queued scan is allowed to do.
+   *
+   * Kept as two independent flags, because they are two independent questions:
+   * `force` means ignore the cache, `allowFetch` means the network may be
+   * touched at all. The queued scan used to be hardcoded to `refresh(false,
+   * false)`, so pressing Retry on a failed download while any other scan was
+   * running silently downgraded it to a local rescan — the one request in the
+   * product that exists specifically to go back online.
+   */
+  private pendingForce = false;
+  private pendingAllowFetch = false;
   /** The results region, rebuilt on its own when search/filter/sort change. */
   private rowsEl: HTMLElement | null = null;
   /** Live "N of M" readout in the toolbar. */
@@ -250,6 +278,8 @@ export class HealthDashboardView extends ItemView {
   private toolbarEl: HTMLElement | null = null;
   private filterSelect: HTMLSelectElement | null = null;
   private searchInput: HTMLInputElement | null = null;
+  /** The pending debounced search rebuild, owned by the view so it can be killed. */
+  private searchTimer: number | null = null;
   private scopeChipEl: HTMLElement | null = null;
 
   constructor(leaf: WorkspaceLeaf, plugin: FlowKitHealthPlugin) {
@@ -297,6 +327,16 @@ export class HealthDashboardView extends ItemView {
     void this.refresh(true);
   }
 
+  private cancelSearchFlush(): void {
+    if (this.searchTimer == null) return;
+    window.clearTimeout(this.searchTimer);
+    this.searchTimer = null;
+  }
+
+  async onClose(): Promise<void> {
+    this.cancelSearchFlush();
+  }
+
   /** Re-render from the results already in hand, without rescanning. */
   rerender(): void {
     this.render();
@@ -318,6 +358,8 @@ export class HealthDashboardView extends ItemView {
     // otherwise complete for real and then render pre-action state.
     if (this.refreshing) {
       this.pendingRefresh = true;
+      this.pendingForce ||= force;
+      this.pendingAllowFetch ||= allowFetch;
       return;
     }
     this.refreshing = true;
@@ -340,12 +382,20 @@ export class HealthDashboardView extends ItemView {
       scrollTop = this.contentEl.scrollTop;
       focusedId = this.focusedRowId();
 
-      const { results, coverage } = await this.plugin.computeAll({ force, allowFetch });
+      const { results, coverage } = await this.plugin.computeAll({
+        force,
+        allowFetch,
+        // Only worth wiring up on the run that actually shows a loading screen.
+        // Every other scan repaints in place and never renders this.
+        onPhase: firstRun ? (p) => this.showPhase(p) : undefined,
+      });
       this.results = results;
       this.coverage = coverage;
       // Read fresh each scan: hotkeys change the moment the user rebinds one,
       // and a stale conflict list is worse than no conflict list.
       this.conflicts = this.plugin.detectConflicts();
+      this.invalidateDerived();
+      this.indexRows();
       const lapsed = this.plugin.takeLapsedMutes();
       if (lapsed.length) this.lapsedMutes = lapsed;
       const s = this.summaryStats();
@@ -397,8 +447,14 @@ export class HealthDashboardView extends ItemView {
         this.restoreFocus(focusedId);
       }
       if (this.pendingRefresh) {
+        // Cleared before the follow-up starts, so a request arriving during it
+        // is queued again rather than swallowed by this one.
         this.pendingRefresh = false;
-        await this.refresh(false, false);
+        const queuedForce = this.pendingForce;
+        const queuedFetch = this.pendingAllowFetch;
+        this.pendingForce = false;
+        this.pendingAllowFetch = false;
+        await this.refresh(queuedForce, queuedFetch);
       }
     }
   }
@@ -435,6 +491,9 @@ export class HealthDashboardView extends ItemView {
 
   /** Repaint after a mute change, without rescanning — it changes no score. */
   private afterMuteChange(): void {
+    // It changes no score, but it changes every count and every finding: muted
+    // rows are excluded from both.
+    this.invalidateDerived();
     const s = this.summaryStats();
     this.plugin.updateStatusBar(
       s.avg,
@@ -478,10 +537,41 @@ export class HealthDashboardView extends ItemView {
    * a property of any single plugin.
    */
   private insights(): Insight[] {
-    return buildInsights(this.results, { conflicts: this.conflicts });
+    const cached = this.derived.insights;
+    if (cached) return cached;
+    const built = buildInsights(this.results, { conflicts: this.conflicts });
+    this.derived.insights = built;
+    return built;
+  }
+
+  /**
+   * Everything derived from the current results, computed once.
+   *
+   * A single render used to walk the whole result set a dozen times: the hero,
+   * the tiles, the status-bar update and both export paths each rebuilt the
+   * same summary, and the findings were rebuilt twice more.
+   *
+   * Deliberately NOT keyed on "a scan happened". Mute and watch toggle the row
+   * objects in place without rescanning — that is the whole reason those
+   * actions feel instant — so a scan-generation key would serve a stale hero
+   * count and a stale findings list after the two most common actions in the
+   * product. Everything that can change a derived value calls `invalidate()`.
+   */
+  private derived: { stats?: SummaryStats; insights?: Insight[] } = {};
+
+  private invalidateDerived(): void {
+    this.derived = {};
   }
 
   private summaryStats(): SummaryStats {
+    const cached = this.derived.stats;
+    if (cached) return cached;
+    const stats = this.computeSummaryStats();
+    this.derived.stats = stats;
+    return stats;
+  }
+
+  private computeSummaryStats(): SummaryStats {
     const active = this.results.filter((r) => !r.muted);
     const scored = active
       .map((r) => r.overall)
@@ -503,11 +593,30 @@ export class HealthDashboardView extends ItemView {
     };
   }
 
+  /**
+   * Per-scan indexes for the things the render path asks for row by row.
+   *
+   * The search haystack was rebuilt and lowercased for every plugin on every
+   * keystroke, and the conflict list was scanned linearly once per row per
+   * render. Neither changes between scans.
+   */
+  private haystacks = new Map<string, string>();
+  private clashCounts = new Map<string, number>();
+
+  private indexRows(): void {
+    this.haystacks.clear();
+    this.clashCounts.clear();
+    for (const r of this.results) {
+      this.haystacks.set(r.id, `${r.name} ${r.author} ${r.id}`.toLowerCase());
+      this.clashCounts.set(r.id, conflictsFor(this.conflicts, r.id).length);
+    }
+  }
+
   private visibleRows(): PluginHealth[] {
     const q = this.search.trim().toLowerCase();
     const filtered = this.results.filter((r) => {
       if (q) {
-        const hay = `${r.name} ${r.author} ${r.id}`.toLowerCase();
+        const hay = this.haystacks.get(r.id) ?? `${r.name} ${r.author} ${r.id}`.toLowerCase();
         if (!hay.includes(q)) return false;
       }
       // A finding scopes the table to exactly the rows it counted.
@@ -638,9 +747,7 @@ export class HealthDashboardView extends ItemView {
     this.renderHeader(root);
 
     if (this.loading) {
-      const empty = root.createDiv({ cls: "flowkit-health-empty" });
-      setIcon(empty.createSpan({ cls: "flowkit-spin" }), "loader-2");
-      empty.createSpan({ text: " Gathering plugin data…" });
+      this.renderLoading(root);
       return;
     }
 
@@ -656,17 +763,30 @@ export class HealthDashboardView extends ItemView {
     }
 
     if (this.results.length === 0) {
-      root.createDiv({
-        cls: "flowkit-health-empty",
-        text: "No installed community plugins found.",
-      });
+      this.renderNothingToScore(root);
       return;
     }
 
-    // A running bisect owns the page. Everything else is a report about a vault
-    // that is, right now, deliberately half switched off — so the scores below
-    // are not what the user's vault normally looks like, and the one control
-    // that matters is the question being asked.
+    // A running bisect owns the page — and now actually does, rather than
+    // saying so in a comment above a function that rendered the whole dashboard
+    // underneath it anyway. Every number below is measured against a vault that
+    // is, right now, deliberately half switched off: that is not the user's
+    // setup, and presenting it as a health report is the one thing this product
+    // is supposed not to do.
+    //
+    // Scoped to a round in progress, not to the session existing. Once the
+    // search is finished the vault is real again, and the user needs the
+    // evidence — the culprit's row, its errors, its history — to decide whether
+    // to leave it off.
+    const running = this.plugin.bisect;
+    if (running && !running.done) {
+      this.renderUnreadable(root);
+      this.renderBisect(root);
+      this.renderSalvage(root);
+      return;
+    }
+    this.renderSalvage(root);
+    this.renderUnreadable(root);
     this.renderBisect(root);
     this.renderAppUpdate(root);
     this.renderChanges(root);
@@ -694,6 +814,103 @@ export class HealthDashboardView extends ItemView {
     this.renderLegend(root);
   }
 
+  /**
+   * The first scan, with the shape of the answer already on screen.
+   *
+   * A centred spinner over a blank page gives the user nothing to judge
+   * progress by, so on a large vault a scan that is working looks identical to
+   * one that has hung. The skeleton says how many rows are coming, and the line
+   * underneath says what is actually happening — reported by the scan itself,
+   * so it can't describe a stage that isn't running.
+   */
+  private renderLoading(root: HTMLElement): void {
+    const box = root.createDiv({ cls: "flowkit-loading" });
+    const head = box.createDiv({ cls: "flowkit-loading-head" });
+    setIcon(head.createSpan({ cls: "flowkit-spin" }), "loader-2");
+    this.phaseEl = head.createSpan({
+      cls: "flowkit-loading-label",
+      text: this.phase?.label ?? "Reading your plugin list…",
+    });
+    this.phaseBarEl = box.createDiv({ cls: "flowkit-loading-bar" });
+    this.phaseFillEl = this.phaseBarEl.createDiv({ cls: "flowkit-loading-fill" });
+    this.paintPhase();
+
+    const skeleton = box.createDiv({ cls: "flowkit-skeleton" });
+    // Sized from what is installed, so the page doesn't reflow into something a
+    // different height the moment real rows arrive.
+    const rows = Math.min(
+      8,
+      Math.max(3, Object.keys(this.plugin.installedManifests()).length)
+    );
+    for (let i = 0; i < rows; i++) {
+      const line = skeleton.createDiv({ cls: "flowkit-skeleton-row" });
+      line.createDiv({ cls: "flowkit-skeleton-name" });
+      for (let c = 0; c < 4; c++) line.createDiv({ cls: "flowkit-skeleton-chip" });
+    }
+  }
+
+  private phase: ScanPhase | null = null;
+  private phaseEl: HTMLElement | null = null;
+  private phaseBarEl: HTMLElement | null = null;
+  private phaseFillEl: HTMLElement | null = null;
+
+  private showPhase(phase: ScanPhase): void {
+    this.phase = phase;
+    if (!this.phaseEl) return;
+    this.phaseEl.setText(phase.label);
+    this.paintPhase();
+  }
+
+  private paintPhase(): void {
+    const p = this.phase;
+    const bar = this.phaseBarEl;
+    const fill = this.phaseFillEl;
+    if (!bar || !fill) return;
+    // Only claim a proportion when there is one. An indeterminate stage gets a
+    // sweeping bar rather than a made-up percentage.
+    if (p?.total && p.total > 0 && p.done != null) {
+      bar.removeClass("is-indeterminate");
+      fill.setCssProps({ "--flowkit-progress": `${Math.round((p.done / p.total) * 100)}%` });
+      return;
+    }
+    bar.addClass("is-indeterminate");
+    fill.setCssProps({ "--flowkit-progress": "0%" });
+  }
+
+  /**
+   * Nothing to score — which is three different situations, and telling them
+   * apart is the difference between an answer and a dead end.
+   */
+  private renderNothingToScore(root: HTMLElement): void {
+    const installed = Object.keys(this.plugin.installedManifests()).length;
+    const box = root.createDiv({ cls: "flowkit-blank" });
+    setIcon(box.createSpan({ cls: "flowkit-blank-icon" }), installed ? "eye-off" : "plug");
+    if (installed > 0) {
+      box.createDiv({
+        cls: "flowkit-blank-title",
+        text: `All ${installed} of your plugins are switched off.`,
+      });
+      box.createDiv({
+        cls: "flowkit-blank-body",
+        text: "FlowKit is only showing enabled plugins. Turn on “Show disabled plugins” to score them too.",
+      });
+      const btn = box.createEl("button", { cls: "mod-cta", text: "Show disabled plugins" });
+      btn.onclick = () => {
+        this.plugin.settings.showDisabled = true;
+        void this.plugin.saveSettings().then(() => this.refresh(false, false));
+      };
+      return;
+    }
+    box.createDiv({
+      cls: "flowkit-blank-title",
+      text: "No community plugins installed.",
+    });
+    box.createDiv({
+      cls: "flowkit-blank-body",
+      text: "There is nothing to score yet — which is its own kind of clean bill of health. FlowKit starts reporting as soon as you install something.",
+    });
+  }
+
   /** Rebuild only the results region. Cheap enough to run on every keystroke. */
   private renderRows(): void {
     const host = this.rowsEl;
@@ -701,6 +918,14 @@ export class HealthDashboardView extends ItemView {
     host.empty();
 
     const rows = this.visibleRows();
+    // An open panel whose row is no longer in the table stops being an open
+    // panel. Keeping the id meant the selection survived invisibly and the row
+    // sprang open again by itself when a filter was cleared, a search was
+    // deleted, or an uninstalled plugin came back — a disclosure the user never
+    // asked for a second time.
+    if (this.expandedId && !rows.some((r) => r.id === this.expandedId)) {
+      this.expandedId = null;
+    }
     if (this.countEl) {
       this.countEl.setText(
         rows.length === this.results.length
@@ -710,10 +935,35 @@ export class HealthDashboardView extends ItemView {
     }
 
     if (rows.length === 0) {
-      const empty = host.createDiv({ cls: "flowkit-health-empty" });
-      empty.createDiv({ text: "No plugins match the current filter." });
+      // Say which of the three things produced nothing, because the way out is
+      // different for each: a filter with no members is good news, a search
+      // with no hits is a typo, and both used to render the same sentence.
+      const empty = host.createDiv({ cls: "flowkit-blank" });
+      setIcon(empty.createSpan({ cls: "flowkit-blank-icon" }), this.search ? "search-x" : "check-circle");
+      if (this.search) {
+        empty.createDiv({
+          cls: "flowkit-blank-title",
+          text: `Nothing matches “${this.search}”.`,
+        });
+        empty.createDiv({
+          cls: "flowkit-blank-body",
+          text: "FlowKit searches plugin names, authors and ids.",
+        });
+      } else {
+        const label = this.scopeInsight
+          ? this.scopeInsight.title
+          : (FILTERS.find((f) => f.key === this.filter)?.label ?? this.filter);
+        empty.createDiv({
+          cls: "flowkit-blank-title",
+          text: `No plugins are in “${label}”.`,
+        });
+        empty.createDiv({
+          cls: "flowkit-blank-body",
+          text: "Nothing to do here — that is the good outcome for this one.",
+        });
+      }
       if (this.search || this.filter !== "all" || this.scopeInsight) {
-        const clear = empty.createEl("button", { text: "Clear filters" });
+        const clear = empty.createEl("button", { text: "Show all plugins" });
         clear.onclick = () => this.applyScope("all");
       }
       return;
@@ -760,7 +1010,9 @@ export class HealthDashboardView extends ItemView {
     if (!this.loading && this.results.length > 0) {
       const exportBtn = actions.createEl("button", { cls: "flowkit-health-btn" });
       setIcon(exportBtn.createSpan(), "download");
-      exportBtn.createSpan({ text: " Share" });
+      // "Share" reads as social. Everything behind this button writes a file or
+      // fills the clipboard.
+      exportBtn.createSpan({ text: " Export" });
       if (!this.plugin.isPro && this.plugin.settings.usedFreeExport) {
         setIcon(exportBtn.createSpan({ cls: "flowkit-lock" }), "lock");
       }
@@ -775,12 +1027,17 @@ export class HealthDashboardView extends ItemView {
     // The diagnostic entry point. It leads with bisect deliberately: that is
     // the thing somebody with a broken vault came here to do, and burying it in
     // a row menu would hide the only feature nothing else in the ecosystem has.
+    // The diagnostic entry point carries the accent, because it is the one
+    // thing here nothing else in the ecosystem does — and it used to sit in the
+    // same flat grey as Refresh, which is a row of four equal buttons and no
+    // answer to "where do I start".
     if (!this.loading && this.results.length > 0) {
       const tools = actions.createEl("button", {
-        cls: "flowkit-health-btn flowkit-tools-btn",
+        cls: "flowkit-health-btn flowkit-tools-btn mod-cta",
       });
       setIcon(tools.createSpan(), "stethoscope");
       tools.createSpan({ text: " Diagnose" });
+      tools.setAttr("aria-label", "Find what's breaking your vault, profile startup, or switch plugin sets");
       tools.onclick = (evt) => this.openToolsMenu(evt);
     }
 
@@ -833,21 +1090,32 @@ export class HealthDashboardView extends ItemView {
     menu.showAtMouseEvent(evt);
   }
 
+  /**
+   * Whether this scan has the signal behind it to put a letter on.
+   *
+   * One decision, in one place, because there are four surfaces that print a
+   * grade — the hero, Copy summary, the Markdown report and the CSV — and three
+   * of them used to compute one unconditionally. The screen would say "not
+   * enough signal to grade this vault" while the report the user pasted into
+   * someone else's issue tracker confidently said "Grade B".
+   *
+   * The guard is not a pure weight threshold: Reliability is local, so offline
+   * coverage reaches 0.70 on its own and would clear any threshold low enough
+   * to be meaningful. Require the data whose absence it was written about.
+   */
+  private canGrade(s: SummaryStats): boolean {
+    return s.confidence > GRADE_MIN_CONFIDENCE && this.coverage.stats;
+  }
+
+  /** The grade for this scan, or the withheld one. */
+  private gradeNow(s: SummaryStats): { letter: string; tone: Tone; verdict: string } {
+    return this.canGrade(s) ? gradeFor(s.avg) : GRADE_WITHHELD;
+  }
+
   private renderHero(root: HTMLElement): void {
     const s = this.summaryStats();
-    // The guard exists to stop a confident letter appearing when the online
-    // signals are missing. A pure weight threshold no longer does that: since
-    // Reliability is local, offline coverage now reaches 0.70 on its own, which
-    // would clear any threshold low enough to be meaningful. Require the data
-    // whose absence the guard was written about.
-    const graded = s.confidence > GRADE_MIN_CONFIDENCE && this.coverage.stats;
-    const grade = graded
-      ? gradeFor(s.avg)
-      : {
-          letter: "—",
-          tone: "unknown" as Tone,
-          verdict: "Not enough signal to grade this vault yet.",
-        };
+    const graded = this.canGrade(s);
+    const grade = this.gradeNow(s);
     const hero = root.createDiv({ cls: "flowkit-hero" });
 
     // No ring. A 116px SVG arc drew one number four different ways (arc, digits,
@@ -958,17 +1226,34 @@ export class HealthDashboardView extends ItemView {
         ? (this.results.find((r) => r.id === state.culprit)?.name ?? state.culprit)
         : null;
       const body = box.createDiv({ cls: "flowkit-bisect-body" });
+      // "It's X" would be a claim of proof, and elimination doesn't give you
+      // one: a symptom can need two plugins together, disabling one can break
+      // another, and some plugins don't fully unload without a restart. The
+      // search narrows honestly; the sentence should too.
       body.setText(
         culprit
-          ? `It's ${culprit}. It is switched off now; everything else is back on.`
+          ? `${culprit} is the one. With it switched off the problem went away, and with it on it came back — that is as close to proof as switching things off can get. It is off now; everything else is back on.`
           : "The problem survived with every candidate switched off, so no installed plugin is causing it. Worth looking at your theme, CSS snippets, or Obsidian itself."
       );
+      if (this.plugin.bisectError) {
+        const warn = box.createDiv({ cls: "flowkit-bisect-error" });
+        setIcon(warn.createSpan({ cls: "flowkit-bisect-error-icon" }), "alert-triangle");
+        warn.createSpan({ text: this.plugin.bisectError });
+      }
       const actions = box.createDiv({ cls: "flowkit-bisect-actions" });
       const done = actions.createEl("button", { cls: "mod-cta", text: culprit ? "Keep it off" : "Restore everything" });
-      done.onclick = () => void this.plugin.finishBisect(true).then(() => this.render());
+      // `false` when there is nothing to keep off: passing `true` happened to
+      // be harmless only because `culprit` is falsy downstream, which is the
+      // kind of accidental correctness that stops being correct on the next
+      // edit.
+      done.onclick = () =>
+        void this.runBisectAction(() => this.plugin.finishBisect(culprit != null));
       if (culprit) {
         const restore = actions.createEl("button", { text: "Turn it back on too" });
-        restore.onclick = () => void this.plugin.finishBisect(false).then(() => this.render());
+        restore.onclick = () => void this.runBisectAction(() => this.plugin.finishBisect(false));
+      }
+      for (const btn of Array.from(actions.querySelectorAll("button"))) {
+        btn.disabled = this.bisectBusy || this.plugin.bisectBusy;
       }
       return;
     }
@@ -979,6 +1264,31 @@ export class HealthDashboardView extends ItemView {
         text: `Testing for: ${state.symptom}`,
       });
     }
+
+    // The vault is not in the state this round describes — because Obsidian was
+    // closed partway through switching plugins over, or because the user went
+    // and changed things themselves. FlowKit cannot tell those apart, and the
+    // second one is very often somebody deliberately getting out of a search
+    // that was going badly. So it asks instead of deciding.
+    if (this.plugin.bisectDrifted()) {
+      const drift = box.createDiv({ cls: "flowkit-bisect-error" });
+      setIcon(drift.createSpan({ cls: "flowkit-bisect-error-icon" }), "help-circle");
+      drift.createSpan({
+        text:
+          "Your plugins don't match the round this search was on — either it was interrupted, " +
+          "or they were changed by hand. Answering now would be answering about a different set.",
+      });
+      const choose = box.createDiv({ cls: "flowkit-bisect-actions" });
+      const resume = choose.createEl("button", { cls: "mod-cta", text: "Put them back and carry on" });
+      resume.onclick = () => void this.runBisectAction(() => this.plugin.resumeBisect());
+      const abandon = choose.createEl("button", { text: "Stop the search" });
+      abandon.onclick = () => void this.runBisectAction(() => this.plugin.cancelBisect());
+      for (const btn of [resume, abandon]) {
+        btn.disabled = this.bisectBusy || this.plugin.bisectBusy;
+      }
+      return;
+    }
+
     box.createDiv({ cls: "flowkit-bisect-body", text: describeRound(state) });
 
     const off = state.disabled
@@ -988,13 +1298,35 @@ export class HealthDashboardView extends ItemView {
     list.createEl("summary", { text: `Currently switched off (${off.length})` });
     list.createDiv({ text: off.join(", ") });
 
+    // A round that could not be established is not a round. Answering it would
+    // be answering about a set of plugins the vault is not actually in, and
+    // this search's whole output is a name it puts in front of the user.
+    const blocked = this.plugin.bisectError;
+    if (blocked) {
+      const warn = box.createDiv({ cls: "flowkit-bisect-error" });
+      setIcon(warn.createSpan({ cls: "flowkit-bisect-error-icon" }), "alert-triangle");
+      warn.createSpan({ text: blocked });
+    }
+
     const actions = box.createDiv({ cls: "flowkit-bisect-actions" });
+    // Every control locks together for the duration of a transition. Locking
+    // only the button that was pressed still lets "the problem is gone" and
+    // "still happening" interleave into two different next rounds.
+    const busy = this.bisectBusy || this.plugin.bisectBusy;
     const gone = actions.createEl("button", { cls: "mod-cta", text: "The problem is gone" });
     gone.onclick = () => void this.answerBisect(true);
     const still = actions.createEl("button", { text: "Still happening" });
     still.onclick = () => void this.answerBisect(false);
     const stop = actions.createEl("button", { cls: "flowkit-bisect-stop", text: "Stop and restore" });
-    stop.onclick = () => void this.plugin.cancelBisect().then(() => this.render());
+    stop.onclick = () => void this.runBisectAction(() => this.plugin.cancelBisect());
+    for (const btn of [gone, still]) btn.disabled = busy || blocked != null;
+    stop.disabled = busy;
+    if (busy) {
+      box.createDiv({
+        cls: "flowkit-bisect-note",
+        text: "Switching plugins over for this round…",
+      });
+    }
 
     box.createDiv({
       cls: "flowkit-bisect-note",
@@ -1002,13 +1334,94 @@ export class HealthDashboardView extends ItemView {
     });
   }
 
-  private async answerBisect(gone: boolean): Promise<void> {
-    const next = await this.plugin.answerBisect(gone);
-    if (next?.done && next.culprit) {
-      const name = this.results.find((r) => r.id === next.culprit)?.name ?? next.culprit;
-      new Notice(`Found it: ${name}.`, 8000);
+  /**
+   * A bisect record that couldn't be read back, and the way out of it.
+   *
+   * The record used to be deleted on sight for being malformed. That is the
+   * right call for any other setting and the wrong one for this: the vault it
+   * describes may be half switched off right now, and deleting it removes the
+   * only thing that knew what "back to normal" meant.
+   */
+  private renderSalvage(root: HTMLElement): void {
+    if (!this.plugin.bisectSalvage) return;
+    const snapshot = this.plugin.settings.profiles.find((p) => p.name === AUTO_SNAPSHOT);
+    const box = root.createDiv({ cls: "flowkit-bisect flowkit-bisect-salvage" });
+    const head = box.createDiv({ cls: "flowkit-bisect-head" });
+    setIcon(head.createSpan({ cls: "flowkit-bisect-icon" }), "life-buoy");
+    head.createSpan({
+      cls: "flowkit-bisect-title",
+      text: "An unfinished search couldn't be read",
+    });
+    box.createDiv({
+      cls: "flowkit-bisect-body",
+      text: snapshot
+        ? "FlowKit found a damaged record of a plugin search. If your vault has plugins switched off that you didn't switch off, this will put back the set it saved when the search started."
+        : "FlowKit found a damaged record of a plugin search, and no snapshot to restore from. If plugins are switched off that you didn't switch off, turn them back on from Settings → Community plugins.",
+    });
+    const actions = box.createDiv({ cls: "flowkit-bisect-actions" });
+    if (snapshot) {
+      const restore = actions.createEl("button", {
+        cls: "mod-cta",
+        text: "Restore my plugins",
+      });
+      restore.onclick = () => {
+        this.plugin.bisectSalvage = null;
+        void this.runApplyProfile(snapshot);
+      };
     }
-    await this.refresh(false, false);
+    const dismiss = actions.createEl("button", { text: "Dismiss" });
+    dismiss.onclick = () => {
+      this.plugin.bisectSalvage = null;
+      this.render();
+    };
+  }
+
+  /**
+   * Say when nothing the user does here will stick.
+   *
+   * FlowKit refuses to write over a data.json it couldn't read, which is the
+   * right call — but silently refusing is not: the licence key would appear to
+   * activate, the mute would appear to take, and none of it would survive a
+   * restart.
+   */
+  private renderUnreadable(root: HTMLElement): void {
+    if (!this.plugin.settingsUnreadable) return;
+    const box = root.createDiv({ cls: "flowkit-coverage-note is-bad" });
+    setIcon(box.createSpan({ cls: "flowkit-coverage-icon" }), "file-warning");
+    box.createDiv({ cls: "flowkit-coverage-body" }).setText(
+      "FlowKit couldn't read its settings file, so it is running on defaults and will not " +
+        "save anything this session — your licence, history and saved sets are untouched on " +
+        "disk. Restart Obsidian to try again."
+    );
+  }
+
+  /** Set while this view is driving a bisect transition. */
+  private bisectBusy = false;
+
+  /** Run a bisect transition with every control locked for its duration. */
+  private async runBisectAction(fn: () => Promise<unknown>): Promise<void> {
+    if (this.bisectBusy) return;
+    this.bisectBusy = true;
+    this.render();
+    try {
+      await fn();
+    } catch (err) {
+      console.error("FlowKit: bisect step failed", err);
+      new Notice("That step didn't finish — the search is where it was.");
+    } finally {
+      this.bisectBusy = false;
+      await this.refresh(false, false);
+    }
+  }
+
+  private async answerBisect(gone: boolean): Promise<void> {
+    await this.runBisectAction(async () => {
+      const next = await this.plugin.answerBisect(gone);
+      if (next?.done && next.culprit && !this.plugin.bisectError) {
+        const name = this.results.find((r) => r.id === next.culprit)?.name ?? next.culprit;
+        new Notice(`Found it: ${name}.`, 8000);
+      }
+    });
   }
 
   /**
@@ -1092,8 +1505,13 @@ export class HealthDashboardView extends ItemView {
 
     const body = box.createDiv({ cls: "flowkit-appupdate-body" });
     if (!broke.length) {
+      // "all your plugins" is only true when disabled ones are being shown;
+      // otherwise this scan never looked at them.
+      const scope = this.plugin.settings.showDisabled
+        ? `all ${this.results.length} of your plugins`
+        : `your ${this.results.length} enabled plugins`;
       body.setText(
-        `FlowKit re-checked all ${this.results.length} of your plugins against ${change.to}. Nothing that worked before has stopped loading.`
+        `FlowKit re-checked ${scope} against ${change.to}. Nothing that worked before has stopped loading.`
       );
       return;
     }
@@ -1204,7 +1622,22 @@ export class HealthDashboardView extends ItemView {
   private renderSummary(root: HTMLElement): void {
     const s = this.summaryStats();
     const summary = root.createDiv({ cls: "flowkit-health-summary" });
-    this.statTile(summary, "Plugins", String(this.results.length), "unknown", "all");
+    // "Plugins 31" beside a hero reading "Across 27 plugins" is two different
+    // denominators on one screen with nothing to explain the gap — and in a
+    // product whose whole argument is that its numbers are honest, that is the
+    // paper cut that costs the most. Muted rows are excluded from every count
+    // and every finding, so say so where the difference shows up.
+    const muted = this.results.length - s.count;
+    this.statTile(
+      summary,
+      "Plugins",
+      muted > 0 ? `${s.count} of ${this.results.length}` : String(this.results.length),
+      "unknown",
+      "all",
+      muted > 0
+        ? `${s.count} counted towards your vault's health; ${muted} muted and excluded.`
+        : undefined
+    );
     this.statTile(
       summary,
       "Updates",
@@ -1278,7 +1711,10 @@ export class HealthDashboardView extends ItemView {
       profile.onclick = () => this.startProfileAll(this.profilableIds());
     }
 
-    const btn = bar.createEl("button", { text: "Why is my vault slow?" });
+    // Named for what it does. As "Why is my vault slow?" it promised a
+    // diagnosis and delivered a sort order, which is a small overclaim in the
+    // one place the product is otherwise scrupulous about not making them.
+    const btn = bar.createEl("button", { text: "Show the most expensive" });
     btn.setAttr("aria-label", "Order the table by what each plugin costs to run");
     btn.onclick = () => this.applyScope("heavy");
   }
@@ -1340,6 +1776,20 @@ export class HealthDashboardView extends ItemView {
         new Notice("Runtime measurement is switched off — turn it on in settings first.");
         return;
       }
+      // A plugin left in the wrong state is not a footnote to a success
+      // message. The run stops on it, and it is the only thing worth saying.
+      if (result.stranded) {
+        const err = result.stranded;
+        const name = this.results.find((r) => r.id === err.pluginId)?.name ?? err.pluginId;
+        new Notice(
+          `Profiling stopped: FlowKit couldn't switch ${name} back ${
+            err.wasEnabled ? "on" : "off"
+          }. Set it from Settings → Community plugins, or restart Obsidian — this change wasn't saved, so a restart undoes it.`,
+          0
+        );
+        await this.refresh(false, false);
+        return;
+      }
       new Notice(
         result.failed.length
           ? `Profiled ${result.measured} plugins. ${result.failed.length} couldn't be measured.`
@@ -1371,10 +1821,12 @@ export class HealthDashboardView extends ItemView {
     label: string,
     value: string,
     tone: Tone,
-    filter: FilterKey
+    filter: FilterKey,
+    hint?: string
   ): void {
     const tile = parent.createEl("button", { cls: "flowkit-stat" });
-    tile.setAttr("aria-label", `${value} ${label} — show them`);
+    tile.setAttr("aria-label", hint ?? `${value} ${label} — show them`);
+    if (hint) tile.setAttr("title", hint);
     // Label first: as a one-line pill it reads "Updates 3", not "3 Updates".
     tile.createSpan({ cls: "flowkit-stat-label", text: label });
     tile.createSpan({ cls: `flowkit-stat-value tone-${tone}`, text: value });
@@ -1792,10 +2244,12 @@ export class HealthDashboardView extends ItemView {
   /** A short vault summary that fits in a chat message. */
   private async copySummary(): Promise<void> {
     const s = this.summaryStats();
-    const grade = gradeFor(s.avg);
+    const grade = this.gradeNow(s);
     const insights = this.insights();
     const lines = [
-      `${PRODUCT_NAME}: vault health ${s.avg ?? "—"}/100 (Grade ${grade.letter}) across ${s.count} plugins.`,
+      `${PRODUCT_NAME}: vault health ${s.avg ?? "—"}/100${
+        this.canGrade(s) ? ` (Grade ${grade.letter})` : " (not enough signal to grade)"
+      } across ${s.count} plugins.`,
     ];
     for (const ins of insights.slice(0, 3)) lines.push(`• ${ins.title}`);
     const watching = this.plugin.observedMs();
@@ -1833,14 +2287,26 @@ export class HealthDashboardView extends ItemView {
       };
       new Notice(`Muted ${changed.length} plugin${changed.length === 1 ? "" : "s"}.`);
     } else {
-      const changed = await this.plugin.disableMany(ids);
-      this.lastBulk = {
-        label: `Disabled ${changed.length} plugin${changed.length === 1 ? "" : "s"}`,
-        revert: async () => {
-          await this.plugin.enableMany(changed);
-        },
-      };
-      new Notice(`Disabled ${changed.length} plugin${changed.length === 1 ? "" : "s"}.`);
+      const { changed, failed } = await this.plugin.disableMany(ids);
+      if (changed.length) {
+        this.lastBulk = {
+          label: `Disabled ${changed.length} plugin${changed.length === 1 ? "" : "s"}`,
+          revert: async () => {
+            const back = await this.plugin.enableMany(changed);
+            if (back.failed.length) throw new Error(describeFailed(back.failed));
+          },
+        };
+      }
+      // Report what happened, not what was asked for. A count that includes
+      // plugins which refused to move is the kind of small lie that is only
+      // discovered when the user goes looking for the plugin they were told
+      // was off.
+      new Notice(
+        failed.length
+          ? `Disabled ${changed.length} of ${rowsLabel(ids.length)}. ${describeFailed(failed)}`
+          : `Disabled ${changed.length} plugin${changed.length === 1 ? "" : "s"}.`,
+        failed.length ? 10_000 : undefined
+      );
     }
     await this.refresh(false, false);
   }
@@ -2007,12 +2473,40 @@ export class HealthDashboardView extends ItemView {
     // The input element survives now, so there is no refocus-and-jump-the-caret
     // hack. Typing in the middle of a query stays put, and IME composition is
     // no longer torn down mid-word.
-    input.oninput = () => {
+    // Coalesced to one rebuild per animation frame's worth of typing. The
+    // results region is a full table — every cell, badge, tooltip, aria string
+    // and handler — and rebuilding all of it between two keystrokes is what
+    // makes a search box feel like it is dragging on a large vault. The value
+    // is read from the element at flush time, so the input stays authoritative
+    // and nothing is lost if two keystrokes land inside one window.
+    // The timer is held on the view, not in this closure. A full render — a
+    // scan landing, a mute, a watch — replaces this input, and a timer captured
+    // here would still fire afterwards, read the detached element, and write
+    // its value back over the current search. Several renders inside one
+    // debounce window would leave several of them queued.
+    this.cancelSearchFlush();
+    const flush = (): void => {
+      this.searchTimer = null;
       this.search = input.value;
       // Typing is its own scope; drop any finding scope so the two can't fight.
       this.scopeInsight = null;
       this.renderRows();
       this.renderScopeChip();
+    };
+    input.oninput = () => {
+      if (this.searchTimer != null) return;
+      this.searchTimer = window.setTimeout(flush, SEARCH_DEBOUNCE_MS);
+    };
+    // Committing shouldn't wait out the timer.
+    const commit = (): void => {
+      this.cancelSearchFlush();
+      flush();
+    };
+    input.onkeydown = (evt) => {
+      if (evt.key === "Enter") commit();
+    };
+    input.onblur = () => {
+      if (this.searchTimer != null) commit();
     };
 
     const select = bar.createEl("select", { cls: "flowkit-filter dropdown" });
@@ -2033,7 +2527,7 @@ export class HealthDashboardView extends ItemView {
     const table = wrap.createEl("table", { cls: "flowkit-health-table" });
     table.createEl("caption", {
       cls: "flowkit-sr-only",
-      text: "Installed plugins scored on compatibility, maintenance, footprint, manifest hygiene and popularity. Select a row to see why it scored what it did.",
+      text: "Installed plugins scored on compatibility, reliability, maintenance, footprint, manifest hygiene and popularity. Select a row to see why it scored what it did.",
     });
     const thead = table.createEl("thead").createEl("tr");
     this.sortableTh(thead, "Plugin", "name");
@@ -2042,7 +2536,7 @@ export class HealthDashboardView extends ItemView {
       "Overall",
       "overall",
       true,
-      "Weighted blend of the five metrics, renormalised over what was available."
+      "Weighted blend of the six metrics, renormalised over what was available."
     );
     for (const col of METRIC_COLUMNS) {
       this.sortableTh(thead, col.label, col.key, true, col.hint);
@@ -2061,8 +2555,12 @@ export class HealthDashboardView extends ItemView {
    * the numbers were terminal: a user could see 43 and had nowhere to go to
    * find out why, or what to do about it.
    */
-  private renderDetail(tbody: HTMLElement, r: PluginHealth): void {
+  private renderDetail(tbody: HTMLElement, r: PluginHealth, after?: HTMLElement): void {
     const tr = tbody.createEl("tr", { cls: "flowkit-detail-row" });
+    // Inserted directly beneath its own row when opened in place; appended when
+    // the table is being built in order.
+    if (after?.nextSibling) tbody.insertBefore(tr, after.nextSibling);
+    else if (after) tbody.appendChild(tr);
     const td = tr.createEl("td");
     td.setAttr("colspan", String(METRIC_COLUMNS.length + 3));
     const panel = td.createDiv({ cls: "flowkit-detail" });
@@ -2245,10 +2743,11 @@ export class HealthDashboardView extends ItemView {
     const expanded = this.expandedId === r.id;
     if (expanded) tr.addClass("is-expanded");
     tr.dataset.pluginId = r.id;
-    const toggle = () => {
-      this.expandedId = expanded ? null : r.id;
-      this.renderRows();
-    };
+    // Opening one row's reasoning used to rebuild every row in the table, which
+    // is both the most common interaction here and the most wasteful thing the
+    // view did — and it visibly flickered on a large vault. Nothing about the
+    // other rows changes, so touch only this one and its panel.
+    const toggle = () => this.toggleDetail(r, tr);
     // A convenience target for the mouse only. The row is NOT given
     // role="button": a button containing its own buttons and a ⋮ menu is a
     // nested-interactive trap, and screen readers would announce the whole row
@@ -2300,7 +2799,7 @@ export class HealthDashboardView extends ItemView {
     // Conflicts belong on the row, not only in the panel: a shortcut that
     // silently doesn't fire is exactly the kind of thing nobody goes looking
     // for, because they've assumed it's their own mistake.
-    const clashes = conflictsFor(this.conflicts, r.id).length;
+    const clashes = this.clashCounts.get(r.id) ?? 0;
     if (clashes > 0 && r.enabled) {
       this.badge(
         nameRow,
@@ -2368,6 +2867,45 @@ export class HealthDashboardView extends ItemView {
     setIcon(menuBtn, "more-vertical");
     menuBtn.setAttr("aria-label", "Plugin actions");
     menuBtn.onclick = (evt) => this.openRowMenu(evt, r);
+  }
+
+  /**
+   * Open or close one row's reasoning, in place.
+   *
+   * Invariants the full rebuild used to give for free, now kept by hand:
+   * exactly one panel is open, the row's `aria-expanded` matches, and the panel
+   * is removed if the row it belongs to leaves the table. `renderRows` still
+   * recreates the open panel from `expandedId`, so a filter, sort or rescan
+   * lands in the same state this leaves behind.
+   */
+  private toggleDetail(r: PluginHealth, tr: HTMLElement): void {
+    const host = this.rowsEl;
+    const wasOpen = this.expandedId === r.id;
+    // Close whatever is open, wherever it is.
+    if (host) {
+      for (const open of Array.from(host.querySelectorAll<HTMLElement>(".flowkit-detail-row"))) {
+        open.remove();
+      }
+      for (const row of Array.from(host.querySelectorAll<HTMLElement>("tr.is-expanded"))) {
+        row.removeClass("is-expanded");
+        row
+          .querySelector<HTMLElement>("button.flowkit-plugin-name")
+          ?.setAttr("aria-expanded", "false");
+      }
+    }
+    if (wasOpen) {
+      this.expandedId = null;
+      return;
+    }
+    this.expandedId = r.id;
+    tr.addClass("is-expanded");
+    tr.querySelector<HTMLElement>("button.flowkit-plugin-name")?.setAttr(
+      "aria-expanded",
+      "true"
+    );
+    const parent = tr.parentElement;
+    if (!parent) return;
+    this.renderDetail(parent, r, tr);
   }
 
   private badge(parent: HTMLElement, label: string, tone: Tone, hint: string): void {
@@ -2470,14 +3008,24 @@ export class HealthDashboardView extends ItemView {
         "Not something to run on a plugin you're in the middle of using — finish the note first.",
       confirmLabel: "Measure it",
       onConfirm: () => {
-        void this.plugin.measureLoad(r.id).then(async (ms) => {
-          if (ms == null) {
-            new Notice("Couldn't measure that one — see the console.");
-            return;
-          }
-          new Notice(`${r.name} loaded in ${Math.round(ms)} ms.`);
-          await this.refresh(false, false);
-        });
+        void this.plugin
+          .measureLoad(r.id)
+          .then(async (ms) => {
+            if (ms == null) {
+              new Notice("Couldn't measure that one — see the console.");
+              return;
+            }
+            new Notice(`${r.name} loaded in ${Math.round(ms)} ms.`);
+            await this.refresh(false, false);
+          })
+          .catch(async (err) => {
+            console.error("FlowKit: measurement failed", err);
+            new Notice(
+              `FlowKit couldn't switch ${r.name} back on after measuring it. Turn it on from Settings → Community plugins, or restart Obsidian.`,
+              0
+            );
+            await this.refresh(false, false);
+          });
       },
     }).open();
   }
@@ -2533,14 +3081,26 @@ export class HealthDashboardView extends ItemView {
       return;
     }
 
+    // Checked before the modal, not after it. Offering to start a search and
+    // then refusing at the moment of confirmation is the same information
+    // delivered at the worst point.
+    if (!this.plugin.canPersist) {
+      new Notice(
+        "FlowKit can't start a search while it can't save its settings: the record of which " +
+          "plugins to switch back on afterwards wouldn't survive a restart. Restart Obsidian first.",
+        10_000
+      );
+      return;
+    }
+
     new BisectStartModal(this.app, {
       candidateCount: candidates.length,
       maxRounds: roundsNeeded(candidates.length),
       snapshotName: AUTO_SNAPSHOT,
       onConfirm: (symptom) => {
-        void this.plugin
-          .startBisect(candidates, symptom || undefined)
-          .then(() => this.refresh(false, false));
+        void this.runBisectAction(async () => {
+          await this.plugin.startBisect(candidates, symptom || undefined);
+        });
       },
     }).open();
   }
@@ -2555,8 +3115,15 @@ export class HealthDashboardView extends ItemView {
       count,
       existing: this.plugin.settings.profiles,
       onConfirm: (name) => {
-        void this.plugin.saveCurrentProfile(name).then(() => {
-          new Notice(`Saved “${name}”.`);
+        void this.plugin.saveCurrentProfile(name).then((stored) => {
+          // Reporting a save that FlowKit refused to make is the small version
+          // of the same lie the banner exists to prevent.
+          new Notice(
+            stored
+              ? `Saved “${name}”.`
+              : `Couldn't save “${name}” — FlowKit can't write its settings file this session.`,
+            stored ? undefined : 8000
+          );
           this.render();
         });
       },
@@ -2600,16 +3167,25 @@ export class HealthDashboardView extends ItemView {
 
   private async runApplyProfile(profile: PluginProfile): Promise<void> {
     const applied = await this.plugin.applyProfile(profile);
-    this.lastBulk = {
-      label: `Switched to “${profile.name}”`,
-      revert: async () => {
-        // The exact inverse of what was actually changed, not of what was
-        // requested — so undo can't switch on something that was already off.
-        await this.plugin.disableMany(applied.enable);
-        await this.plugin.enableMany(applied.disable);
-      },
-    };
-    new Notice(`Switched to “${profile.name}”.`);
+    if (applied.enable.length || applied.disable.length) {
+      this.lastBulk = {
+        label: `Switched to “${profile.name}”`,
+        revert: async () => {
+          // The exact inverse of what was actually changed, not of what was
+          // requested — so undo can't switch on something that was already off.
+          const off = await this.plugin.disableMany(applied.enable);
+          const on = await this.plugin.enableMany(applied.disable);
+          const failed = [...off.failed, ...on.failed];
+          if (failed.length) throw new Error(describeFailed(failed));
+        },
+      };
+    }
+    new Notice(
+      applied.failed.length
+        ? `Switched to “${profile.name}”, but not completely. ${describeFailed(applied.failed)}`
+        : `Switched to “${profile.name}”.`,
+      applied.failed.length ? 10_000 : undefined
+    );
     await this.refresh(false, false);
   }
 
@@ -2617,6 +3193,7 @@ export class HealthDashboardView extends ItemView {
   private async toggleWatch(r: PluginHealth): Promise<void> {
     const watching = await this.plugin.toggleWatch(r.id);
     r.watched = watching;
+    this.invalidateDerived();
     new Notice(
       watching
         ? `Watching ${r.name} — FlowKit will lead with it when something changes.`
@@ -2827,7 +3404,7 @@ export class HealthDashboardView extends ItemView {
     // Plugin names legitimately contain pipes; unescaped they split the table.
     const md = (v: string) => v.replace(/\|/g, "\\|");
     const s = this.summaryStats();
-    const grade = gradeFor(s.avg);
+    const grade = this.gradeNow(s);
     const lines: string[] = [];
     lines.push("# Plugin Health Report");
     lines.push("");
@@ -2835,8 +3412,13 @@ export class HealthDashboardView extends ItemView {
       `> Generated by FlowKit on ${when} · ${this.coverage.stats ? "online" : "local signals only"} · ${rows.length} plugin(s)`
     );
     lines.push("");
+    // The report leaves the vault, so it has to be at least as careful as the
+    // screen. Withholding on screen and printing a confident letter into
+    // somebody else's issue tracker is the worse half of the same mistake.
     lines.push(
-      `**Vault health: ${s.avg == null ? "—" : s.avg}/100 (Grade ${grade.letter})** — ${grade.verdict}`
+      this.canGrade(s)
+        ? `**Vault health: ${s.avg == null ? "—" : s.avg}/100 (Grade ${grade.letter})** — ${grade.verdict}`
+        : `**Vault health: ${s.avg == null ? "—" : s.avg}/100 — ungraded.** ${grade.verdict}`
     );
     lines.push("");
     lines.push(
@@ -2969,6 +3551,18 @@ export class HealthDashboardView extends ItemView {
       .filter(Boolean)
       .join(", ");
   }
+}
+
+/** Name the plugins that would not move, rather than pointing at the console. */
+function describeFailed(failed: LifecycleFailure[]): string {
+  const names = failed.map((f) => f.id).join(", ");
+  return `${names} wouldn't switch — change ${
+    failed.length === 1 ? "it" : "them"
+  } from Settings → Community plugins.`;
+}
+
+function rowsLabel(n: number): string {
+  return `${n} plugin${n === 1 ? "" : "s"}`;
 }
 
 /** How long error-watching has been running, in words. */

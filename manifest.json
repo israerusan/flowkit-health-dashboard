@@ -1,9 +1,9 @@
 {
   "id": "flowkit-health-dashboard",
   "name": "FlowKit Health Dashboard",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "minAppVersion": "1.4.0",
-  "description": "Scores every installed add-on on compatibility, maintenance, footprint, manifest hygiene, and popularity.",
+  "description": "Find which add-on is breaking your vault, and score every one installed on compatibility, reliability, maintenance and footprint.",
   "author": "Israel Avila",
   "authorUrl": "https://github.com/israerusan",
   "fundingUrl": "https://buymeacoffee.com/vaultspotlight",

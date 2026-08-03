@@ -25,6 +25,38 @@ type ClearIntervalFn = (id?: number) => void;
 /** Marks our wrappers, so unload can tell them from someone else's. */
 const WRAPPED = Symbol.for("flowkit-runtime-wrapper");
 
+/**
+ * A measurement that could not put the plugin back the way it found it.
+ *
+ * Distinct from "couldn't measure that one", because the consequences are
+ * completely different: one is a blank cell in a table, the other is a vault
+ * that is not what the user left it as. It carries the id so the UI can name
+ * the plugin instead of telling somebody to go and read the console.
+ */
+export class RestoreFailedError extends Error {
+  constructor(
+    readonly pluginId: string,
+    /** What the plugin's state was before FlowKit touched it. */
+    readonly wasEnabled: boolean,
+    readonly cause: unknown,
+    /** The measurement's own failure, when there was one as well. */
+    readonly measureError: unknown = null
+  ) {
+    super(
+      `FlowKit could not switch ${pluginId} back ${wasEnabled ? "on" : "off"} after measuring it.`
+    );
+    this.name = "RestoreFailedError";
+  }
+}
+
+/** What one profiling run did, including a plugin it could not restore. */
+export interface ProfileRunResult {
+  measured: number;
+  failed: string[];
+  /** Set when the run stopped because a plugin was left in the wrong state. */
+  stranded?: RestoreFailedError;
+}
+
 /** Obsidian's internal plugin registry — not in the public typings. */
 interface InternalPluginsApi {
   manifests: Record<string, PluginManifest>;
@@ -316,20 +348,42 @@ export class RuntimeWatcher {
     }
     const wasEnabled = api.enabledPlugins?.has(id) ?? false;
     const wrapped = (api.enablePlugin as unknown as { [WRAPPED]?: true })[WRAPPED] === true;
+    let ms: number | null = null;
+    let measureError: unknown = null;
     try {
       if (wasEnabled) await api.disablePlugin(id);
       const started = performance.now();
       await api.enablePlugin(id);
-      const ms = performance.now() - started;
+      ms = performance.now() - started;
       // When the wrapper installed, it already recorded a tighter measurement
       // from inside the call; recording again here would overwrite it with one
       // that includes this method's own overhead.
       if (!wrapped) this.noteLoad(id, ms);
-      return ms;
     } catch (err) {
+      measureError = err;
       console.error("FlowKit: could not measure the load time for", id, err);
-      return null;
     }
+
+    // Put it back the way it was found, whether or not the measurement worked.
+    //
+    // This used to sit inside the try, so an enable that threw after the
+    // disable had succeeded left the plugin switched off — a diagnostic that
+    // silently changed the vault and reported only "couldn't measure that one".
+    // It also always enabled, which turned a measurement of a disabled plugin
+    // into a decision to run it.
+    try {
+      if ((api.enabledPlugins?.has(id) ?? false) !== wasEnabled) {
+        if (wasEnabled) await api.enablePlugin(id);
+        else await api.disablePlugin(id);
+      }
+      // The API resolving is not the registry having moved.
+      if ((api.enabledPlugins?.has(id) ?? false) !== wasEnabled) {
+        throw new Error("the plugin registry did not settle");
+      }
+    } catch (err) {
+      throw new RestoreFailedError(id, wasEnabled, err, measureError);
+    }
+    return ms;
   }
 
   // --- live readings --------------------------------------------------------
@@ -416,13 +470,24 @@ export class RuntimeWatcher {
     ids: string[],
     onProgress?: (done: number, total: number, id: string) => void,
     shouldStop?: () => boolean
-  ): Promise<{ measured: number; failed: string[] }> {
+  ): Promise<ProfileRunResult> {
     const failed: string[] = [];
     let measured = 0;
     for (let i = 0; i < ids.length; i++) {
       if (shouldStop?.()) break;
       const id = ids[i];
-      const ms = await this.measureLoad(id);
+      let ms: number | null = null;
+      try {
+        ms = await this.measureLoad(id);
+      } catch (err) {
+        // A plugin left in the wrong state stops the run. Carrying on would
+        // restart another forty plugins on top of a vault that is already not
+        // what the user left it as, and bury the one fact they need.
+        if (err instanceof RestoreFailedError) {
+          return { measured, failed, stranded: err };
+        }
+        throw err;
+      }
       if (ms == null) failed.push(id);
       else measured++;
       onProgress?.(i + 1, ids.length, id);
