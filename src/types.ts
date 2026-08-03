@@ -1,6 +1,9 @@
 // Shared types for the FlowKit Health Dashboard.
 
 import type { ListingStatus } from "./scoring";
+import type { MuteRecord } from "./mutes";
+import type { RepoActivity } from "./repoActivity";
+import type { RuntimeProfile } from "./runtime";
 
 export type { ListingStatus };
 
@@ -26,14 +29,18 @@ export interface MetricScore {
  * A plain, categorical read on release activity — easier to scan than the 0–100
  * maintenance score.
  * - `maintained`   — released recently (≤6 months).
+ * - `active`       — no recent release, but its repository was pushed to in the
+ *                    last 6 months: being worked on, just not tagged.
  * - `aging`        — no release in a while (6–18 months).
  * - `stable`       — no recent release, but many published versions and most
  *                    users on the newest: finished rather than abandoned.
- * - `unmaintained` — no release in over 18 months, and no sign of maturity.
+ * - `unmaintained` — no release in over 18 months and no sign of maturity, or
+ *                    an archived / deleted repository.
  * - `unknown`      — no release data (offline, or not a community plugin).
  */
 export type MaintenanceStatus =
   | "maintained"
+  | "active"
   | "aging"
   | "stable"
   | "unmaintained"
@@ -64,6 +71,19 @@ export interface PluginHealth {
   listing: ListingStatus;
   /** User has muted this plugin from the at-risk / unmaintained counts. */
   muted: boolean;
+  /** Why and for how long, when muted. */
+  mute?: MuteRecord;
+  /**
+   * User has asked to be told about this one specifically. A vault-wide report
+   * is global noise; three plugins the user actually depends on are personal.
+   */
+  watched: boolean;
+  /** What this plugin costs while running, as far as it could be measured. */
+  runtime?: RuntimeProfile;
+  /** Bytes of code and styles on disk, when they could be read. */
+  bundleBytes?: number;
+  /** What its repository says about itself, when the lookup is switched on. */
+  repoActivity?: RepoActivity;
   /** Weighted blend of the available metrics, or `null` if none are available. */
   overall: number | null;
   /**
@@ -164,6 +184,22 @@ export type HealthChangeKind =
   | "update-published"
   | "resolved";
 
+/**
+ * Obsidian itself moving, recorded separately from per-plugin trouble.
+ *
+ * This is the moment people actually open a plugin-health dashboard: something
+ * stopped working right after an update and they want to know what. Keeping the
+ * version transition means the answer can be "here is what changed *because of
+ * that update*" rather than a general list of everything currently wrong.
+ */
+export interface AppVersionChange {
+  at: number;
+  from: string;
+  to: string;
+  /** Plugin ids that could load before and cannot now. */
+  brokeIds: string[];
+}
+
 export interface HealthChange {
   at: number;
   id: string;
@@ -171,8 +207,18 @@ export interface HealthChange {
   kind: HealthChangeKind;
 }
 
-/** Bumped whenever a change to scoring makes old `avg` values incomparable. */
-export const SCORING_MODEL = 3;
+/**
+ * Bumped whenever a change to scoring makes old `avg` values incomparable.
+ *
+ * 4 — Footprint stopped being bytes-on-disk alone: measured load time and fast
+ * repeating timers now count, and Maintenance can be corrected by what the
+ * plugin's repository says. Both move real scores, so old readings are kept but
+ * start a fresh trend line rather than drawing a step the user didn't cause.
+ *
+ * 5 — Footprint also counts how long a plugin's timer callbacks block the
+ * interface, which is the cost users actually feel.
+ */
+export const SCORING_MODEL = 5;
 
 /**
  * Where an error came from.

@@ -1,6 +1,10 @@
 import type { Plugin } from "obsidian";
 import { attributeStack, recordError, type ObservedError } from "./errors";
+import { PRODUCT_ID } from "./product";
 import type { PluginErrorRecord } from "./types";
+
+/** FlowKit's own frames, skipped when a stack was captured inside our wrappers. */
+const IGNORE_SELF: ReadonlySet<string> = new Set([PRODUCT_ID]);
 
 type ConsoleErrorFn = (...args: unknown[]) => void;
 
@@ -133,7 +137,11 @@ export class ErrorWatcher {
     this.handling = true;
     try {
       const installed = this.host.installedIds();
-      const pluginId = attributeStack(partial.stack, installed);
+      // A thrown Error carries the stack from where it was thrown, so FlowKit
+      // is absent from it — but `console.error("some string")` has no Error, so
+      // the stack is synthesised inside our own wrapper with our frames on top.
+      // Without skipping ourselves, every such log is blamed on FlowKit.
+      const pluginId = attributeStack(partial.stack, installed, IGNORE_SELF);
       // Unattributable errors are dropped rather than blamed on something.
       // Obsidian's own internals, themes and CSS snippets all land here.
       if (!pluginId) return;

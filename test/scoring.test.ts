@@ -28,6 +28,46 @@ import { verifyLicense } from "../src/shared/verifyLicense.mjs";
 import { buildInsights } from "../src/insights";
 import type { HealthChangeKind, PluginHealth } from "../src/types";
 import { diffTrouble } from "../src/changes";
+import {
+  loadScore,
+  pollPenalty,
+  readFootprint,
+  recordLoad,
+  pruneProfiles,
+  sizeScore,
+  startupCost,
+} from "../src/runtime";
+import { findConflicts, printChord, type CommandRow } from "../src/conflicts";
+import { buildMute, describeMute, migrateMutes, sweepMutes } from "../src/mutes";
+import { rankSafeDisable } from "../src/triage";
+import { isStale, selectForLookup, type RepoActivityMap } from "../src/repoActivity";
+import { repoVerdict } from "../src/scoring";
+import {
+  beginBisect,
+  bisectStep,
+  desiredState,
+  restoreState,
+  roundsNeeded,
+  searchableCandidates,
+  type BisectState,
+} from "../src/bisect";
+import {
+  correlate,
+  describeGap,
+  diffInstalled,
+  pruneEvents,
+  type PluginEvent,
+  type SeenMap,
+} from "../src/timeline";
+import {
+  deleteProfile,
+  isNoop,
+  profileDelta,
+  saveProfile,
+  type PluginProfile,
+} from "../src/profiles";
+import { searchTerms } from "../src/issueSearch";
+import { tickScore } from "../src/runtime";
 
 const DAY = 86_400_000;
 const NOW = 2_000_000_000_000; // fixed "now" so the tests are deterministic
@@ -467,6 +507,7 @@ function ph(overrides: Partial<PluginHealth>): PluginHealth {
     updateAvailable: false,
     listing: "listed",
     muted: false,
+    watched: false,
     overall: 90,
     confidence: 1,
     metrics: {
@@ -852,6 +893,807 @@ eq("prerelease vs prerelease", compareVersion("1.0.0-alpha", "1.0.0-beta"), -1);
     const unmuted = diffTrouble(muted.current, [row("a", ["error-started"])], ALL, 2);
     eq("unmuting doesn't re-announce it", unmuted.fresh.length, 0);
   }
+}
+
+// --- runtime footprint -------------------------------------------------------
+{
+  eq("50 KB is the footprint anchor", Math.round(sizeScore(50_000)), 100);
+  check("500 KB costs 40 points", Math.round(sizeScore(500_000)) === 60);
+  eq("a 50 ms load is free", loadScore(50), 100);
+  check("a 5 s load is punishing", loadScore(5000) < 25, `got ${loadScore(5000)}`);
+
+  eq("a minute-long timer costs nothing", pollPenalty(60_000), 0);
+  eq("an hourly timer costs nothing", pollPenalty(3_600_000), 0);
+  check("a 100 ms timer costs the most", pollPenalty(100) === 45);
+  check(
+    "a faster timer never costs less than a slower one",
+    pollPenalty(250) >= pollPenalty(1000) && pollPenalty(1000) >= pollPenalty(10_000)
+  );
+
+  // The whole point of the rework: size alone said the small one was cheaper.
+  const smallPoller = readFootprint(60_000, { minIntervalMs: 100 }, "1.0.0");
+  const bigIdle = readFootprint(400_000, {}, "1.0.0");
+  check(
+    "a small plugin polling hard scores below a big idle one",
+    (smallPoller.value ?? 0) < (bigIdle.value ?? 0),
+    `poller ${smallPoller.value} vs idle ${bigIdle.value}`
+  );
+  check("and the reason is named", smallPoller.detail.includes("timer"), smallPoller.detail);
+
+  // Bytes-only behaviour is unchanged, so an unobserved plugin scores as before.
+  eq("bytes-only is unchanged", readFootprint(50_000, undefined, "1.0.0").value, 100);
+  eq(
+    "an unmeasurable plugin stays unavailable",
+    readFootprint(undefined, undefined, "1.0.0").value,
+    null
+  );
+
+  // A load time measured against a build the user no longer runs is not
+  // evidence about the build they do run.
+  const stale = readFootprint(50_000, { loadMs: 4000, loadVersion: "0.9.0" }, "1.0.0");
+  eq("a load time from an older version is ignored", stale.value, 100);
+  const current = readFootprint(50_000, { loadMs: 4000, loadVersion: "1.0.0" }, "1.0.0");
+  check("but the current version's load time counts", (current.value ?? 100) < 40);
+
+  const rec = recordLoad(undefined, 123.7, "1.0.0", NOW);
+  eq("a recorded load rounds to whole ms", rec.loadMs, 124);
+  eq("and is tied to the version it timed", rec.loadVersion, "1.0.0");
+
+  const kept = pruneProfiles({ a: { loadMs: 1 }, b: { loadMs: 2 } }, new Set(["a"]));
+  eq("uninstalled profiles are dropped", Object.keys(kept).join(), "a");
+
+  const cost = startupCost(
+    [
+      { id: "a", enabled: true, bytes: 1000 },
+      { id: "b", enabled: false, bytes: 9_000_000 },
+      { id: "c", enabled: true, bytes: 2000 },
+    ],
+    { a: { loadMs: 100 }, c: { minIntervalMs: 200 } }
+  );
+  eq("startup cost counts only enabled plugins", cost.bytes, 3000);
+  eq("and only measured load times", cost.measuredCount, 1);
+  eq("and counts the pollers", cost.polling, 1);
+}
+
+// --- conflicts ---------------------------------------------------------------
+{
+  const installed = new Set(["alpha", "beta"]);
+  const names = { alpha: "Alpha", beta: "Beta" };
+  const cmd = (id: string, name: string, hotkeys?: CommandRow["hotkeys"]): CommandRow => ({
+    id,
+    name,
+    hotkeys,
+  });
+
+  eq("chords print canonically", printChord({ modifiers: ["Shift", "Mod"], key: "t" }), "Mod+Shift+T");
+  eq("a chord with no key is nothing", printChord({ modifiers: ["Mod"] }), null);
+
+  {
+    const found = findConflicts({
+      commands: [
+        cmd("alpha:go", "Go", [{ modifiers: ["Mod"], key: "T" }]),
+        cmd("beta:leap", "Leap", [{ modifiers: ["Mod"], key: "t" }]),
+      ],
+      customKeys: {},
+      installed,
+      names,
+    });
+    eq("two plugins on one chord is a conflict", found.length, 1);
+    eq("and it is reported as a hotkey clash", found[0].kind, "hotkey");
+    eq("naming both plugins", found[0].ids.slice().sort().join(), "alpha,beta");
+  }
+
+  {
+    // Modifier order and key case are presentation, not identity.
+    const found = findConflicts({
+      commands: [
+        cmd("alpha:go", "Go", [{ modifiers: ["Mod", "Shift"], key: "k" }]),
+        cmd("beta:leap", "Leap", [{ modifiers: ["Shift", "Mod"], key: "K" }]),
+      ],
+      customKeys: {},
+      installed,
+      names,
+    });
+    eq("modifier order doesn't hide a clash", found.length, 1);
+  }
+
+  {
+    // One plugin binding the same chord to two of its own commands is its own
+    // business, and usually deliberate.
+    const found = findConflicts({
+      commands: [
+        cmd("alpha:on", "On", [{ modifiers: ["Mod"], key: "T" }]),
+        cmd("alpha:off", "Off", [{ modifiers: ["Mod"], key: "T" }]),
+      ],
+      customKeys: {},
+      installed,
+      names,
+    });
+    eq("one plugin clashing with itself is not reported", found.length, 0);
+  }
+
+  {
+    // An empty custom binding is how Obsidian records "I removed this", so it
+    // must count as an override — not as "no override, use the default".
+    const found = findConflicts({
+      commands: [
+        cmd("alpha:go", "Go", [{ modifiers: ["Mod"], key: "T" }]),
+        cmd("beta:leap", "Leap", [{ modifiers: ["Mod"], key: "T" }]),
+      ],
+      customKeys: { "beta:leap": [] },
+      installed,
+      names,
+    });
+    eq("a binding the user removed is not still clashing", found.length, 0);
+  }
+
+  {
+    const found = findConflicts({
+      commands: [
+        cmd("editor:toggle-bold", "Toggle bold", [{ modifiers: ["Mod"], key: "B" }]),
+        cmd("app:go-back", "Back", [{ modifiers: ["Mod"], key: "B" }]),
+      ],
+      customKeys: {},
+      installed,
+      names,
+    });
+    eq("two core commands clashing is not our business", found.length, 0);
+  }
+
+  {
+    const found = findConflicts({
+      commands: [cmd("alpha:x", "Insert template"), cmd("beta:y", "Insert template")],
+      customKeys: {},
+      installed,
+      names,
+    });
+    eq("duplicate command names are reported", found.length, 1);
+    eq("as a name clash", found[0].kind, "command-name");
+  }
+}
+
+// --- mutes -------------------------------------------------------------------
+{
+  const migrated = migrateMutes(["old-one"], undefined, NOW);
+  eq("a pre-1.3 mute survives migration", Object.keys(migrated).join(), "old-one");
+  eq("as an indefinite one", migrated["old-one"].until, null);
+
+  const both = migrateMutes(["a"], { a: { at: 1, until: 99 } }, NOW);
+  eq("an existing record wins over the legacy list", both.a.until, 99);
+
+  const mutes = {
+    timed: buildMute("30d", NOW, "1.5.0"),
+    pinned: buildMute("until-update", NOW, "1.5.0"),
+    forever: buildMute("forever", NOW, "1.5.0", "  decided  "),
+  };
+  eq("a reason is trimmed", mutes.forever.reason, "decided");
+  eq("an indefinite mute has no expiry", mutes.forever.until, null);
+
+  const same = sweepMutes(mutes, NOW + 1000, "1.5.0");
+  eq("nothing lapses on the same day and version", same.expired.length, 0);
+
+  const later = sweepMutes(mutes, NOW + 31 * DAY, "1.5.0");
+  eq("a 30-day mute lapses", later.expired.join(), "timed");
+  check("and the others survive", "pinned" in later.active && "forever" in later.active);
+
+  const updated = sweepMutes(mutes, NOW + 1000, "1.6.0");
+  eq("an Obsidian update lapses the version-pinned mute", updated.expired.join(), "pinned");
+
+  check(
+    "a live mute describes itself",
+    describeMute(mutes.timed, NOW).includes("lapses in"),
+    describeMute(mutes.timed, NOW)
+  );
+}
+
+// --- triage ------------------------------------------------------------------
+{
+  const broken = ph({
+    id: "broken",
+    name: "Broken",
+    overall: 20,
+    metrics: {
+      hygiene: { value: 100, source: "measured", detail: "" },
+      maintenance: { value: 80, source: "measured", detail: "" },
+      footprint: { value: 90, source: "measured", detail: "" },
+      popularity: { value: 50, source: "measured", detail: "" },
+      compatibility: { value: 0, source: "measured", detail: "" },
+      reliability: { value: 100, source: "measured", detail: "" },
+    },
+    runtime: { commands: 10, handlers: 20 },
+  });
+  const old = ph({
+    id: "old",
+    name: "Old",
+    overall: 45,
+    maintenanceStatus: "unmaintained",
+    runtime: { commands: 0, handlers: 0 },
+  });
+  const beloved = ph({
+    id: "beloved",
+    name: "Beloved",
+    overall: 30,
+    watched: true,
+    maintenanceStatus: "unmaintained",
+    errors: { uncaught: 6, logged: 0, firstAt: 1, lastAt: 2, signatures: [] },
+    runtime: { commands: 2, handlers: 2 },
+  });
+
+  const ranked = rankSafeDisable([broken, old, beloved], 3);
+  eq("the broken one leads", ranked[0]?.id, "broken");
+  eq("because switching it off costs nothing", ranked[0]?.cost, 0);
+  check(
+    "and that is what it says",
+    ranked[0]?.loss.includes("already isn't running"),
+    ranked[0]?.loss
+  );
+  const watchedRank = ranked.findIndex((c) => c.id === "beloved");
+  check(
+    "a watched plugin is never recommended first",
+    watchedRank !== 0,
+    `ranked at ${watchedRank}`
+  );
+
+  eq(
+    "a disabled plugin is not a candidate",
+    rankSafeDisable([{ ...broken, enabled: false }]).length,
+    0
+  );
+  eq("nor is a muted one", rankSafeDisable([{ ...broken, muted: true }]).length, 0);
+  eq("nor is a healthy one", rankSafeDisable([ph({ overall: 95 })]).length, 0);
+}
+
+// --- repository activity -----------------------------------------------------
+{
+  eq("an archived repo is decisive", repoVerdict({ at: NOW, archived: true }, NOW), "archived");
+  eq(
+    "a deleted repo is decisive",
+    repoVerdict({ at: NOW, failed: "missing" }, NOW),
+    "gone"
+  );
+  eq(
+    "a recent push means active",
+    repoVerdict({ at: NOW, pushedAt: NOW - 30 * DAY }, NOW),
+    "active"
+  );
+  eq(
+    "a three-year-old push means dormant",
+    repoVerdict({ at: NOW, pushedAt: NOW - 1100 * DAY }, NOW),
+    "dormant"
+  );
+  // Nine months is neither evidence of life nor of death, and must leave the
+  // release-based reading exactly as it was.
+  eq(
+    "an ambiguous push decides nothing",
+    repoVerdict({ at: NOW, pushedAt: NOW - 280 * DAY }, NOW),
+    null
+  );
+  eq("no reading decides nothing", repoVerdict(undefined, NOW), null);
+
+  const base: ScoreInput = {
+    manifest: manifest({}),
+    enabled: true,
+    isMobile: false,
+    bundleBytes: 50_000,
+  };
+  const ancient = { downloads: 1000, updated: NOW - 900 * DAY } as Record<string, number>;
+  for (let i = 0; i < 9; i++) ancient[`1.0.${i}`] = 700;
+
+  const stableOnly = computeHealth({ ...base, remote: ancient }, NOW);
+  eq("the maturity carve-out still applies alone", stableOnly.maintenanceStatus, "stable");
+
+  const dormant = computeHealth(
+    { ...base, remote: ancient, repoActivity: { at: NOW, pushedAt: NOW - 1100 * DAY } },
+    NOW
+  );
+  eq(
+    "a dormant repository overrules the carve-out",
+    dormant.maintenanceStatus,
+    "unmaintained"
+  );
+  check(
+    "and drags the score down with it",
+    (dormant.metrics.maintenance.value ?? 100) <= 25,
+    `got ${dormant.metrics.maintenance.value}`
+  );
+
+  const stillGoing = computeHealth(
+    { ...base, remote: ancient, repoActivity: { at: NOW, pushedAt: NOW - 20 * DAY } },
+    NOW
+  );
+  eq("a repository still being pushed to reads as active", stillGoing.maintenanceStatus, "active");
+  check(
+    "and is not scored as abandoned",
+    (stillGoing.metrics.maintenance.value ?? 0) >= 65,
+    `got ${stillGoing.metrics.maintenance.value}`
+  );
+
+  const archived = computeHealth(
+    { ...base, remote: ancient, repoActivity: { at: NOW, archived: true } },
+    NOW
+  );
+  eq("an archived repository is unmaintained", archived.maintenanceStatus, "unmaintained");
+  check(
+    "whatever its release history says",
+    (archived.metrics.maintenance.value ?? 100) <= 10,
+    `got ${archived.metrics.maintenance.value}`
+  );
+
+  // Selection has to spend a scarce request budget where the answer can change.
+  const cache: RepoActivityMap = { fresh: { at: NOW } };
+  check("a fresh reading is not stale", !isStale(cache.fresh, NOW));
+  check("a fortnight-old one is", isStale(cache.fresh, NOW + 14 * DAY));
+  const picked = selectForLookup(
+    [
+      { id: "fresh", repo: "a/b", inDoubt: true, enabled: true },
+      { id: "norepo", inDoubt: true, enabled: true },
+      { id: "settled", repo: "c/d", inDoubt: false, enabled: true },
+      { id: "off", repo: "e/f", inDoubt: true, enabled: false },
+      { id: "on", repo: "g/h", inDoubt: true, enabled: true },
+    ],
+    cache,
+    NOW,
+    2
+  );
+  eq("only doubtful, stale, repo-having plugins are looked up", picked.join(), "on,off");
+}
+
+// --- conflict insight --------------------------------------------------------
+{
+  const rows = [
+    ph({ id: "alpha", name: "Alpha" }),
+    ph({ id: "beta", name: "Beta" }),
+    ph({ id: "gamma", name: "Gamma" }),
+  ];
+  const insights = buildInsights(rows, {
+    conflicts: [
+      {
+        kind: "hotkey",
+        subject: "Mod+T",
+        parties: [],
+        ids: ["alpha", "beta"],
+      },
+    ],
+  });
+  const card = insights.find((i) => i.id === "conflicts");
+  check("a shortcut clash becomes a finding", card != null);
+  eq("naming exactly the plugins involved", card?.ids.slice().sort().join(), "alpha,beta");
+  eq("and the table scopes to them", rows.filter((r) => card?.match(r)).length, 2);
+
+  const none = buildInsights(rows, { conflicts: [] });
+  eq("no clashes, no card", none.some((i) => i.id === "conflicts"), false);
+
+  // A clash involving only disabled plugins isn't affecting anything today.
+  const disabled = buildInsights(
+    [ph({ id: "alpha", enabled: false }), ph({ id: "beta", enabled: false })],
+    { conflicts: [{ kind: "hotkey", subject: "Mod+T", parties: [], ids: ["alpha", "beta"] }] }
+  );
+  eq("a clash between disabled plugins is not reported", disabled.some((i) => i.id === "conflicts"), false);
+}
+
+// --- bisect ------------------------------------------------------------------
+{
+  eq("one candidate needs one round", roundsNeeded(1), 1);
+  // log2 to narrow, plus one to switch the last suspect off and confirm.
+  eq("forty candidates need seven", roundsNeeded(40), 7);
+  eq("eight candidates need four", roundsNeeded(8), 4);
+
+  const all = ["a", "b", "c", "d", "e", "f", "g", "h"];
+
+  // The search must terminate on whichever plugin is guilty, whichever answers
+  // that implies — so drive it for every possible culprit rather than trusting
+  // one hand-picked path.
+  for (const guilty of all) {
+    let state = beginBisect(all, all, NOW, "lag");
+    let guard = 0;
+    while (!state.done && guard++ < 20) {
+      // The symptom disappears exactly when the guilty plugin is switched off.
+      state = bisectStep(state, state.disabled.includes(guilty));
+    }
+    check(`bisect terminates for ${guilty}`, state.done, `after ${guard} rounds`);
+    eq(`bisect finds ${guilty}`, state.culprit, guilty);
+    check(
+      `and does it within the promised rounds for ${guilty}`,
+      guard <= roundsNeeded(all.length),
+      `took ${guard}, promised ${roundsNeeded(all.length)}`
+    );
+  }
+
+  // Nobody is guilty: the symptom persists no matter what is switched off.
+  {
+    let state = beginBisect(all, all, NOW);
+    let guard = 0;
+    while (!state.done && guard++ < 20) state = bisectStep(state, false);
+    check("bisect terminates when no plugin is at fault", state.done);
+    eq("with nothing accused", state.culprit, undefined);
+    eq("and says so", state.exonerated, true);
+  }
+
+  // Two candidates must split 1/1, not 2/0 — a round that disables everything
+  // asks a question whose answer eliminates nothing.
+  {
+    const two = beginBisect(["a", "b"], ["a", "b"], NOW);
+    eq("two candidates split one and one", two.disabled.length, 1);
+    const after = bisectStep(two, true);
+    eq("and one answer settles it", after.done, true);
+    eq("naming the disabled one", after.culprit, "a");
+    // Answering "still happening" clears `a` but proves nothing about `b`,
+    // which has never been switched off — so it takes one more round.
+    const other = bisectStep(two, false);
+    eq("clearing one doesn't yet accuse the other", other.done, false);
+    eq("but it is now the only suspect, and it is off", other.disabled.join(), "b");
+    eq("and the next answer names it", bisectStep(other, true).culprit, "b");
+    eq("or exonerates everything", bisectStep(other, false).exonerated, true);
+  }
+
+  // Plugins that were never candidates stay on throughout, and everything the
+  // user had off stays off.
+  {
+    const state = beginBisect(["a", "b"], ["a", "b", "keepme"], NOW);
+    const want = desiredState(state);
+    check("non-candidates stay enabled", want.enable.includes("keepme"));
+    check("the tested half is off", want.disable.includes("a"));
+    check(
+      "and a plugin the user had disabled is never switched on",
+      !want.enable.includes("neverinstalled") && !want.disable.includes("neverinstalled")
+    );
+  }
+
+  // Restore is the whole safety net: it must name exactly the original set.
+  {
+    const state = beginBisect(["a", "b", "c"], ["a", "b", "c", "d"], NOW);
+    const mid = bisectStep(state, false);
+    const back = restoreState(mid);
+    eq("restore re-enables everything that was on", back.enable.slice().sort().join(), "a,b,c,d");
+    eq("and leaves nothing off", back.disable.length, 0);
+  }
+
+  {
+    const done = beginBisect([], [], NOW);
+    eq("a search with no candidates is already over", done.done, true);
+    const stepped: BisectState = bisectStep(done, true);
+    eq("and stepping it does nothing", stepped, done);
+  }
+}
+
+// A search must never be able to switch off the thing running the search.
+// Without this, bisect eventually unloads FlowKit: the view vanishes mid-run,
+// the session survives on disk describing a half-disabled vault, and the only
+// thing that knows how to restore it is now disabled.
+{
+  const enabled = ["alpha", "flowkit-health-dashboard", "beta"];
+  const searchable = searchableCandidates(enabled, "flowkit-health-dashboard");
+  eq("the searcher is never a candidate", searchable.join(), "alpha,beta");
+  eq(
+    "and it is never switched off",
+    beginBisect(searchable, enabled, 1).disabled.includes("flowkit-health-dashboard"),
+    false
+  );
+  // It stays enabled throughout, because it is in originalEnabled but never
+  // in the disabled set.
+  const state = beginBisect(searchable, enabled, 1);
+  check(
+    "it stays running for the whole search",
+    desiredState(state).enable.includes("flowkit-health-dashboard")
+  );
+  eq(
+    "filtering is a no-op when it isn't in the list",
+    searchableCandidates(["alpha"], "flowkit-health-dashboard").join(),
+    "alpha"
+  );
+  // The same hazard, learned a second time: profiling restarts every plugin it
+  // is handed, so handing it our own id orphans the run inside an unloaded
+  // instance and silently discards every measurement.
+  eq(
+    "profiling is filtered the same way",
+    searchableCandidates(
+      ["flowkit-health-dashboard", "alpha", "beta"],
+      "flowkit-health-dashboard"
+    ).join(),
+    "alpha,beta"
+  );
+}
+
+// --- timeline ----------------------------------------------------------------
+{
+  const observed = (version: string, enabled = true) => [
+    { id: "a", name: "A", version, enabled },
+  ];
+
+  // The first run records a baseline and says nothing — announcing every
+  // installed plugin as new would fabricate events that never happened.
+  {
+    const first = diffInstalled({}, observed("1.0.0"), NOW, false);
+    eq("the baseline run emits nothing", first.events.length, 0);
+    eq("but records what it saw", first.seen.a.version, "1.0.0");
+  }
+
+  {
+    const seen: SeenMap = { a: { version: "1.0.0", enabled: true, at: NOW - DAY } };
+    const updated = diffInstalled(seen, observed("1.1.0"), NOW);
+    eq("an update is recorded", updated.events.length, 1);
+    eq("with both versions", `${updated.events[0].from}->${updated.events[0].to}`, "1.0.0->1.1.0");
+
+    const same = diffInstalled(seen, observed("1.0.0"), NOW);
+    eq("an unchanged plugin emits nothing", same.events.length, 0);
+
+    const toggled = diffInstalled(seen, observed("1.0.0", false), NOW);
+    eq("a toggle is recorded", toggled.events[0]?.kind, "disabled");
+
+    const gone = diffInstalled(seen, [], NOW);
+    eq("an uninstall is recorded", gone.events[0]?.kind, "removed");
+
+    const added = diffInstalled({}, observed("1.0.0"), NOW);
+    eq("a new plugin is recorded as installed", added.events[0]?.kind, "installed");
+  }
+
+  // The correlation is the product's best sentence, and also the easiest place
+  // to assert a cause that isn't there.
+  {
+    const events: PluginEvent[] = [
+      { at: NOW - 2 * 3_600_000, id: "a", name: "A", kind: "updated", from: "1", to: "2" },
+      { at: NOW - 40 * DAY, id: "b", name: "B", kind: "updated", from: "1", to: "2" },
+    ];
+
+    const hit = correlate(
+      events,
+      [{ id: "a", name: "A", firstAt: NOW - 3_600_000, uncaught: 5 }],
+      NOW
+    );
+    eq("errors soon after an update correlate", hit.length, 1);
+    eq("naming that update", hit[0].event.to, "2");
+    eq("and the ordering is known", hit[0].approximate, false);
+
+    // The case a real vault produced: FlowKit does not scan the instant a
+    // plugin updates, so the moment it NOTICES can land after the errors have
+    // already started. Anchoring to `at` alone silently discards exactly the
+    // correlation the feature exists to make.
+    const noticedLate: PluginEvent[] = [
+      {
+        at: NOW,
+        since: NOW - 4 * 3_600_000,
+        id: "a",
+        name: "A",
+        kind: "updated",
+        from: "1",
+        to: "2",
+      },
+    ];
+    const late = correlate(
+      noticedLate,
+      [{ id: "a", name: "A", firstAt: NOW - 2 * 3_600_000, uncaught: 5 }],
+      NOW
+    );
+    eq("an update noticed late still correlates", late.length, 1);
+    eq("but says the ordering is uncertain", late[0].approximate, true);
+    eq("and never reports a negative gap", late[0].gapMs, 0);
+
+    // Before the window opened is still not evidence about the change.
+    const tooEarly = correlate(
+      noticedLate,
+      [{ id: "a", name: "A", firstAt: NOW - 5 * 3_600_000, uncaught: 5 }],
+      NOW
+    );
+    eq("errors predating the window still don't correlate", tooEarly.length, 0);
+
+    const old = correlate(
+      events,
+      [{ id: "b", name: "B", firstAt: NOW - 3_600_000, uncaught: 5 }],
+      NOW
+    );
+    eq("an update forty days earlier is not a cause", old.length, 0);
+
+    // Errors that predate the update are not evidence about the update. This
+    // is the difference between a correlation and blaming an author for a bug
+    // that predates their release.
+    const before = correlate(
+      events,
+      [{ id: "a", name: "A", firstAt: NOW - 5 * 3_600_000, uncaught: 5 }],
+      NOW
+    );
+    eq("errors that started before the change don't correlate", before.length, 0);
+
+    const clean = correlate(events, [{ id: "a", name: "A", firstAt: NOW, uncaught: 0 }], NOW);
+    eq("a plugin with no errors never correlates", clean.length, 0);
+  }
+
+  eq("under a minute isn't 'minutes'", describeGap(45_000), "less than a minute");
+  eq("and minutes are counted", describeGap(20 * 60_000), "20 minutes");
+  eq("hours still read as hours", describeGap(2 * 3_600_000), "2 hours");
+
+  {
+    const kept = pruneEvents(
+      [
+        { at: NOW - 200 * DAY, id: "old", name: "Old", kind: "installed" },
+        { at: NOW - DAY, id: "new", name: "New", kind: "installed" },
+      ],
+      NOW
+    );
+    eq("events past the window are dropped", kept.length, 1);
+    eq("keeping the recent one", kept[0].id, "new");
+  }
+}
+
+// --- plugin sets -------------------------------------------------------------
+{
+  let profiles: PluginProfile[] = [];
+  profiles = saveProfile(profiles, "Writing", ["a", "b"], NOW);
+  profiles = saveProfile(profiles, "Minimal", ["a"], NOW);
+  eq("profiles are saved newest first", profiles[0].name, "Minimal");
+
+  profiles = saveProfile(profiles, "Writing", ["a", "b", "c"], NOW + 1);
+  eq("saving over a name replaces it", profiles.length, 2);
+  eq("with the new contents", profiles.find((p) => p.name === "Writing")?.ids.length, 3);
+
+  eq("a blank name saves nothing", saveProfile(profiles, "  ", ["x"], NOW).length, 2);
+  eq("deleting works", deleteProfile(profiles, "Minimal").length, 1);
+
+  const installed = new Set(["a", "b", "c"]);
+  const enabled = new Set(["a", "z"]);
+  const delta = profileDelta(
+    { name: "W", ids: ["a", "b", "gone"], at: NOW },
+    installed,
+    enabled
+  );
+  eq("what to switch on", delta.enable.join(), "b");
+  // `z` is enabled but not installed as far as this vault knows, so it is left
+  // alone rather than being switched off by a profile that never mentioned it.
+  eq("what to switch off", delta.disable.join(), "");
+  eq("and what the profile names that isn't here", delta.missing.join(), "gone");
+
+  const off = profileDelta({ name: "W", ids: ["a"], at: NOW }, installed, new Set(["a", "c"]));
+  eq("a plugin outside the profile is switched off", off.disable.join(), "c");
+
+  check("an identical profile is a no-op", isNoop(profileDelta({ name: "W", ids: ["a"], at: NOW }, installed, new Set(["a"]))));
+  check("a different one is not", !isNoop(off));
+}
+
+// --- timer callback cost -----------------------------------------------------
+{
+  eq("a callback inside the frame budget is free", tickScore(10), 100);
+  eq("a quarter-second freeze bottoms out", tickScore(250), 0);
+  check("and 100 ms lands in between", tickScore(100) > 0 && tickScore(100) < 100);
+
+  // The case the whole metric exists for: a slow callback on a slow timer is
+  // invisible to every other measure here.
+  const slowTick = readFootprint(50_000, { minIntervalMs: 30_000, maxTickMs: 200 }, "1.0.0");
+  check(
+    "a slow callback on a slow timer still scores badly",
+    (slowTick.value ?? 100) < 30,
+    `got ${slowTick.value}`
+  );
+  check("and says why", slowTick.detail.includes("blocks the interface"), slowTick.detail);
+
+  // A 30 s timer is not free — it sits inside the one-minute idle threshold —
+  // so the idle case is checked at a period the curve really does ignore.
+  const fastTick = readFootprint(50_000, { minIntervalMs: 120_000, maxTickMs: 3 }, "1.0.0");
+  eq("a quick callback on an idle timer costs nothing", fastTick.value, 100);
+  check(
+    "a 30-second timer costs a little",
+    (readFootprint(50_000, { minIntervalMs: 30_000 }, "1.0.0").value ?? 100) < 100
+  );
+}
+
+// --- issue search terms ------------------------------------------------------
+{
+  const terms = searchTerms(
+    "Cannot read properties of undefined at C:\\Users\\me\\vault\\.obsidian\\plugins\\x\\main.js:1042"
+  );
+  check("paths are stripped", !terms.includes("Users"), terms);
+  check("line numbers are stripped", !terms.includes("1042"), terms);
+  check("but the message survives", terms.includes("Cannot read properties"), terms);
+  eq("an empty message searches for nothing", searchTerms("  "), "");
+}
+
+// --- attribution must look past our own frames ------------------------------
+// Found in a real vault: the watcher captures a stack from inside its own
+// setInterval wrapper, so FlowKit's frames sit on top of the caller's. The
+// innermost-wins rule then faithfully returned FlowKit every time, and no other
+// plugin in the vault was ever measured.
+{
+  const installed = new Set(["flowkit-health-dashboard", "dataview"]);
+  const self = new Set(["flowkit-health-dashboard"]);
+  const stack = [
+    "Error",
+    "    at RuntimeWatcher.attributeCaller (plugin:flowkit-health-dashboard:120:20)",
+    "    at Window.set (plugin:flowkit-health-dashboard:99:14)",
+    "    at DataviewPlugin.onload (plugin:dataview:4102:9)",
+  ].join("\n");
+
+  eq(
+    "without the exclusion, our own frame wins",
+    attributeStack(stack, installed),
+    "flowkit-health-dashboard"
+  );
+  eq(
+    "with it, the real caller is found",
+    attributeStack(stack, installed, self),
+    "dataview"
+  );
+  eq(
+    "a stack containing only our own frames attributes to nobody",
+    attributeStack(
+      "Error\n    at x (plugin:flowkit-health-dashboard:1:1)",
+      installed,
+      self
+    ),
+    null
+  );
+}
+
+// --- reliability: silence needs time, failure does not ----------------------
+{
+  const brandNew = { ...input({}), observedMs: 60_000 };
+
+  const quiet = computeHealth(brandNew, NOW);
+  eq(
+    "a quiet plugin is still unjudged early on",
+    quiet.metrics.reliability.value,
+    null
+  );
+
+  // Observed uncaught errors are evidence available immediately. Withholding
+  // the score for six hours put "13 errors" beside a blank Reliability and an
+  // overall of 72 — the product contradicting itself in three inches.
+  const broken = computeHealth(
+    {
+      ...brandNew,
+      errors: {
+        uncaught: 13,
+        logged: 10,
+        firstAt: NOW - 60_000,
+        lastAt: NOW,
+        signatures: [],
+      },
+    },
+    NOW
+  );
+  check(
+    "but observed errors are scored straight away",
+    broken.metrics.reliability.value != null,
+    "still null"
+  );
+  check(
+    "and scored badly",
+    (broken.metrics.reliability.value ?? 100) < 40,
+    `got ${broken.metrics.reliability.value}`
+  );
+  check(
+    "which drags the overall down with it",
+    (broken.overall ?? 100) < (quiet.overall ?? 0),
+    `broken ${broken.overall} vs quiet ${quiet.overall}`
+  );
+
+  // Errors a plugin catches and logs itself still never count against it.
+  const tidy = computeHealth(
+    {
+      ...brandNew,
+      errors: { uncaught: 0, logged: 40, firstAt: NOW - 60_000, lastAt: NOW, signatures: [] },
+    },
+    NOW
+  );
+  eq("logged-only errors don't force an early judgement", tidy.metrics.reliability.value, null);
+}
+
+// --- don't send people to a setting that can't help -------------------------
+{
+  const local = computeHealth(input({ listing: "local" }), NOW);
+  check(
+    "a local install isn't told to enable enrichment",
+    !local.metrics.popularity.detail.includes("enrichment"),
+    local.metrics.popularity.detail
+  );
+  check(
+    "it's told why the figures don't exist",
+    local.metrics.maintenance.detail.includes("outside the community directory"),
+    local.metrics.maintenance.detail
+  );
+  const listed = computeHealth(input({ listing: "listed" }), NOW);
+  check(
+    "a listed plugin with no data still gets the actionable message",
+    listed.metrics.popularity.detail.includes("enrichment"),
+    listed.metrics.popularity.detail
+  );
 }
 
 // --- report -----------------------------------------------------------------

@@ -28,7 +28,20 @@ const PLUGIN_PATH_FRAME = /[/\\]plugins[/\\]([^/\\]+)[/\\]/g;
  */
 export function attributeStack(
   stack: string | undefined,
-  installed: ReadonlySet<string>
+  installed: ReadonlySet<string>,
+  /**
+   * Plugin ids to look straight past — in practice, FlowKit's own.
+   *
+   * This matters whenever the stack is captured from inside FlowKit rather than
+   * at the point something went wrong. A thrown `Error` records its stack where
+   * it was thrown, so FlowKit never appears in it; but a stack synthesised
+   * inside one of our own wrappers — the `setInterval` hook, or `console.error`
+   * called with a bare string — has FlowKit's frames sitting on top of the
+   * caller's. Without this, the innermost-wins rule below faithfully picks the
+   * innermost plugin and that plugin is always us: every timer in the vault
+   * gets recorded against FlowKit and no other plugin is ever measured.
+   */
+  ignore?: ReadonlySet<string>
 ): string | null {
   if (!stack) return null;
   for (const line of stack.split("\n")) {
@@ -37,6 +50,7 @@ export function attributeStack(
       let match: RegExpExecArray | null;
       while ((match = pattern.exec(line)) !== null) {
         const id = match[1];
+        if (ignore?.has(id)) continue;
         if (installed.has(id)) return id;
       }
     }

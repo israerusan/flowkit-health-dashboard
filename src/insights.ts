@@ -1,5 +1,6 @@
 // Turns a scored plugin set into a short, ranked list of actionable insights.
 // Kept free of any Obsidian imports so the Node test suite can exercise it.
+import type { Conflict } from "./conflicts";
 import type { PluginHealth } from "./types";
 
 export type InsightTone = "bad" | "warn" | "good" | "info";
@@ -81,7 +82,16 @@ const IS_UNMAINTAINED = (r: PluginHealth): boolean =>
 const HAS_UPDATE = (r: PluginHealth): boolean => !r.muted && r.updateAvailable;
 const IS_LOCAL = (r: PluginHealth): boolean => !r.muted && r.listing === "local";
 
-export function buildInsights(results: PluginHealth[]): Insight[] {
+/** Extra vault-level evidence that isn't a property of any single plugin. */
+export interface InsightContext {
+  /** Plugins getting in each other's way. */
+  conflicts?: Conflict[];
+}
+
+export function buildInsights(
+  results: PluginHealth[],
+  context: InsightContext = {}
+): Insight[] {
   const live = results.filter((r) => !r.muted);
   const insights: Insight[] = [];
 
@@ -143,6 +153,35 @@ export function buildInsights(results: PluginHealth[]): Insight[] {
       match: IS_INCOMPATIBLE,
       action: "disable-incompatible",
       actionLabel: "Disable these",
+    });
+  }
+
+  // Two healthy plugins can still make a vault feel broken. This is the only
+  // finding here that is not a property of any single plugin, which is exactly
+  // why no per-plugin score could ever have surfaced it: a shortcut claimed
+  // twice means one of them silently never fires, and nothing in Obsidian's own
+  // UI shows you that.
+  const conflicts = (context.conflicts ?? []).filter((c) =>
+    c.ids.some((id) => live.some((r) => r.id === id && r.enabled))
+  );
+  const hotkeyClashes = conflicts.filter((c) => c.kind === "hotkey");
+  if (conflicts.length) {
+    const involved = new Set(conflicts.flatMap((c) => c.ids));
+    const affected = live.filter((r) => involved.has(r.id) && r.enabled);
+    const affectedIds = new Set(affected.map((r) => r.id));
+    const subjects = [...new Set(conflicts.map((c) => c.subject))].slice(0, 3).join(", ");
+    insights.push({
+      id: "conflicts",
+      tone: "warn",
+      icon: "keyboard",
+      title: hotkeyClashes.length
+        ? `${hotkeyClashes.length} shortcut${hotkeyClashes.length > 1 ? "s are" : " is"} claimed by more than one plugin`
+        : `${conflicts.length} command name${conflicts.length > 1 ? "s are" : " is"} used by more than one plugin`,
+      detail: hotkeyClashes.length
+        ? `${subjects} — only one plugin answers each, and Obsidian doesn't tell you which. Affects ${names(affected)}.`
+        : `${subjects} — indistinguishable in the command palette. Affects ${names(affected)}.`,
+      ids: affected.map((r) => r.id),
+      match: (r) => affectedIds.has(r.id),
     });
   }
 

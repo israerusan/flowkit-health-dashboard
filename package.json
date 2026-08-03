@@ -1,6 +1,6 @@
 {
   "name": "flowkit-health-dashboard",
-  "version": "1.2.1",
+  "version": "1.4.0",
   "description": "FlowKit Plugin Health Dashboard for Obsidian.",
   "main": "main.js",
   "type": "module",
@@ -11,7 +11,8 @@
     "lint": "tsc --noEmit -p . && eslint . --max-warnings 0",
     "test": "npm run lint && node test/run.mjs",
     "test:ci": "node test/run.mjs",
-    "license:generate": "node scripts/generate-license.mjs"
+    "license:generate": "node scripts/generate-license.mjs",
+    "probe:network": "node test/probe.mjs"
   },
   "keywords": [
     "obsidian",
