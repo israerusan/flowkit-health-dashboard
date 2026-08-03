@@ -2490,6 +2490,29 @@ export class HealthDashboardView extends ItemView {
    * does mean the first half switched off is the half most likely to contain
    * the problem, and a lucky first answer ends the search early.
    */
+  /**
+   * Command-palette entry points.
+   *
+   * The dashboard's own menu was the only way to reach any of this, which
+   * means it could not be searched for or bound to a key — and the palette is
+   * where most people look first. Each ensures there is a scan to act on,
+   * since a command can open the view and fire before it has scanned.
+   */
+  async commandBisect(): Promise<void> {
+    if (!this.results.length) await this.refresh(false, false);
+    this.startBisect();
+  }
+
+  async commandProfile(): Promise<void> {
+    if (!this.results.length) await this.refresh(false, false);
+    this.startProfileAll(this.profilableIds());
+  }
+
+  async commandSaveSet(): Promise<void> {
+    if (!this.results.length) await this.refresh(false, false);
+    this.saveProfile();
+  }
+
   private startBisect(): void {
     if (!this.plugin.isPro) {
       this.openUpgrade("bisect");

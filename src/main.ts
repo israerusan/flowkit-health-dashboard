@@ -180,6 +180,27 @@ export default class FlowKitHealthPlugin extends Plugin {
       callback: () => void this.activateView(),
     });
 
+    // Reachable from the command palette, not just from a menu inside the
+    // view: the flagship feature was previously findable only by someone who
+    // already knew where to look, which is the wrong way round.
+    this.addCommand({
+      id: "bisect-plugins",
+      name: "Find what's breaking my vault",
+      callback: () => void this.runInDashboard((view) => view.commandBisect()),
+    });
+
+    this.addCommand({
+      id: "profile-startup",
+      name: "Profile plugin startup",
+      callback: () => void this.runInDashboard((view) => view.commandProfile()),
+    });
+
+    this.addCommand({
+      id: "save-plugin-set",
+      name: "Save current plugin set",
+      callback: () => void this.runInDashboard((view) => view.commandSaveSet()),
+    });
+
     this.addSettingTab(new FlowKitHealthSettingTab(this.app, this));
 
     if (this.settings.trackErrors) {
@@ -711,6 +732,22 @@ export default class FlowKitHealthPlugin extends Plugin {
     // `void` the reveal so no-floating-promises is satisfied (revealLeaf gained a
     // Promise return in 1.7.2; we don't consume it).
     void workspace.revealLeaf(leaf);
+  }
+
+  /**
+   * Open the dashboard and run something in it. Commands can fire with no view
+   * on screen, and every one of these acts on the current scan.
+   */
+  private async runInDashboard(
+    fn: (view: HealthDashboardView) => Promise<void>
+  ): Promise<void> {
+    await this.activateView();
+    for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_HEALTH)) {
+      if (leaf.view instanceof HealthDashboardView) {
+        await fn(leaf.view);
+        return;
+      }
+    }
   }
 
   /** Obsidian's plugin registry, defaulted so a shape change degrades to an empty scan. */
