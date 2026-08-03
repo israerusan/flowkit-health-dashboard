@@ -405,6 +405,22 @@ Key didn't arrive, or want a refund? Email <iavila01@gmail.com>.
   jsDelivr CDN mirror of the same repository when GitHub rate-limits the
   connection. Nothing is sent — these are plain public downloads — and the
   result is cached locally for a day.
+
+### Every network call FlowKit can make
+
+There are exactly three, all to GitHub, none of them telemetry, and each can be
+switched off or simply not used:
+
+| Call | When | Sends |
+|---|---|---|
+| Community plugin list + download stats | On open/refresh, cached a day. Off with **Online enrichment**. | Nothing — plain public file downloads |
+| `api.github.com/repos/{owner}/{repo}` | Only with **Check repository activity** on (off by default), a few per scan, cached a week | A repository name that is already public |
+| `api.github.com/search/issues` | Only when you press **"Is this a known issue?"** on a recorded error | That repository name and the error message text |
+
+No accounts, no analytics, no identifiers, and nothing about your notes or vault
+is ever transmitted. Error messages and stack traces stay on your machine — the
+issue search sends only the message text of the error you explicitly asked it to
+look up, and only when you press the button.
 - **Check repository activity** — ask GitHub whether a plugin's repository is
   archived or still being pushed to, so *finished* and *abandoned* stop looking
   identical. **Off by default**: it is the only thing here that talks to an API
@@ -415,6 +431,12 @@ Key didn't arrive, or want a refund? Email <iavila01@gmail.com>.
   repeating timers, so Footprint reflects what a plugin *does* and not only how
   big it is. Only measurements FlowKit witnesses are used; a plugin it couldn't
   observe is never penalised for it.
+
+  To do this it wraps `window.setInterval` and Obsidian's plugin loader while
+  it runs, so it can see which plugin created a timer and how long each load
+  and each callback takes. Both wrappers pass straight through to the originals,
+  record nothing but timings, and are removed when FlowKit unloads. Turn this
+  off and none of it happens. Nothing measured here leaves your machine.
 - **Show disabled plugins** — include installed-but-disabled plugins.
 - **Re-download community data on open** — off by default; the cached scan is
   reused for a day, and Refresh always refetches.

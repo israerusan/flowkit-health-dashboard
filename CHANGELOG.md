@@ -77,8 +77,25 @@ the weakest thing in the product and it converted nobody.
 
 ### Changed
 
+- **The diagnostic tools are in the command palette** — "Find what's breaking my
+  vault", "Profile plugin startup", "Save current plugin set" — so they can be
+  searched for and bound to a key instead of living only in a menu inside the
+  dashboard.
+- **The dashboard re-scores while you watch it.** It used to scan once at
+  startup and then only redraw, which meant a tab left open reported a vault
+  with no timers and no errors indefinitely — precisely the signals this release
+  adds, none of which exist a second after Obsidian loads.
 - Timer callback cost feeds Footprint, so trend history from 1.3.x is kept but
   starts a fresh line — the same guard used in every scoring change since 1.0.0.
+
+### Notes
+
+Everything above was exercised in a live vault before release, against
+purpose-built plugins that load slowly, poll, block the interface, throw, and
+fight each other for a shortcut. That found ten defects — including a bisect
+that could have switched off FlowKit mid-search, and a startup profiler that
+reported success while discarding every measurement — all of which are fixed
+here. The suite that ships with the source now covers each of them.
 
 ## [1.3.0] - 2026-08-03
 
