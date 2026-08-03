@@ -581,6 +581,69 @@
   border: 0;
 }
 
+/* "Since you last looked" -------------------------------------------------
+   The only part of the screen that is new on a return visit, so it gets the
+   highest weight above the fold when it is present — and is absent entirely
+   otherwise. */
+.flowkit-changes {
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--background-modifier-border);
+  border-left: 3px solid var(--interactive-accent);
+  border-radius: 8px;
+  background: var(--background-secondary);
+}
+.flowkit-changes-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+.flowkit-changes-icon {
+  display: inline-flex;
+  color: var(--text-muted);
+}
+.flowkit-changes-title {
+  flex: 1 1 auto;
+  font-size: 0.78em;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+}
+.flowkit-changes-dismiss {
+  flex: 0 0 auto;
+  background: transparent;
+  box-shadow: none;
+  border: none;
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: 1.1em;
+  line-height: 1;
+  padding: 0 4px;
+}
+.flowkit-change {
+  font-size: 0.88em;
+  padding: 1px 0;
+}
+.flowkit-change-name {
+  font-weight: 600;
+}
+.flowkit-change.is-bad .flowkit-change-name {
+  color: var(--color-red, #c62828);
+}
+.flowkit-change.is-good .flowkit-change-name {
+  color: var(--color-green, #2e7d32);
+}
+.flowkit-change-what {
+  color: var(--text-muted);
+}
+.flowkit-changes-more {
+  font-size: 0.8em;
+  color: var(--text-muted);
+  margin-top: 4px;
+}
+
 /* First-run explainer ----------------------------------------------------- */
 .flowkit-intro {
   display: flex;
@@ -1074,5 +1137,34 @@
   font-size: 0.82em;
   color: var(--text-muted);
   margin: -4px 0 14px;
+  line-height: 1.6;
+}
+
+/* All-clear state ---------------------------------------------------------
+   The good case, which most vaults are in most of the time. Stated as the
+   checks that passed, so the user can see the work that was done. */
+.flowkit-allclear {
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--color-green, #2e7d32) 40%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--color-green, #2e7d32) 6%, transparent);
+}
+.flowkit-allclear-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.flowkit-allclear-icon {
+  display: inline-flex;
+  color: var(--color-green, #2e7d32);
+}
+.flowkit-allclear-title {
+  font-weight: 600;
+}
+.flowkit-allclear-list {
+  margin: 8px 0 0;
+  padding-left: 20px;
+  font-size: 0.85em;
+  color: var(--text-muted);
   line-height: 1.6;
 }

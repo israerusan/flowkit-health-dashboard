@@ -24,6 +24,8 @@ import {
 } from "./settings";
 import type {
   DataCoverage,
+  HealthChange,
+  HealthChangeKind,
   HealthSnapshot,
   PluginHealth,
   RemoteCache,
@@ -62,6 +64,20 @@ const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
 /** How often the background pass runs while Obsidian stays open. */
 const MONITOR_INTERVAL_MS = 6 * 60 * 60 * 1000;
+
+/** Cap on the recorded change log. */
+const MAX_CHANGES = 60;
+
+/** Whether two trouble maps describe the same state. */
+function sameKinds(
+  a: Record<string, HealthChangeKind[]>,
+  b: Record<string, HealthChangeKind[]>
+): boolean {
+  const ka = Object.keys(a);
+  const kb = Object.keys(b);
+  if (ka.length !== kb.length) return false;
+  return ka.every((id) => (a[id] ?? []).join("|") === (b[id] ?? []).join("|"));
+}
 
 
 export default class FlowKitHealthPlugin extends Plugin {
@@ -220,45 +236,75 @@ export default class FlowKitHealthPlugin extends Plugin {
    * most valuable right after an Obsidian update, which is exactly when nobody
    * thinks to go looking.
    */
-  private async reportRegressions(active: PluginHealth[]): Promise<void> {
-    const seen = new Set(this.settings.notified);
-    // Everything currently in trouble, whether or not we've mentioned it.
-    const bad = active
-      .filter(
-        (r) =>
-          r.enabled &&
-          (r.metrics.compatibility.value === 0 ||
-            r.listing === "delisted" ||
-            (r.errors?.uncaught ?? 0) > 0 ||
-            r.maintenanceStatus === "unmaintained")
-      )
-      .map((r) => r.id);
-    const badSet = new Set(bad);
-    const fresh = bad.filter((id) => !seen.has(id));
+  /** Which kinds of trouble a plugin is in right now. */
+  private troubleKinds(r: PluginHealth): HealthChangeKind[] {
+    const kinds: HealthChangeKind[] = [];
+    if (!r.enabled) return kinds;
+    if ((r.errors?.uncaught ?? 0) > 0) kinds.push("error-started");
+    if (r.listing === "delisted") kinds.push("delisted");
+    if (r.metrics.compatibility.value === 0) kinds.push("became-incompatible");
+    if (r.updateAvailable) kinds.push("update-published");
+    return kinds;
+  }
 
-    // Remember exactly what is bad *now*, so a plugin the user fixed drops off
-    // the list and a genuine future regression is reported again. Doing this
-    // unconditionally — not only when something is fresh — is the point: the
-    // prune used to sit after an early return, and it compared against all
-    // installed ids rather than the failing ones, so an id was silently
-    // remembered forever and could never be reported a second time.
-    if (this.settings.notified.length !== badSet.size ||
-        this.settings.notified.some((id) => !badSet.has(id))) {
-      this.settings.notified = [...badSet];
-      await this.saveSettings();
+  /**
+   * Diff this scan against the last one and append what moved.
+   *
+   * This used to live inline, fire a Notice, and then throw the transition
+   * away — so the product knew exactly what had changed and kept none of it.
+   * Recorded for everyone; only the Notice stays Pro.
+   */
+  async diffChanges(active: PluginHealth[]): Promise<HealthChange[]> {
+    const previous = this.settings.notified;
+    const current: Record<string, HealthChangeKind[]> = {};
+    const fresh: HealthChange[] = [];
+    const at = Date.now();
+
+    for (const r of active) {
+      const kinds = this.troubleKinds(r);
+      if (kinds.length) current[r.id] = kinds;
+      const before = new Set(previous[r.id] ?? []);
+      for (const kind of kinds) {
+        if (!before.has(kind)) fresh.push({ at, id: r.id, name: r.name, kind });
+      }
+      // Everything that cleared. The product had no way to say good news.
+      const stillBad = new Set(kinds);
+      const recovered = [...before].filter((k) => !stillBad.has(k));
+      if (recovered.length && kinds.length === 0) {
+        fresh.push({ at, id: r.id, name: r.name, kind: "resolved" });
+      }
     }
 
-    if (!fresh.length) return;
+    if (!fresh.length && sameKinds(previous, current)) return [];
 
-    const names = active
-      .filter((r) => fresh.includes(r.id))
-      .map((r) => r.name)
-      .slice(0, 3)
-      .join(", ");
+    this.settings.notified = current;
+    this.settings.changeLog = [...this.settings.changeLog, ...fresh].slice(-MAX_CHANGES);
+    await this.saveSettings();
+    return fresh;
+  }
+
+  /** Changes the user hasn't acknowledged yet, newest last. */
+  unseenChanges(): HealthChange[] {
+    const since = this.settings.lastSeenChangeAt ?? 0;
+    return this.settings.changeLog.filter((c) => c.at > since);
+  }
+
+  /** Mark the "since you last looked" strip as read. */
+  async markChangesSeen(): Promise<void> {
+    this.settings.lastSeenChangeAt = Date.now();
+    await this.saveSettings();
+  }
+
+  private async reportRegressions(active: PluginHealth[]): Promise<void> {
+    const fresh = await this.diffChanges(active);
+    const worrying = fresh.filter((c) => c.kind !== "resolved" && c.kind !== "update-published");
+    if (!worrying.length) return;
+
+    const names = worrying.slice(0, 3).map((c) => c.name).join(", ");
     new Notice(
-      `FlowKit: ${fresh.length} plugin${fresh.length === 1 ? "" : "s"} need${
-        fresh.length === 1 ? "s" : ""
-      } a look — ${names}${fresh.length > 3 ? ` +${fresh.length - 3} more` : ""}.`,
+      `FlowKit: ${worrying.length} plugin${worrying.length === 1 ? "" : "s"} need${
+        worrying.length === 1 ? "s" : ""
+      } a look — ${names}${worrying.length > 3 ? ` +${worrying.length - 3} more` : ""}.`,
       8000
     );
   }
@@ -272,7 +318,14 @@ export default class FlowKitHealthPlugin extends Plugin {
     // rather than defending at each call site.
     if (!Array.isArray(this.settings.ignored)) this.settings.ignored = [];
     if (!Array.isArray(this.settings.history)) this.settings.history = [];
-    if (!Array.isArray(this.settings.notified)) this.settings.notified = [];
+    // `notified` was a flat id list before the change log existed. Migrating to
+    // an empty map is deliberate: the old shape recorded only that a plugin was
+    // *some* kind of bad, so there is nothing to translate into per-kind state,
+    // and starting clean costs at most one duplicate notification.
+    if (!this.settings.notified || Array.isArray(this.settings.notified)) {
+      this.settings.notified = {};
+    }
+    if (!Array.isArray(this.settings.changeLog)) this.settings.changeLog = [];
     if (!this.settings.errorLog || typeof this.settings.errorLog !== "object") {
       this.settings.errorLog = {};
     }

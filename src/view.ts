@@ -1,6 +1,16 @@
-import { ItemView, Menu, Notice, TFile, WorkspaceLeaf, setIcon } from "obsidian";
+import {
+  ItemView,
+  Menu,
+  Notice,
+  Platform,
+  TFile,
+  WorkspaceLeaf,
+  apiVersion,
+  setIcon,
+} from "obsidian";
 import type {
   DataCoverage,
+  HealthChange,
   HealthSnapshot,
   MaintenanceStatus,
   MetricScore,
@@ -17,6 +27,7 @@ import {
   type Insight,
 } from "./insights";
 import { WEIGHTS } from "./scoring";
+import { totalUncaught } from "./errors";
 import { BulkConfirmModal } from "./ui/BulkConfirmModal";
 import { UpgradeModal } from "./ui/UpgradeModal";
 import { PRODUCT_NAME, PRO_PRICE } from "./product";
@@ -282,6 +293,9 @@ export class HealthDashboardView extends ItemView {
         confidence: s.confidence,
         model: SCORING_MODEL,
       });
+      // Record what moved since the last scan, so reopening the dashboard can
+      // lead with it rather than rendering an identical screen.
+      await this.plugin.diffChanges(this.results.filter((r) => !r.muted));
       // Otherwise the status bar keeps quoting the last background pass — so
       // acting on a bulk fix left it reading "5 to fix" for hours afterwards.
       this.plugin.updateStatusBar(
@@ -522,6 +536,7 @@ export class HealthDashboardView extends ItemView {
       return;
     }
 
+    this.renderChanges(root);
     this.renderIntro(root);
     this.renderHero(root);
     this.renderCoverageNotice(root);
@@ -581,13 +596,19 @@ export class HealthDashboardView extends ItemView {
     // boolean — the header used to claim "full metrics" whenever stats loaded,
     // even with sideload detection and repo links silently missing.
     const full = this.coverage.stats && this.coverage.list;
+    // Say how old the data is. The cache TTL is 24h and re-download-on-open is
+    // off by default, so the normal case is reading day-old numbers under a
+    // green "Online" label — the one place left where the product, whose whole
+    // differentiator is honest provenance, overstated itself.
+    const cachedAt = this.plugin.settings.cache?.at;
+    const age = cachedAt ? ` · community data from ${describeWhen(cachedAt)}` : "";
     status.setText(
       this.loading
         ? "Scoring…"
         : full
-          ? "Online — all signals"
+          ? `Online — all signals${age}`
           : this.coverage.stats || this.coverage.list
-            ? "Online — some signals unavailable"
+            ? `Online — some signals unavailable${age}`
             : "Local signals only"
     );
     status.addClass(full ? "is-online" : "is-offline");
@@ -595,7 +616,7 @@ export class HealthDashboardView extends ItemView {
     if (!this.loading && this.results.length > 0) {
       const exportBtn = actions.createEl("button", { cls: "flowkit-health-btn" });
       setIcon(exportBtn.createSpan(), "download");
-      exportBtn.createSpan({ text: " Export" });
+      exportBtn.createSpan({ text: " Share" });
       if (!this.plugin.isPro && this.plugin.settings.usedFreeExport) {
         setIcon(exportBtn.createSpan({ cls: "flowkit-lock" }), "lock");
       }
@@ -681,6 +702,53 @@ export class HealthDashboardView extends ItemView {
       text.createEl("p", {
         cls: "flowkit-hero-hint",
         text: "Turn on online enrichment for maintenance and popularity data, and a letter grade.",
+      });
+    }
+  }
+
+  /**
+   * What moved since the user last looked.
+   *
+   * This is the answer to the product's structural problem — that it was a
+   * report you read once. Every other section renders the same thing on every
+   * visit; this one is the only part of the screen that is new.
+   */
+  private renderChanges(root: HTMLElement): void {
+    const unseen = this.plugin.unseenChanges();
+    if (!unseen.length) return;
+
+    const since = this.plugin.settings.lastSeenChangeAt;
+    const box = root.createDiv({ cls: "flowkit-changes" });
+    const head = box.createDiv({ cls: "flowkit-changes-head" });
+    setIcon(head.createSpan({ cls: "flowkit-changes-icon" }), "history");
+    head.createSpan({
+      cls: "flowkit-changes-title",
+      text: since ? `Since ${describeWhen(since)}` : "Since you last looked",
+    });
+    const dismiss = head.createEl("button", { cls: "flowkit-changes-dismiss", text: "×" });
+    dismiss.setAttr("aria-label", "Mark these as seen");
+    dismiss.onclick = () => {
+      void this.plugin.markChangesSeen().then(() => this.render());
+    };
+
+    // Newest first, and the ones that matter before the merely informational.
+    const ranked = [...unseen].sort((a, b) => {
+      const weight = (k: HealthChange["kind"]): number =>
+        k === "resolved" ? 2 : k === "update-published" ? 1 : 0;
+      return weight(a.kind) - weight(b.kind) || b.at - a.at;
+    });
+    const list = box.createDiv({ cls: "flowkit-changes-list" });
+    for (const change of ranked.slice(0, 3)) {
+      const line = list.createDiv({
+        cls: `flowkit-change is-${change.kind === "resolved" ? "good" : "bad"}`,
+      });
+      line.createSpan({ cls: "flowkit-change-name", text: change.name });
+      line.createSpan({ cls: "flowkit-change-what", text: ` ${describeChange(change.kind)}` });
+    }
+    if (ranked.length > 3) {
+      list.createDiv({
+        cls: "flowkit-changes-more",
+        text: `+${ranked.length - 3} more`,
       });
     }
   }
@@ -820,6 +888,15 @@ export class HealthDashboardView extends ItemView {
     setIcon(head.createSpan({ cls: "flowkit-section-icon" }), "lightbulb");
     head.createSpan({ cls: "flowkit-section-title", text: "What to fix" });
 
+    // When nothing is wrong, state the negative results. A diagnosis that finds
+    // nothing used to render as four green words, so the user never saw the
+    // work that was done — and this is the state most vaults are in most of the
+    // time, which made it the least designed screen in the product.
+    if (insights.length === 1 && insights[0].id === "healthy") {
+      this.renderAllClear(section);
+      return;
+    }
+
     // The complete diagnosis, for everyone.
     //
     // This used to show insights[0] and then a lock card. It converted nobody:
@@ -850,6 +927,31 @@ export class HealthDashboardView extends ItemView {
     const btn = lock.createEl("button", { cls: "flowkit-health-btn flowkit-upgrade-btn" });
     btn.setText("See what Pro adds");
     btn.onclick = () => this.openUpgrade("bulk");
+  }
+
+  /** The good case, stated as the checks that passed rather than as an absence. */
+  private renderAllClear(section: HTMLElement): void {
+    const live = this.results.filter((r) => !r.muted);
+    const card = section.createDiv({ cls: "flowkit-allclear" });
+    const head = card.createDiv({ cls: "flowkit-allclear-head" });
+    setIcon(head.createSpan({ cls: "flowkit-allclear-icon" }), "check-circle");
+    head.createSpan({
+      cls: "flowkit-allclear-title",
+      text: `Checked ${live.length} plugin${live.length === 1 ? "" : "s"}. Nothing needs your attention.`,
+    });
+
+    const watched = this.plugin.observedMs();
+    const errors = totalUncaught(this.plugin.settings.errorLog);
+    const checks = [
+      `${live.filter((r) => r.listing === "delisted").length} pulled from the community directory`,
+      `${live.filter((r) => isIncompatible(r)).length} incompatible with Obsidian ${apiVersion}`,
+      watched > 0
+        ? `${errors} errors traced to a plugin in ${Math.max(1, Math.floor(watched / 86_400_000))} day${Math.floor(watched / 86_400_000) === 1 ? "" : "s"} of watching`
+        : "error watching is off",
+      `${live.filter((r) => r.maintenanceStatus === "unmaintained").length} without a release in 18 months`,
+    ];
+    const list = card.createEl("ul", { cls: "flowkit-allclear-list" });
+    for (const c of checks) list.createEl("li", { text: c });
   }
 
   private renderInsightCard(parent: HTMLElement, ins: Insight, pro: boolean): void {
@@ -975,6 +1077,82 @@ export class HealthDashboardView extends ItemView {
         const btn = locked.createEl("button", { text: "See the stack trace with Pro" });
         btn.onclick = () => this.openUpgrade("errors");
       }
+    }
+  }
+
+  /**
+   * A paste-ready bug report for one plugin.
+   *
+   * The user was going to file that issue anyway, badly, from memory. Every
+   * field here is something FlowKit already holds, and the report carries a
+   * footer to exactly the audience worth reaching — plugin authors and the
+   * power users reading their issue trackers.
+   */
+  private async copyBugReport(r: PluginHealth): Promise<void> {
+    const lines: string[] = [];
+    lines.push(`**${r.name}** v${r.version}`);
+    if (r.latestVersion && r.latestVersion !== r.version) {
+      lines.push(`Latest published: v${r.latestVersion}`);
+    }
+    lines.push(`Obsidian ${apiVersion} · ${Platform.isMobile ? "mobile" : "desktop"}`);
+    lines.push("");
+
+    const rec = r.errors;
+    if (rec?.signatures.length) {
+      const watched = Math.max(1, Math.round(this.plugin.observedMs() / 86_400_000));
+      lines.push(
+        `${rec.uncaught} unhandled error${rec.uncaught === 1 ? "" : "s"} recorded over ${watched} day${watched === 1 ? "" : "s"}:`
+      );
+      lines.push("");
+      for (const sig of [...rec.signatures].sort((a, b) => b.lastAt - a.lastAt).slice(0, 5)) {
+        lines.push(`- \`${sig.message}\` — seen ${sig.count}×, last ${describeWhen(sig.lastAt)}`);
+        // The stack is the Pro line: it is the part an author can act on.
+        if (this.plugin.isPro && sig.stack) {
+          lines.push("");
+          lines.push("```");
+          lines.push(sig.stack);
+          lines.push("```");
+        }
+      }
+      if (!this.plugin.isPro) {
+        lines.push("");
+        lines.push("_Stack traces available with FlowKit Pro._");
+      }
+    } else {
+      lines.push(`Overall health ${r.overall ?? "—"}. No errors recorded.`);
+    }
+
+    lines.push("");
+    lines.push(`— collected by ${PRODUCT_NAME} for Obsidian`);
+
+    try {
+      await navigator.clipboard.writeText(lines.join("\n"));
+      new Notice("Bug report copied — paste it into an issue.");
+    } catch (err) {
+      console.error("FlowKit: clipboard write failed", err);
+      new Notice("Couldn't copy to the clipboard — see the console.");
+    }
+  }
+
+  /** A short vault summary that fits in a chat message. */
+  private async copySummary(): Promise<void> {
+    const s = this.summaryStats();
+    const grade = gradeFor(s.avg);
+    const insights = buildInsights(this.results);
+    const lines = [
+      `${PRODUCT_NAME}: vault health ${s.avg ?? "—"}/100 (Grade ${grade.letter}) across ${s.count} plugins.`,
+    ];
+    for (const ins of insights.slice(0, 3)) lines.push(`• ${ins.title}`);
+    const watching = this.plugin.observedMs();
+    if (watching > 0) {
+      lines.push(`Watching for plugin errors for ${Math.max(1, Math.floor(watching / 86_400_000))} days.`);
+    }
+    try {
+      await navigator.clipboard.writeText(lines.join("\n"));
+      new Notice("Summary copied.");
+    } catch (err) {
+      console.error("FlowKit: clipboard write failed", err);
+      new Notice("Couldn't copy to the clipboard — see the console.");
     }
   }
 
@@ -1292,6 +1470,10 @@ export class HealthDashboardView extends ItemView {
       const gh = actions.createEl("button", { text: "Open on GitHub" });
       gh.onclick = () => window.open(`https://github.com/${r.repo}`, "_blank");
     }
+    if (r.errors?.signatures.length) {
+      const report = actions.createEl("button", { cls: "mod-cta", text: "Copy bug report" });
+      report.onclick = () => void this.copyBugReport(r);
+    }
     const mute = actions.createEl("button", {
       text: r.muted ? "Unmute" : "Mute from counts",
     });
@@ -1459,6 +1641,15 @@ export class HealthDashboardView extends ItemView {
       );
     }
 
+    if (r.errors?.signatures.length) {
+      menu.addItem((item) =>
+        item
+          .setTitle("Copy bug report")
+          .setIcon("clipboard-list")
+          .onClick(() => void this.copyBugReport(r))
+      );
+    }
+
     menu.addSeparator();
     menu.addItem((item) =>
       item
@@ -1541,14 +1732,16 @@ export class HealthDashboardView extends ItemView {
   }
 
   private onExportClick(evt: MouseEvent): void {
-    // Free users get one full report. It is the only artefact this plugin
-    // produces that leaves the app and gets seen by other people, so refusing
-    // it outright was refusing the product's best piece of marketing.
-    if (!this.plugin.isPro && this.plugin.settings.usedFreeExport) {
-      this.openUpgrade("export");
-      return;
-    }
     const menu = new Menu();
+    // Copy is always free and unlimited. Never ration the thing that carries
+    // your name outward.
+    menu.addItem((item) =>
+      item
+        .setTitle("Copy summary")
+        .setIcon("clipboard-copy")
+        .onClick(() => void this.copySummary())
+    );
+    menu.addSeparator();
     menu.addItem((item) =>
       item
         .setTitle("Export Markdown report")
@@ -1557,9 +1750,15 @@ export class HealthDashboardView extends ItemView {
     );
     menu.addItem((item) =>
       item
-        .setTitle("Export CSV")
+        .setTitle(this.plugin.isPro ? "Export CSV" : "Export CSV (Pro)")
         .setIcon("table")
-        .onClick(() => void this.exportReport("csv"))
+        .onClick(() => {
+          if (!this.plugin.isPro) {
+            this.openUpgrade("export");
+            return;
+          }
+          void this.exportReport("csv");
+        })
     );
     menu.showAtMouseEvent(evt);
   }
@@ -1753,8 +1952,27 @@ export class HealthDashboardView extends ItemView {
   }
 }
 
+/** Plain-English wording for one recorded transition. */
+function describeChange(kind: HealthChange["kind"]): string {
+  switch (kind) {
+    case "error-started":
+      return "started throwing errors";
+    case "delisted":
+      return "was removed from the community directory";
+    case "became-incompatible":
+      return "stopped being compatible with your Obsidian";
+    case "update-published":
+      return "published an update";
+    default:
+      return "is back to normal";
+  }
+}
+
 /** A short, relative-ish description of a past timestamp for the trend delta. */
 function describeWhen(at: number): string {
+  const hours = (Date.now() - at) / 3_600_000;
+  if (hours < 1) return "just now";
+  if (hours < 24) return `${Math.round(hours)} hours ago`;
   const days = Math.floor((Date.now() - at) / 86_400_000);
   if (days <= 0) return "earlier today";
   if (days === 1) return "yesterday";

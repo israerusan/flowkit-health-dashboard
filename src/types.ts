@@ -148,6 +148,29 @@ export interface HealthSnapshot {
   model?: number;
 }
 
+/**
+ * A plugin crossing into — or back out of — trouble.
+ *
+ * The 90-day history stores five vault-wide aggregates and no plugin ids, so it
+ * is structurally incapable of answering "which one changed?". This is the
+ * record that can: it is what makes reopening the dashboard worth doing, and
+ * `resolved` matters most, because the product otherwise has no vocabulary for
+ * good news arriving over time.
+ */
+export type HealthChangeKind =
+  | "error-started"
+  | "delisted"
+  | "became-incompatible"
+  | "update-published"
+  | "resolved";
+
+export interface HealthChange {
+  at: number;
+  id: string;
+  name: string;
+  kind: HealthChangeKind;
+}
+
 /** Bumped whenever a change to scoring makes old `avg` values incomparable. */
 export const SCORING_MODEL = 3;
 

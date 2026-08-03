@@ -1,6 +1,12 @@
 import { App, Notice, PluginSettingTab, Setting } from "obsidian";
 import type FlowKitHealthPlugin from "./main";
-import type { HealthSnapshot, PluginErrorRecord, RemoteCache } from "./types";
+import type {
+  HealthChange,
+  HealthChangeKind,
+  HealthSnapshot,
+  PluginErrorRecord,
+  RemoteCache,
+} from "./types";
 import {
   PRODUCT_NAME,
   PRO_FEATURES,
@@ -35,8 +41,16 @@ export interface FlowKitHealthSettings {
   usedFreeExport: boolean;
   /** Pro: check for newly-degraded plugins in the background once a day. */
   backgroundMonitoring: boolean;
-  /** Ids already reported by monitoring, so the same news isn't repeated. */
-  notified: string[];
+  /**
+   * Which kinds of trouble each plugin is currently in, so we only report a
+   * transition once — and can tell when one clears. Was a flat `string[]` of
+   * ids; migrated on load.
+   */
+  notified: Record<string, HealthChangeKind[]>;
+  /** What changed and when. Capped; the newest entries are kept. */
+  changeLog: HealthChange[];
+  /** When the user last dismissed the "since you last looked" strip. */
+  lastSeenChangeAt: number | null;
   /** Watch for runtime errors and attribute them to the plugin that threw. */
   trackErrors: boolean;
   /** Also capture errors plugins catch and log themselves. */
@@ -58,7 +72,9 @@ export const DEFAULT_SETTINGS: FlowKitHealthSettings = {
   seenIntro: false,
   usedFreeExport: false,
   backgroundMonitoring: true,
-  notified: [],
+  notified: {},
+  changeLog: [],
+  lastSeenChangeAt: null,
   trackErrors: true,
   trackConsoleErrors: true,
   watchingSince: null,
