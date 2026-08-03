@@ -112,6 +112,18 @@ const MONITOR_INTERVAL_MS = 6 * 60 * 60 * 1000;
 /** Cap on the recorded change log. */
 const MAX_CHANGES = 60;
 
+/**
+ * How often a watcher may trigger a re-score while a dashboard is open.
+ *
+ * Rescoring is local and cheap, but it stats every plugin's files and writes a
+ * snapshot, so it is not free enough to run on every observed error during a
+ * burst.
+ */
+const LOCAL_RESCAN_THROTTLE_MS = 15_000;
+
+/** A displayed scan older than this is refreshed when the view is next looked at. */
+const STALE_SCAN_MS = 30_000;
+
 export default class FlowKitHealthPlugin extends Plugin {
   settings: FlowKitHealthSettings = DEFAULT_SETTINGS;
 
@@ -138,6 +150,9 @@ export default class FlowKitHealthPlugin extends Plugin {
 
   /** Guards the background repository lookups against overlapping batches. */
   private repoLookupInFlight = false;
+
+  /** When the last watcher-triggered local rescan ran. */
+  private lastLocalRescan = 0;
 
   /**
    * Mutes that lapsed during the last scan. Surfaced once, so a plugin
@@ -175,7 +190,9 @@ export default class FlowKitHealthPlugin extends Plugin {
         installedIds: () => new Set(Object.keys(this.pluginsApi().manifests ?? {})),
         log: () => this.settings.errorLog,
         onChange: () => {
-          void this.saveSettings().then(() => this.refreshViews());
+          // Re-score, not just repaint: an error that just landed changes
+          // Reliability, and repainting the previous scan hides it.
+          void this.saveSettings().then(() => this.requestLocalRescan());
         },
       });
       this.errorWatcher.start(this.settings.trackConsoleErrors);
@@ -187,7 +204,10 @@ export default class FlowKitHealthPlugin extends Plugin {
         store: () => this.settings.runtimeProfiles,
         versionOf: (id) => this.pluginsApi().manifests?.[id]?.version,
         onChange: () => {
-          void this.saveSettings().then(() => this.refreshViews());
+          // The first flush lands ~5s after startup, by which time a polling
+          // plugin has actually polled — which is the only reason the runtime
+          // signals ever appear on a dashboard opened at launch.
+          void this.saveSettings().then(() => this.requestLocalRescan());
         },
       });
       // Started before anything else touches the plugin registry, so the
@@ -568,6 +588,37 @@ export default class FlowKitHealthPlugin extends Plugin {
    * stale view and concludes nothing happened — at precisely the moment they
    * have just paid.
    */
+  /**
+   * Re-score from live local signals after a watcher observed something.
+   *
+   * The watchers used to only re-RENDER, which redraws the previous scan's
+   * numbers. That made the dashboard a photograph taken at startup: the runtime
+   * signals it now depends on — timers, callback cost, error counts — are all
+   * things that do not exist yet a second after Obsidian loads, so a restored
+   * dashboard tab would faithfully display a vault with no timers and no errors
+   * for as long as it stayed open. The background pass runs every six hours,
+   * which is no help at all to somebody watching the screen.
+   *
+   * Local-only and never fetching: nothing a watcher observes is a question the
+   * network could answer.
+   */
+  requestLocalRescan(): void {
+    const now = Date.now();
+    if (now - this.lastLocalRescan < LOCAL_RESCAN_THROTTLE_MS) {
+      // Too soon to re-score, but the newest counts are still worth painting.
+      this.refreshViews();
+      return;
+    }
+    this.lastLocalRescan = now;
+    this.refreshViews(true, false);
+  }
+
+  /** Whether the displayed scan is old enough to be worth redoing. */
+  scanIsStale(): boolean {
+    const last = this.settings.lastScanAt ?? 0;
+    return Date.now() - last > STALE_SCAN_MS;
+  }
+
   refreshViews(rescan = false, allowFetch = false): void {
     for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_HEALTH)) {
       const view = leaf.view;

@@ -265,6 +265,21 @@ export class HealthDashboardView extends ItemView {
   }
 
   async onOpen(): Promise<void> {
+    // Re-score whenever this tab is brought back into view and what it is
+    // showing has gone stale.
+    //
+    // Obsidian restores open tabs, so on a cold start this view's first scan
+    // runs seconds after launch — before any plugin has polled, thrown, or done
+    // anything the runtime signals measure. Without this, a dashboard that was
+    // left open faithfully reports a vault with no timers and no errors for as
+    // long as it stays open, and the only other pass runs every six hours.
+    this.registerEvent(
+      this.app.workspace.on("active-leaf-change", (leaf) => {
+        if (leaf !== this.leaf) return;
+        if (!this.plugin.scanIsStale()) return;
+        void this.refresh(false, false);
+      })
+    );
     await this.refresh(this.plugin.settings.autoRefreshOnOpen);
   }
 
