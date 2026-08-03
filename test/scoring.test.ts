@@ -1508,6 +1508,117 @@ eq("prerelease vs prerelease", compareVersion("1.0.0-alpha", "1.0.0-beta"), -1);
   eq("an empty message searches for nothing", searchTerms("  "), "");
 }
 
+// --- attribution must look past our own frames ------------------------------
+// Found in a real vault: the watcher captures a stack from inside its own
+// setInterval wrapper, so FlowKit's frames sit on top of the caller's. The
+// innermost-wins rule then faithfully returned FlowKit every time, and no other
+// plugin in the vault was ever measured.
+{
+  const installed = new Set(["flowkit-health-dashboard", "dataview"]);
+  const self = new Set(["flowkit-health-dashboard"]);
+  const stack = [
+    "Error",
+    "    at RuntimeWatcher.attributeCaller (plugin:flowkit-health-dashboard:120:20)",
+    "    at Window.set (plugin:flowkit-health-dashboard:99:14)",
+    "    at DataviewPlugin.onload (plugin:dataview:4102:9)",
+  ].join("\n");
+
+  eq(
+    "without the exclusion, our own frame wins",
+    attributeStack(stack, installed),
+    "flowkit-health-dashboard"
+  );
+  eq(
+    "with it, the real caller is found",
+    attributeStack(stack, installed, self),
+    "dataview"
+  );
+  eq(
+    "a stack containing only our own frames attributes to nobody",
+    attributeStack(
+      "Error\n    at x (plugin:flowkit-health-dashboard:1:1)",
+      installed,
+      self
+    ),
+    null
+  );
+}
+
+// --- reliability: silence needs time, failure does not ----------------------
+{
+  const brandNew = { ...input({}), observedMs: 60_000 };
+
+  const quiet = computeHealth(brandNew, NOW);
+  eq(
+    "a quiet plugin is still unjudged early on",
+    quiet.metrics.reliability.value,
+    null
+  );
+
+  // Observed uncaught errors are evidence available immediately. Withholding
+  // the score for six hours put "13 errors" beside a blank Reliability and an
+  // overall of 72 — the product contradicting itself in three inches.
+  const broken = computeHealth(
+    {
+      ...brandNew,
+      errors: {
+        uncaught: 13,
+        logged: 10,
+        firstAt: NOW - 60_000,
+        lastAt: NOW,
+        signatures: [],
+      },
+    },
+    NOW
+  );
+  check(
+    "but observed errors are scored straight away",
+    broken.metrics.reliability.value != null,
+    "still null"
+  );
+  check(
+    "and scored badly",
+    (broken.metrics.reliability.value ?? 100) < 40,
+    `got ${broken.metrics.reliability.value}`
+  );
+  check(
+    "which drags the overall down with it",
+    (broken.overall ?? 100) < (quiet.overall ?? 0),
+    `broken ${broken.overall} vs quiet ${quiet.overall}`
+  );
+
+  // Errors a plugin catches and logs itself still never count against it.
+  const tidy = computeHealth(
+    {
+      ...brandNew,
+      errors: { uncaught: 0, logged: 40, firstAt: NOW - 60_000, lastAt: NOW, signatures: [] },
+    },
+    NOW
+  );
+  eq("logged-only errors don't force an early judgement", tidy.metrics.reliability.value, null);
+}
+
+// --- don't send people to a setting that can't help -------------------------
+{
+  const local = computeHealth(input({ listing: "local" }), NOW);
+  check(
+    "a local install isn't told to enable enrichment",
+    !local.metrics.popularity.detail.includes("enrichment"),
+    local.metrics.popularity.detail
+  );
+  check(
+    "it's told why the figures don't exist",
+    local.metrics.maintenance.detail.includes("outside the community directory"),
+    local.metrics.maintenance.detail
+  );
+  const listed = computeHealth(input({ listing: "listed" }), NOW);
+  check(
+    "a listed plugin with no data still gets the actionable message",
+    listed.metrics.popularity.detail.includes("enrichment"),
+    listed.metrics.popularity.detail
+  );
+}
+
 // --- report -----------------------------------------------------------------
 if (failures.length) {
   console.error(`\n✗ ${failures.length} failed, ${passed} passed:`);

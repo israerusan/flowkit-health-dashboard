@@ -1,6 +1,14 @@
 import type { App, PluginManifest } from "obsidian";
 import { attributeStack } from "./errors";
+import { PRODUCT_ID } from "./product";
 import { recordLoad, type RuntimeProfile, type RuntimeProfiles } from "./runtime";
+
+/**
+ * FlowKit's own frames, which sit on top of the caller's in any stack captured
+ * inside our wrappers. Skipping them is what makes timer attribution point at
+ * the plugin that created the timer rather than at the code watching for it.
+ */
+const IGNORE_SELF: ReadonlySet<string> = new Set([PRODUCT_ID]);
 
 // Measuring what other plugins cost while they run.
 //
@@ -174,7 +182,9 @@ export class RuntimeWatcher {
     if (this.inHook) return null;
     this.inHook = true;
     try {
-      return attributeStack(new Error().stack, this.host.installedIds());
+      // Captured inside our own wrapper, so our frames are innermost — skip
+      // them, or every timer in the vault is recorded against FlowKit.
+      return attributeStack(new Error().stack, this.host.installedIds(), IGNORE_SELF);
     } catch {
       return null;
     } finally {

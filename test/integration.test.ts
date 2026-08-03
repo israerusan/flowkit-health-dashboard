@@ -163,6 +163,9 @@ async function timerTests(): Promise<void> {
   const app = new FakeApp();
   app.install("alpha");
   app.install("beta");
+  // FlowKit is itself an installed plugin, which is precisely why its own
+  // frames were being matched and returned as the culprit.
+  app.install("flowkit-health-dashboard");
 
   const store: RuntimeProfiles = {};
   const watcher = new RuntimeWatcher(app as never, {
@@ -177,7 +180,16 @@ async function timerTests(): Promise<void> {
   check("start() replaces setInterval", window.setInterval !== beforeSet);
 
   // A timer created from inside plugin code is attributed to that plugin.
-  const alphaTimer = asPlugin("alpha", () => window.setInterval(() => undefined, 250));
+  //
+  // Nested through a frame marked as FlowKit's own, because that is the real
+  // shape: the watcher captures the stack from inside its own `setInterval`
+  // wrapper, so FlowKit's frames sit ON TOP of the calling plugin's. The first
+  // version of this harness called `setInterval` from unmarked test code, which
+  // is why it passed while the shipped build attributed every timer in the
+  // vault to FlowKit itself and measured no other plugin at all.
+  const alphaTimer = asPlugin("alpha", () =>
+    asPlugin("flowkit-health-dashboard", () => window.setInterval(() => undefined, 250))
+  );
   // …and one created from test code (no plugin frame) is not blamed on anyone.
   const orphan = window.setInterval(() => undefined, 100);
 
@@ -188,10 +200,19 @@ async function timerTests(): Promise<void> {
     "an unattributable timer is dropped, not blamed on a nearby plugin",
     snapshot.beta?.minIntervalMs == null && snapshot.alpha?.timers === 1
   );
+  check(
+    "FlowKit's own frames are skipped, not recorded as the timer's owner",
+    snapshot["flowkit-health-dashboard"]?.minIntervalMs == null,
+    `got ${snapshot["flowkit-health-dashboard"]?.minIntervalMs}`
+  );
 
   // The fastest period wins, since that is the one that costs.
-  asPlugin("alpha", () => window.setInterval(() => undefined, 1000));
-  const fast = asPlugin("alpha", () => window.setInterval(() => undefined, 50));
+  asPlugin("alpha", () =>
+    asPlugin("flowkit-health-dashboard", () => window.setInterval(() => undefined, 1000))
+  );
+  const fast = asPlugin("alpha", () =>
+    asPlugin("flowkit-health-dashboard", () => window.setInterval(() => undefined, 50))
+  );
   snapshot = watcher.snapshot();
   eq("the fastest period is the one reported", snapshot.alpha?.minIntervalMs, 50);
   eq("and all of them are counted", snapshot.alpha?.timers, 3);

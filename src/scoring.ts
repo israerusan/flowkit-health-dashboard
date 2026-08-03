@@ -157,6 +157,24 @@ const UNAVAILABLE = (detail: string): MetricScore => ({
 });
 
 /**
+ * Why a community-derived metric is missing.
+ *
+ * "Enable enrichment" is only useful advice when enabling it would actually
+ * help. A plugin installed outside the directory has no download counts and no
+ * release history to fetch, so telling its owner to switch something on sends
+ * them to a setting that cannot change the answer.
+ */
+function missingStatsReason(i: ScoreInput): string {
+  if (i.listing === "local") {
+    return "Installed outside the community directory, so there are no download or release figures to read.";
+  }
+  if (i.listing === "delisted") {
+    return "No longer in the community directory, so its figures are no longer published.";
+  }
+  return "Needs online community stats (enable enrichment).";
+}
+
+/**
  * Compatibility — MEASURED and fully local. Compares the plugin's declared
  * `minAppVersion` against the running Obsidian API version, and flags
  * desktop-only plugins running on mobile.
@@ -205,7 +223,7 @@ function scoreCompatibility(i: ScoreInput): MetricScore {
 function scorePopularity(i: ScoreInput): MetricScore {
   const downloads = i.remote?.downloads;
   if (downloads == null || i.downloadPercentile == null) {
-    return UNAVAILABLE("Needs online community stats (enable enrichment).");
+    return UNAVAILABLE(missingStatsReason(i));
   }
   const pct = Math.round(clamp(i.downloadPercentile * 100));
   return {
@@ -321,7 +339,7 @@ function scoreMaintenance(i: ScoreInput, now: number): MetricScore {
         detail: "Its repository no longer exists on GitHub.",
       };
     }
-    return UNAVAILABLE("Needs online community stats (enable enrichment).");
+    return UNAVAILABLE(missingStatsReason(i));
   }
 
   const ageDays = Math.max(0, (now - updated) / DAY_MS);
@@ -422,12 +440,19 @@ export function deriveMaintenanceStatus(
  */
 function scoreReliability(i: ScoreInput): MetricScore {
   const observed = i.observedMs ?? 0;
-  if (observed < MIN_OBSERVATION_MS) {
+  const record = i.errors;
+
+  // The observation window exists so that SILENCE means something: a plugin
+  // that hasn't thrown in ninety seconds is not thereby reliable. It was
+  // applied to failures too, which is the opposite mistake — errors already
+  // observed are positive evidence, available immediately and not improved by
+  // waiting. A row reading "13 errors" beside a blank Reliability and an
+  // overall of 72 is the product contradicting itself in three inches.
+  if (observed < MIN_OBSERVATION_MS && (record?.uncaught ?? 0) === 0) {
     return UNAVAILABLE(
       "FlowKit hasn't been watching long enough to judge this yet."
     );
   }
-  const record = i.errors;
   const rate = errorRatePerDay(record, observed);
   const value = reliabilityScore(rate);
 
