@@ -576,6 +576,33 @@ export class FlowKitHealthSettingTab extends PluginSettingTab {
             this.display();
           })
       );
+
+    this.renderFeedback(containerEl);
+  }
+
+  /** Where bugs and ideas go. Deliberately the last thing on the tab. */
+  private renderFeedback(containerEl: HTMLElement): void {
+    new Setting(containerEl).setName("Feedback").setHeading();
+
+    new Setting(containerEl)
+      .setName("Bugs and feature requests")
+      .setDesc("Issues and ideas are tracked on GitHub. Opens in your browser.")
+      .addButton((btn) =>
+        btn.setButtonText("Report a bug").onClick(() => {
+          window.open(
+            "https://github.com/israerusan/flowkit-health-dashboard/issues/new?labels=bug",
+            "_blank"
+          );
+        })
+      )
+      .addButton((btn) =>
+        btn.setButtonText("Request a feature").onClick(() => {
+          window.open(
+            "https://github.com/israerusan/flowkit-health-dashboard/issues/new?labels=enhancement",
+            "_blank"
+          );
+        })
+      );
   }
 
   private renderProSection(containerEl: HTMLElement): void {
