@@ -3,6 +3,15 @@
 All notable changes to FlowKit Plugin Health Dashboard are documented here. This
 project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+- Added before/after health experiments with per-plugin deltas.
+- Added conservative compatibility forecasts for the next Obsidian minor
+  release.
+- Added persisted last-known-good restore and safe-mode sessions.
+- Added numeric regression detection and richer since-last-look timelines that
+  include install, update, and removal events.
+
 ## [1.7.1] - 2026-08-03
 
 A third adversarial review — two outside models and a twelve-agent pass with a

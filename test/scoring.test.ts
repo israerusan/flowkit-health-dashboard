@@ -7,6 +7,7 @@ import {
   compareVersion,
   computeHealth,
   deriveMaintenanceStatus,
+  forecastCompatibility,
   mergeRemoteCache,
   pickLatestVersion,
   rankerFromDistribution,
@@ -64,9 +65,16 @@ import {
   deleteProfile,
   isNoop,
   profileDelta,
+  safeModeTarget,
   saveProfile,
   type PluginProfile,
+  type SafeModeSession,
 } from "../src/profiles";
+import {
+  captureHealthReading,
+  compareHealth,
+  detectRegressions,
+} from "../src/experiments";
 import { buildRedactor, redactUserContent, searchTerms } from "../src/issueSearch";
 import {
   DEVICE_RETENTION_MS,
@@ -891,6 +899,7 @@ eq("prerelease vs prerelease", compareVersion("1.0.0-alpha", "1.0.0-beta"), -1);
   const ALL = new Set<HealthChangeKind>([
     "error-started",
     "became-incompatible",
+    "became-unmaintained",
     "delisted",
     "update-published",
   ]);
@@ -929,6 +938,11 @@ eq("prerelease vs prerelease", compareVersion("1.0.0-alpha", "1.0.0-beta"), -1);
     const before = { a: ["error-started"] as HealthChangeKind[] };
     const after = diffTrouble(before, [row("a", [])], ALL, 2);
     eq("a fixed plugin is reported resolved", after.fresh[0]?.kind, "resolved");
+  }
+
+  {
+    const stale = diffTrouble({}, [row("a", ["became-unmaintained"])], ALL, 2);
+    eq("newly stale plugin is reported", stale.fresh[0]?.kind, "became-unmaintained");
   }
 
   // A signal we couldn't read this scan must not read as recovery.
@@ -1069,6 +1083,42 @@ eq("prerelease vs prerelease", compareVersion("1.0.0-alpha", "1.0.0-beta"), -1);
     currentLoadMs({ loadMs: 900 }, "2.0.0"),
     900
   );
+}
+
+// --- forecasts, experiments and regressions --------------------------------
+{
+  const safe = forecastCompatibility("1.4.0", "1.5.0");
+  eq("compatible plugin forecasts safe", safe.status, "safe");
+  eq("forecast targets the next minor", safe.targetVersion, "1.6.0");
+  eq("future minimum inside forecast is watched", forecastCompatibility("1.6.0", "1.5.0").status, "watch");
+  eq("future minimum beyond forecast is at risk", forecastCompatibility("2.0.0", "1.5.0").status, "at-risk");
+  eq("missing minimum is unknown", forecastCompatibility(undefined, "1.5.0").status, "unknown");
+
+  const before = captureHealthReading([ph({ id: "a", name: "A", overall: 80, version: "1.0.0" })], NOW);
+  const after = captureHealthReading([ph({ id: "a", name: "A", overall: 60, version: "1.1.0" })], NOW + DAY);
+  const comparison = compareHealth(before, after);
+  eq("experiment reports average delta", comparison.avgDelta, -20);
+  eq("experiment identifies worsened plugin", comparison.worsened[0].id, "a");
+  eq("experiment marks version change", comparison.changed[0].versionChanged, true);
+
+  const prior = { a: { ...before, plugins: { a: before.plugins.a } } };
+  const regressions = detectRegressions(
+    prior,
+    [ph({ id: "a", name: "A", overall: 60, version: "1.1.0" })],
+    [{ at: NOW + DAY, since: NOW, id: "a", name: "A", kind: "updated", from: "1.0.0", to: "1.1.0" }],
+    NOW + DAY
+  );
+  eq("regression detector finds a ten-point drop", regressions.length, 1);
+  eq("regression is attributed to update", regressions[0].reason, "update");
+
+  const session: SafeModeSession = {
+    originalEnabled: ["a", "b", "c"],
+    keepEnabled: ["a"],
+    startedAt: NOW,
+  };
+  const target = safeModeTarget(session, new Set(["a", "b", "c"]));
+  eq("safe mode keeps selected plugins on", target.enable.join(), "a");
+  eq("safe mode disables the rest", target.disable.slice().sort().join(), "b,c");
 }
 
 // --- two devices, one data.json ---------------------------------------------

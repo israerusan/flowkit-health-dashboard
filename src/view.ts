@@ -47,7 +47,8 @@ import {
   searchableCandidates,
 } from "./bisect";
 import { describeEvent, describeGap } from "./timeline";
-import { AUTO_SNAPSHOT, isNoop, type PluginProfile } from "./profiles";
+import { AUTO_SNAPSHOT, LAST_KNOWN_GOOD, isNoop, type PluginProfile } from "./profiles";
+import { compareHealth } from "./experiments";
 import { buildRedactor, findKnownIssues } from "./issueSearch";
 import { BulkConfirmModal } from "./ui/BulkConfirmModal";
 import { BisectStartModal } from "./ui/BisectModal";
@@ -457,6 +458,8 @@ export class HealthDashboardView extends ItemView {
       const lapsed = this.plugin.takeLapsedMutes();
       if (lapsed.length) this.lapsedMutes = lapsed;
       const s = this.summaryStats();
+      await this.plugin.recordHealthReading(this.results);
+      await this.plugin.updateLastKnownGood(this.results);
       await this.plugin.recordSnapshot({
         at: Date.now(),
         avg: s.avg,
@@ -875,6 +878,7 @@ export class HealthDashboardView extends ItemView {
     this.renderAppUpdate(root);
     this.renderChanges(root);
     this.renderCorrelations(root);
+    this.renderHealthSessions(root);
     this.renderLapsedMutes(root);
     this.renderIntro(root);
     this.renderHero(root);
@@ -1183,6 +1187,19 @@ export class HealthDashboardView extends ItemView {
         .onClick(() => this.saveProfile())
     );
 
+    menu.addItem((item) =>
+      item
+        .setTitle(this.plugin.isPro ? "Start safe mode…" : "Start safe mode… (Pro)")
+        .setIcon("shield-check")
+        .onClick(() => this.startSafeMode())
+    );
+    menu.addItem((item) =>
+      item
+        .setTitle("Start before/after health experiment")
+        .setIcon("flask-conical")
+        .onClick(() => this.startExperiment())
+    );
+
     const profiles = this.plugin.settings.profiles;
     for (const profile of profiles) {
       menu.addItem((item) =>
@@ -1274,9 +1291,9 @@ export class HealthDashboardView extends ItemView {
    */
   private renderChanges(root: HTMLElement): void {
     const unseen = this.plugin.unseenChanges();
-    if (!unseen.length) return;
-
     const since = this.plugin.settings.lastSeenChangeAt;
+    const events = this.plugin.eventsSince(since ?? 0);
+    if (!unseen.length && !events.length) return;
     const box = root.createDiv({ cls: "flowkit-changes" });
     const head = box.createDiv({ cls: "flowkit-changes-head" });
     setIcon(head.createSpan({ cls: "flowkit-changes-icon" }), "history");
@@ -1300,6 +1317,7 @@ export class HealthDashboardView extends ItemView {
       return weight(a.kind) - weight(b.kind) || b.at - a.at;
     });
     const list = box.createDiv({ cls: "flowkit-changes-list" });
+    const total = ranked.length + events.length;
     for (const change of ranked.slice(0, 3)) {
       const line = list.createDiv({
         cls: `flowkit-change is-${change.kind === "resolved" ? "good" : "bad"}`,
@@ -1307,10 +1325,15 @@ export class HealthDashboardView extends ItemView {
       line.createSpan({ cls: "flowkit-change-name", text: change.name });
       line.createSpan({ cls: "flowkit-change-what", text: ` ${describeChange(change.kind)}` });
     }
-    if (ranked.length > 3) {
+    for (const event of events.slice(0, Math.max(0, 3 - ranked.length))) {
+      const line = list.createDiv({ cls: "flowkit-change is-info" });
+      line.createSpan({ cls: "flowkit-change-name", text: event.name });
+      line.createSpan({ cls: "flowkit-change-what", text: ` ${describeEvent(event)}` });
+    }
+    if (total > 3) {
       list.createDiv({
         cls: "flowkit-changes-more",
-        text: `+${ranked.length - 3} more`,
+        text: `+${total - 3} more`,
       });
     }
   }
@@ -1735,6 +1758,104 @@ export class HealthDashboardView extends ItemView {
     );
     const show = box.createEl("button", { cls: "mod-cta", text: "Show these" });
     show.onclick = () => this.applyScope("incompatible");
+  }
+
+  /** Persistent recovery and before/after tools that make remediation repeatable. */
+  private renderHealthSessions(root: HTMLElement): void {
+    const safe = this.plugin.settings.safeMode;
+    const knownGood = this.plugin.settings.profiles.find((p) => p.name === LAST_KNOWN_GOOD);
+    const experiment = this.plugin.settings.healthExperiment;
+    const regressions = this.plugin.settings.regressions.slice(-3).reverse();
+    if (!safe && !knownGood && !experiment && !regressions.length) return;
+
+    const box = root.createDiv({ cls: "flowkit-health-sessions" });
+    const head = box.createDiv({ cls: "flowkit-section-head" });
+    setIcon(head.createSpan({ cls: "flowkit-section-icon" }), "shield-check");
+    head.createSpan({ cls: "flowkit-section-title", text: "Recovery and experiments" });
+
+    if (safe) {
+      const row = box.createDiv({ cls: "flowkit-session-row tone-warn" });
+      row.createEl("strong", { text: "Safe mode is active" });
+      row.createSpan({
+        text: safe.restoreFailed?.length
+          ? ` — restore needs attention for ${safe.restoreFailed.join(", ")}.`
+          : ` — ${safe.keepEnabled.length} plugin${safe.keepEnabled.length === 1 ? "" : "s"} kept on.`,
+      });
+      const restore = row.createEl("button", { cls: "mod-cta", text: "Restore original set" });
+      restore.onclick = () => {
+        this.act(
+          this.plugin.restoreSafeMode().then((result) => {
+            if (!result) return;
+            new Notice(
+              result.failed.length
+                ? `Safe mode restore incomplete: ${describeFailed(result.failed)}`
+                : "Safe mode ended; your original plugin set is back.",
+              result.failed.length ? 10000 : undefined
+            );
+            void this.refresh(false, false);
+          }),
+          "Couldn't restore safe mode"
+        );
+      };
+    }
+
+    if (knownGood && !safe) {
+      const delta = this.plugin.deltaFor(knownGood);
+      if (!isNoop(delta)) {
+        const row = box.createDiv({ cls: "flowkit-session-row" });
+        row.createEl("strong", { text: "Last known good" });
+        row.createSpan({
+          text: ` — ${knownGood.ids.length} plugins captured ${describeWhen(knownGood.at)}.`,
+        });
+        const restore = row.createEl("button", { text: "Restore it" });
+        restore.onclick = () => this.applyProfile(knownGood);
+      }
+    }
+
+    if (experiment) {
+      const row = box.createDiv({ cls: "flowkit-session-row" });
+      row.createEl("strong", { text: experiment.name });
+      if (experiment.after) {
+        const comparison = compareHealth(experiment.baseline, experiment.after);
+        const delta = comparison.avgDelta;
+        row.createSpan({
+          text: ` — complete${delta == null ? "" : `; average ${delta >= 0 ? "+" : ""}${delta}`}.`,
+        });
+        const restart = row.createEl("button", { text: "Start another" });
+        restart.onclick = () => {
+          this.act(
+            this.plugin.clearHealthExperiment().then(() => this.startExperiment()),
+            "Couldn't reset the health experiment"
+          );
+        };
+      } else {
+        row.createSpan({ text: " — baseline saved; change your setup, then compare." });
+        const finish = row.createEl("button", { text: "Compare after changes" });
+        finish.onclick = () => {
+          this.act(
+            this.refresh(false, false).then(() => this.plugin.finishHealthExperiment(this.results).then(() => this.render())),
+            "Couldn't complete the health experiment"
+          );
+        };
+        const cancel = row.createEl("button", { text: "Cancel" });
+        cancel.onclick = () => {
+          this.act(
+            this.plugin.clearHealthExperiment().then(() => this.render()),
+            "Couldn't cancel the health experiment"
+          );
+        };
+      }
+    }
+
+    if (regressions.length) {
+      const row = box.createDiv({ cls: "flowkit-session-row tone-bad" });
+      row.createEl("strong", { text: "Recent regressions" });
+      row.createSpan({
+        text: ` — ${regressions
+          .map((r) => `${r.name} ${r.fromOverall}→${r.toOverall}`)
+          .join(", ")}.`,
+      });
+    }
   }
 
   /**
@@ -2920,6 +3041,13 @@ export class HealthDashboardView extends ItemView {
           : ""
       } · by ${r.author}`,
     });
+    if (r.compatibilityForecast) {
+      const forecast = r.compatibilityForecast;
+      facts.createDiv({
+        cls: `flowkit-detail-forecast tone-${forecast.status === "safe" ? "good" : forecast.status === "unknown" ? "unknown" : "warn"}`,
+        text: `Next-release forecast (${forecast.targetVersion}): ${forecast.detail}`,
+      });
+    }
 
     // What it costs and what it does, side by side — the two halves of the
     // question "should I turn this off".
@@ -3390,6 +3518,76 @@ export class HealthDashboardView extends ItemView {
   async commandSaveSet(): Promise<void> {
     if (!this.results.length) await this.refresh(false, false);
     this.saveProfile();
+  }
+
+  async commandSafeMode(): Promise<void> {
+    if (!this.results.length) await this.refresh(false, false);
+    this.startSafeMode();
+  }
+
+  async commandExperiment(): Promise<void> {
+    if (!this.results.length) await this.refresh(false, false);
+    this.startExperiment();
+  }
+
+  private startExperiment(): void {
+    if (this.plugin.settings.healthExperiment) {
+      new Notice("A health experiment is already active — compare it after changing your setup.");
+      return;
+    }
+    if (!this.plugin.canPersist) {
+      new Notice("FlowKit can't save an experiment while its settings file is unreadable.", 8000);
+      return;
+    }
+    this.act(
+      this.plugin.startHealthExperiment("Before/after health check", this.results).then((started) => {
+        if (started) new Notice("Baseline saved. Change your plugin setup, then compare the result.");
+        this.render();
+      }),
+      "Couldn't start the health experiment"
+    );
+  }
+
+  private startSafeMode(): void {
+    if (!this.plugin.isPro) {
+      this.openUpgrade("profiles");
+      return;
+    }
+    if (this.plugin.settings.safeMode) {
+      new Notice("Safe mode is already active — restore the original set first.");
+      return;
+    }
+    const keep = this.results
+      .filter((r) => r.enabled && r.watched)
+      .map((r) => r.id);
+    const count = this.results.filter((r) => r.enabled).length;
+    const watchedCount = keep.length;
+    new BulkConfirmModal(this.app, {
+      title: "Start safe mode?",
+      intro: `FlowKit will keep FlowKit${watchedCount > 1 ? ` and ${watchedCount - 1} watched plugin${watchedCount === 2 ? "" : "s"}` : ""} on, and switch off the other ${Math.max(0, count - watchedCount)} enabled plugins. Your original set is saved and can be restored.`,
+      rows: [
+        {
+          name: "Nothing is uninstalled",
+          detail: "Safe mode only changes enabled state. Restore the original set when you are done testing.",
+        },
+      ],
+      confirmLabel: "Start safe mode",
+      onConfirm: () => {
+        this.act(
+          this.plugin.startSafeMode(keep).then((result) => {
+            if (!result) return;
+            new Notice(
+              result.failed.length
+                ? `Safe mode started with failures: ${describeFailed(result.failed)}`
+                : "Safe mode started. Reproduce the problem, then restore your original set.",
+              result.failed.length ? 10000 : undefined
+            );
+            void this.refresh(false, false);
+          }),
+          "Couldn't start safe mode"
+        );
+      },
+    }).open();
   }
 
   private startBisect(): void {
@@ -3952,6 +4150,8 @@ function describeChange(kind: HealthChange["kind"]): string {
       return "was removed from the community directory";
     case "became-incompatible":
       return "stopped being compatible with your Obsidian";
+    case "became-unmaintained":
+      return "went stale";
     case "update-published":
       return "published an update";
     default:

@@ -304,7 +304,15 @@ once, and being told when something breaks while you weren't looking.
 - **Copy bug report** — a plugin's errors, versions and platform, paste-ready
   for an issue
 - A **30-day health trend**, recorded whether or not you open the dashboard
-- A **status-bar readout** that names what's wrong, not just that something is
+- A **status-bar readout** that names what's wrong, not just that something is wrong
+- **Before/after health experiments** — save a baseline, change a plugin set,
+  and compare aggregate and per-plugin deltas
+- **Conservative next-release compatibility forecasts** for plugins with a
+  declared minimum Obsidian version
+- **Last-known-good restore and safe mode** — save a healthy set, keep only
+  watched plugins running for diagnosis, and recover after a restart
+- **Regression detection** — large score drops are attributed to an update when
+  the timeline supports that conclusion
 - **Unlimited Markdown reports** and copy-to-clipboard summaries
 - **Mute with a reason and an expiry**, and **watch** the plugins you depend on
 - **Search, filter, sort**, and the per-row menu (enable/disable, open settings,
@@ -384,6 +392,10 @@ Key didn't arrive, or want a refund? Email <iavila01@gmail.com>.
 - **Diagnose** in the header is the entry point when something is actually
   wrong: find what's breaking your vault, profile startup, and save or switch
   plugin sets.
+- Use **Start before/after health experiment** to capture a baseline before
+  changing settings, then compare it from the recovery panel. **Start safe
+  mode** saves the original set first and offers a restore action even after a
+  restart.
 - Start with **What to fix**. Selecting a finding filters the table to exactly
   the plugins it names.
 - **Select any row** to open its reasoning panel: each metric's value, weight

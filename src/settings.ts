@@ -3,7 +3,7 @@ import type FlowKitHealthPlugin from "./main";
 import type { BisectState } from "./bisect";
 import type { MuteMap } from "./mutes";
 import { describeMute } from "./mutes";
-import { AUTO_SNAPSHOT, type PluginProfile } from "./profiles";
+import { AUTO_SNAPSHOT, type PluginProfile, type SafeModeSession } from "./profiles";
 import type { PluginEvent } from "./timeline";
 import { deviceCount, type DeviceSeen } from "./devices";
 import type { RepoActivityMap } from "./repoActivity";
@@ -16,6 +16,7 @@ import type {
   PluginErrorRecord,
   RemoteCache,
 } from "./types";
+import type { HealthExperiment, HealthReadingMap, PluginRegression } from "./experiments";
 import {
   PRODUCT_NAME,
   PRO_FEATURES,
@@ -161,6 +162,14 @@ export interface FlowKitHealthSettings {
   eventBaselineSet: boolean;
   /** Saved sets of enabled plugins. */
   profiles: PluginProfile[];
+  /** Most recent successful health baseline, used by before/after experiments. */
+  healthReadings: HealthReadingMap;
+  /** A user-started before/after health experiment. */
+  healthExperiment: HealthExperiment | null;
+  /** Numeric regressions detected between consecutive local readings. */
+  regressions: PluginRegression[];
+  /** A persisted safe-mode session that can be restored after a restart. */
+  safeMode: SafeModeSession | null;
 }
 
 export const DEFAULT_SETTINGS: FlowKitHealthSettings = {
@@ -198,6 +207,10 @@ export const DEFAULT_SETTINGS: FlowKitHealthSettings = {
   events: [],
   eventBaselineSet: false,
   profiles: [],
+  healthReadings: {},
+  healthExperiment: null,
+  regressions: [],
+  safeMode: null,
 };
 
 /** How long typing a licence key runs ahead of the write to disk. */
@@ -471,6 +484,45 @@ export class FlowKitHealthSettingTab extends PluginSettingTab {
           text: `${profile.name} — ${profile.ids.length} plugin(s)`,
         });
       }
+    }
+
+    if (this.plugin.settings.safeMode) {
+      new Setting(containerEl)
+        .setName("Safe mode is active")
+        .setDesc(
+          "FlowKit saved the original enabled set before switching plugins off. Restore it here if the dashboard is not open."
+        )
+        .addButton((btn) =>
+          btn.setButtonText("Restore original set").onClick(async () => {
+            const result = await this.plugin.restoreSafeMode();
+            if (!result) return;
+            new Notice(
+              result.failed.length
+                ? `Safe mode restore incomplete: ${result.failed.map((f) => f.id).join(", ")}`
+                : "Safe mode ended; your original plugin set is back.",
+              result.failed.length ? 10000 : undefined
+            );
+            this.plugin.refreshViews(true, false);
+            this.display();
+          })
+        );
+    }
+
+    if (this.plugin.settings.healthExperiment) {
+      new Setting(containerEl)
+        .setName("Health experiment")
+        .setDesc(
+          this.plugin.settings.healthExperiment.after
+            ? "A before/after comparison is saved in the dashboard."
+            : "A baseline is saved. Change your plugin setup, then finish the comparison in the dashboard."
+        )
+        .addButton((btn) =>
+          btn.setButtonText("Clear").onClick(async () => {
+            await this.plugin.clearHealthExperiment();
+            this.plugin.refreshViews();
+            this.display();
+          })
+        );
     }
 
     const events = this.plugin.settings.events.length;

@@ -17,6 +17,7 @@ export interface PluginProfile {
 
 /** The name FlowKit uses for the automatic pre-bisect capture. */
 export const AUTO_SNAPSHOT = "Before last bisect";
+export const LAST_KNOWN_GOOD = "Last known good";
 
 /** Save (or overwrite) a profile, newest first. */
 export function saveProfile(
@@ -46,6 +47,25 @@ export interface ProfileDelta {
    * "known-good" set stops being known-good.
    */
   missing: string[];
+}
+
+/** Persisted guardrail for a user-requested safe-mode session. */
+export interface SafeModeSession {
+  originalEnabled: string[];
+  keepEnabled: string[];
+  startedAt: number;
+  restoreFailed?: string[];
+}
+
+export function safeModeTarget(
+  session: SafeModeSession,
+  installed: ReadonlySet<string>
+): { enable: string[]; disable: string[] } {
+  const keep = new Set(session.keepEnabled);
+  return {
+    enable: session.keepEnabled.filter((id) => installed.has(id)),
+    disable: session.originalEnabled.filter((id) => installed.has(id) && !keep.has(id)),
+  };
 }
 
 /**

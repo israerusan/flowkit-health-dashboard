@@ -76,6 +76,29 @@
   background: var(--interactive-accent-hover);
 }
 
+/* Recovery, experiments and forecasts ----------------------------------- */
+.flowkit-health-sessions {
+  margin: 10px 0 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  background: var(--background-secondary);
+}
+.flowkit-session-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 6px 0;
+}
+.flowkit-session-row button {
+  margin-left: auto;
+}
+.flowkit-detail-forecast {
+  margin-top: 4px;
+  color: var(--text-muted);
+}
+
 /* Hero: gauge + verdict --------------------------------------------------
    The one element on the page that is allowed to be large. Everything else
    here is deliberately quiet, so the verdict has to carry the weight or the

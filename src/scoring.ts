@@ -10,6 +10,7 @@ import type { MuteRecord } from "./mutes";
 import type { RepoActivity } from "./repoActivity";
 import type {
   CachedPlugin,
+  CompatibilityForecast,
   MaintenanceStatus,
   MetricScore,
   PluginErrorRecord,
@@ -79,6 +80,44 @@ export const WEIGHTS = {
 } as const;
 
 export type MetricKey = keyof typeof WEIGHTS;
+
+/**
+ * Forecast the conservative compatibility boundary for the next Obsidian
+ * minor release. Obsidian does not publish a machine-readable future API
+ * contract, so this deliberately predicts one minor step rather than claiming
+ * certainty about an unreleased version.
+ */
+export function forecastCompatibility(
+  minimumVersion: string | undefined,
+  currentVersion: string = apiVersion
+): CompatibilityForecast {
+  if (!minimumVersion) {
+    return {
+      targetVersion: currentVersion,
+      status: "unknown",
+      detail: "No minimum app version declared — future compatibility is unverifiable.",
+    };
+  }
+  const parsed = parseVersion(currentVersion).parts;
+  const target = `${parsed[0] ?? 0}.${(parsed[1] ?? 0) + 1}.0`;
+  if (compareVersion(minimumVersion, currentVersion) > 0) {
+    return {
+      targetVersion: target,
+      minimumVersion,
+      status: compareVersion(minimumVersion, target) > 0 ? "at-risk" : "watch",
+      detail:
+        compareVersion(minimumVersion, target) > 0
+          ? `Requires Obsidian ${minimumVersion}, beyond the conservative ${target} forecast.`
+          : `Requires Obsidian ${minimumVersion}; review compatibility before ${target}.`,
+    };
+  }
+  return {
+    targetVersion: target,
+    minimumVersion,
+    status: "safe",
+    detail: `Declared minimum ${minimumVersion}; no risk in the conservative ${target} forecast.`,
+  };
+}
 
 /** Where a plugin stands relative to Obsidian's community directory. */
 export type ListingStatus = "listed" | "delisted" | "local" | "unknown";
@@ -858,6 +897,7 @@ export function computeHealth(i: ScoreInput, now: number): PluginHealth {
       i.repoActivity
     ),
     updateAvailable,
+    compatibilityForecast: forecastCompatibility(i.manifest.minAppVersion),
     latestVersion,
     listing,
     muted: i.muted ?? false,

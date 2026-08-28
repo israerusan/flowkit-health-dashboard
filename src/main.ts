@@ -53,12 +53,24 @@ import {
 } from "./devices";
 import {
   AUTO_SNAPSHOT,
+  LAST_KNOWN_GOOD,
   deleteProfile,
   profileDelta,
+  safeModeTarget,
   saveProfile,
   type PluginProfile,
   type ProfileDelta,
+  type SafeModeSession,
 } from "./profiles";
+import {
+  captureHealthReading,
+  compareHealth,
+  detectRegressions,
+  isLastKnownGood,
+  type ExperimentComparison,
+  type HealthExperiment,
+  type PluginRegression,
+} from "./experiments";
 import { LicenseManager } from "./license/LicenseManager";
 import { SaveQueue, cloneState, isUsableCache, mapWithConcurrency } from "./persistence";
 import {
@@ -349,6 +361,18 @@ export default class FlowKitHealthPlugin extends Plugin {
       callback: () => void this.runInDashboard((view) => view.commandSaveSet()),
     });
 
+    this.addCommand({
+      id: "start-safe-mode",
+      name: "Start FlowKit safe mode",
+      callback: () => void this.runInDashboard((view) => view.commandSafeMode()),
+    });
+
+    this.addCommand({
+      id: "start-health-experiment",
+      name: "Start before/after health experiment",
+      callback: () => void this.runInDashboard((view) => view.commandExperiment()),
+    });
+
     this.addSettingTab(new FlowKitHealthSettingTab(this.app, this));
 
     if (this.settings.trackErrors) {
@@ -540,6 +564,16 @@ export default class FlowKitHealthPlugin extends Plugin {
         ? active.reduce((a, r) => a + r.confidence, 0) / active.length
         : 0;
 
+      const numericRegressions = await this.recordHealthReading(results);
+      if (this.isPro && numericRegressions.length) {
+        const names = numericRegressions.slice(0, 3).map((r) => r.name).join(", ");
+        new Notice(
+          `FlowKit: health regressed for ${names}${
+            numericRegressions.length > 3 ? ` +${numericRegressions.length - 3} more` : ""
+          }.`,
+          8000
+        );
+      }
       await this.recordSnapshot({
         at: Date.now(),
         avg,
@@ -669,6 +703,7 @@ export default class FlowKitHealthPlugin extends Plugin {
     if ((r.errors?.uncaught ?? 0) > 0) kinds.push("error-started");
     if (r.listing === "delisted") kinds.push("delisted");
     if (r.metrics.compatibility.value === 0) kinds.push("became-incompatible");
+    if (r.maintenanceStatus === "unmaintained") kinds.push("became-unmaintained");
     if (r.updateAvailable) kinds.push("update-published");
     return kinds;
   }
@@ -682,7 +717,10 @@ export default class FlowKitHealthPlugin extends Plugin {
   private evaluableKinds(coverage: DataCoverage): Set<HealthChangeKind> {
     const set = new Set<HealthChangeKind>(["error-started", "became-incompatible"]);
     if (coverage.list) set.add("delisted");
-    if (coverage.stats) set.add("update-published");
+    if (coverage.stats) {
+      set.add("update-published");
+      set.add("became-unmaintained");
+    }
     return set;
   }
 
@@ -748,6 +786,7 @@ export default class FlowKitHealthPlugin extends Plugin {
   recordingSuspended(): boolean {
     return (
       this.bisectInProgress() || this.vaultUnrestored() || this.vaultMutationDepth > 0
+      || this.settings.safeMode != null
     );
   }
 
@@ -810,6 +849,13 @@ export default class FlowKitHealthPlugin extends Plugin {
   unseenChanges(): HealthChange[] {
     const since = this.settings.lastSeenChangeAt ?? 0;
     return this.settings.changeLog.filter((c) => c.at > since);
+  }
+
+  /** Install/update/removal events that happened since the same acknowledgement point. */
+  eventsSince(at = this.settings.lastSeenChangeAt ?? 0): PluginEvent[] {
+    return this.settings.events
+      .filter((event) => event.at > at)
+      .sort((a, b) => b.at - a.at);
   }
 
   /** Mark the "since you last looked" strip as read. */
@@ -880,6 +926,26 @@ export default class FlowKitHealthPlugin extends Plugin {
     if (!Array.isArray(this.settings.watched)) this.settings.watched = [];
     if (!Array.isArray(this.settings.events)) this.settings.events = [];
     if (!Array.isArray(this.settings.profiles)) this.settings.profiles = [];
+    if (!this.settings.healthReadings || typeof this.settings.healthReadings !== "object") {
+      this.settings.healthReadings = {};
+    }
+    if (!Array.isArray(this.settings.regressions)) this.settings.regressions = [];
+    if (
+      this.settings.healthExperiment !== null &&
+      (typeof this.settings.healthExperiment !== "object" ||
+        !this.settings.healthExperiment.baseline ||
+        typeof this.settings.healthExperiment.baseline !== "object")
+    ) {
+      this.settings.healthExperiment = null;
+    }
+    if (
+      this.settings.safeMode !== null &&
+      (typeof this.settings.safeMode !== "object" ||
+        !Array.isArray(this.settings.safeMode.originalEnabled) ||
+        !Array.isArray(this.settings.safeMode.keepEnabled))
+    ) {
+      this.settings.safeMode = null;
+    }
     // Upgraded in place from the pre-1.7 flat map — see `migrateSeen`. Also the
     // guard against a hand-edited or sync-mangled value, since it validates the
     // shape of every bucket it keeps.
@@ -1855,6 +1921,19 @@ export default class FlowKitHealthPlugin extends Plugin {
   async applyProfile(
     profile: PluginProfile
   ): Promise<ProfileDelta & { failed: LifecycleFailure[] }> {
+    if (!this.canPersist) {
+      return {
+        enable: [],
+        disable: [],
+        missing: [],
+        failed: [
+          {
+            id: profile.name,
+            error: new Error("FlowKit cannot persist the recovery state."),
+          },
+        ],
+      };
+    }
     const delta = this.deltaFor(profile);
     const disabled = await this.disableMany(delta.disable);
     const enabled = await this.enableMany(delta.enable);
@@ -1864,6 +1943,150 @@ export default class FlowKitHealthPlugin extends Plugin {
       missing: delta.missing,
       failed: [...disabled.failed, ...enabled.failed],
     };
+  }
+
+  /** Save a known-good set after a healthy scan, without overwriting user profiles. */
+  async updateLastKnownGood(results: PluginHealth[]): Promise<boolean> {
+    if (this.settings.safeMode || !isLastKnownGood(results) || !this.canPersist) return false;
+    const enabled = [...(this.pluginsApi().enabledPlugins ?? new Set<string>())];
+    const existing = this.settings.profiles.find((p) => p.name === LAST_KNOWN_GOOD);
+    if (existing && existing.ids.slice().sort().join("|") === enabled.slice().sort().join("|")) {
+      return false;
+    }
+    this.settings.profiles = saveProfile(
+      this.settings.profiles,
+      LAST_KNOWN_GOOD,
+      enabled,
+      Date.now()
+    );
+    await this.saveSettings();
+    return true;
+  }
+
+  /** Capture the current plugin set before entering a deliberately minimal mode. */
+  async startSafeMode(keepEnabled: string[]): Promise<LifecycleResult | null> {
+    if (!this.canPersist || this.settings.safeMode) return null;
+    const api = this.pluginsApi();
+    const originalEnabled = [...(api.enabledPlugins ?? new Set<string>())];
+    const keep = [
+      this.manifest.id,
+      ...new Set(keepEnabled),
+    ].filter((id) => originalEnabled.includes(id));
+    const session: SafeModeSession = {
+      originalEnabled,
+      keepEnabled: keep,
+      startedAt: Date.now(),
+    };
+    this.settings.safeMode = session;
+    await this.saveSettings();
+    const target = safeModeTarget(session, new Set(Object.keys(api.manifests ?? {})));
+    target.disable = target.disable.filter((id) => id !== this.manifest.id);
+    const result = await this.withVaultMutation(async () => this.disableMany(target.disable));
+    if (result.failed.length) {
+      this.settings.safeMode = { ...session, restoreFailed: result.failed.map((f) => f.id) };
+      await this.saveSettings();
+    }
+    return result;
+  }
+
+  /** Restore the exact enabled set captured when safe mode began. */
+  async restoreSafeMode(): Promise<LifecycleResult | null> {
+    const session = this.settings.safeMode;
+    if (!session) return null;
+    const profile: PluginProfile = {
+      name: "Safe mode restore",
+      ids: session.originalEnabled,
+      at: session.startedAt,
+    };
+    const result = await this.withVaultMutation(() => this.applyProfile(profile));
+    const lifecycle: LifecycleResult = {
+      changed: [...result.enable, ...result.disable],
+      failed: [
+        ...result.failed,
+        ...result.missing.map((id) => ({
+          id,
+          error: new Error("Plugin is no longer installed."),
+        })),
+      ],
+    };
+    if (!lifecycle.failed.length) {
+      this.settings.safeMode = null;
+      await this.saveSettings();
+    } else {
+      this.settings.safeMode = {
+        ...session,
+        restoreFailed: lifecycle.failed.map((f) => f.id),
+      };
+      await this.saveSettings();
+    }
+    return lifecycle;
+  }
+
+  /** Begin a before/after health experiment from the latest scan. */
+  async startHealthExperiment(name: string, results: PluginHealth[]): Promise<HealthExperiment | null> {
+    if (!this.canPersist || this.settings.healthExperiment) return null;
+    const trimmed = name.trim() || "Health experiment";
+    const baseline = captureHealthReading(results, Date.now());
+    const experiment: HealthExperiment = {
+      id: `health-${Date.now().toString(36)}`,
+      name: trimmed,
+      startedAt: baseline.at,
+      baseline,
+    };
+    this.settings.healthExperiment = experiment;
+    await this.saveSettings();
+    return experiment;
+  }
+
+  /** Finish the active experiment against a fresh scan and return its comparison. */
+  async finishHealthExperiment(results: PluginHealth[]): Promise<ExperimentComparison | null> {
+    const active = this.settings.healthExperiment;
+    if (!active) return null;
+    const after = captureHealthReading(results, Date.now());
+    this.settings.healthExperiment = { ...active, after, completedAt: after.at };
+    await this.saveSettings();
+    return compareHealth(active.baseline, after);
+  }
+
+  async clearHealthExperiment(): Promise<void> {
+    this.settings.healthExperiment = null;
+    await this.saveSettings();
+  }
+
+  /** Record per-plugin readings and return only newly detected numeric regressions. */
+  async recordHealthReading(results: PluginHealth[], at = Date.now()): Promise<PluginRegression[]> {
+    if (this.settings.safeMode) return [];
+    const reading = captureHealthReading(results, at);
+    const fresh = detectRegressions(
+      this.settings.healthReadings,
+      results,
+      this.settings.events,
+      at
+    );
+    const next = Object.fromEntries(
+      results.map((row) => [
+        row.id,
+        {
+          ...reading,
+          plugins: { [row.id]: reading.plugins[row.id] },
+        },
+      ])
+    );
+    // Keep readings for temporarily hidden/disabled plugins; otherwise a
+    // re-enabled plugin would lose its baseline and a regression would look
+    // like a first observation.
+    this.settings.healthReadings = { ...this.settings.healthReadings, ...next };
+    if (fresh.length) {
+      const existing = new Set(
+        this.settings.regressions.map((r) => `${r.id}:${r.toVersion}:${r.at}`)
+      );
+      this.settings.regressions = [
+        ...this.settings.regressions,
+        ...fresh.filter((r) => !existing.has(`${r.id}:${r.toVersion}:${r.at}`)),
+      ].slice(-60);
+    }
+    await this.saveSettings();
+    return fresh;
   }
 
   // --- change timeline ------------------------------------------------------

@@ -11,6 +11,7 @@ export const BAD_KINDS: HealthChangeKind[] = [
   "error-started",
   "delisted",
   "became-incompatible",
+  "became-unmaintained",
 ];
 
 /** One plugin's state, reduced to what the diff needs. */

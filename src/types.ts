@@ -46,6 +46,16 @@ export type MaintenanceStatus =
   | "unmaintained"
   | "unknown";
 
+/** A cautious, local forecast for compatibility with the next app release. */
+export interface CompatibilityForecast {
+  /** Version used as the conservative forecast target. */
+  targetVersion: string;
+  /** Plugin minimum version, when declared. */
+  minimumVersion?: string;
+  status: "safe" | "watch" | "at-risk" | "unknown";
+  detail: string;
+}
+
 /** The five headline metrics the dashboard shows, plus a blended overall. */
 export interface PluginHealth {
   id: string;
@@ -59,6 +69,8 @@ export interface PluginHealth {
   maintenanceStatus: MaintenanceStatus;
   /** A newer version is published than the one installed. */
   updateAvailable: boolean;
+  /** Conservative forecast for the next Obsidian release. */
+  compatibilityForecast?: CompatibilityForecast;
   /** Latest published version, when known. */
   latestVersion?: string;
   /**
@@ -193,6 +205,7 @@ export type HealthChangeKind =
   | "error-started"
   | "delisted"
   | "became-incompatible"
+  | "became-unmaintained"
   | "update-published"
   | "resolved";
 
