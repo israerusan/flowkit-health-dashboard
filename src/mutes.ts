@@ -5,6 +5,8 @@
 // at a time, and the old flat id list offered nothing else. Six months later
 // nobody remembers why Templater is muted or whether the reason still holds.
 
+import { compareVersion } from "./version";
+
 /** Why and for how long one plugin is muted. */
 export interface MuteRecord {
   /** When it was muted. */
@@ -12,7 +14,7 @@ export interface MuteRecord {
   /** Epoch ms after which the mute lapses, or null for indefinite. */
   until: number | null;
   /**
-   * When set, the mute lapses as soon as Obsidian's version differs from this.
+   * When set, the mute lapses once Obsidian is NEWER than this.
    * "It's fine on 1.7.2" is a claim about a specific Obsidian, and an update is
    * exactly the event that invalidates it.
    */
@@ -79,8 +81,22 @@ export function sweepMutes(
   const expired: string[] = [];
   for (const [id, rec] of Object.entries(mutes)) {
     const lapsedByTime = rec.until != null && rec.until <= now;
+    // NEWER, not merely different — and the sweep writes its survivors back
+    // over `settings.mutes`, which is the shared synced file, so the difference
+    // is destructive rather than cosmetic.
+    //
+    // A desktop on Obsidian 1.7.2 mutes a plugin "until Obsidian updates". The
+    // phone sharing that `data.json` is on 1.6.7, as phones routinely are:
+    // 1.6.7 !== 1.7.2, so the phone's first scan declared the mute lapsed,
+    // announced it as an event, and deleted it from the file — and the desktop
+    // then read back a vault with the mute gone and the plugin back in its
+    // at-risk counts, having updated nothing. Every scan on the older device
+    // did it again, so the mute could not be re-set either.
+    //
+    // "Fine on 1.7.2" is a claim about 1.7.2 and everything below it. Only
+    // moving past it can falsify it.
     const lapsedByUpdate =
-      rec.untilAppVersion != null && rec.untilAppVersion !== appVersion;
+      rec.untilAppVersion != null && compareVersion(appVersion, rec.untilAppVersion) > 0;
     if (lapsedByTime || lapsedByUpdate) expired.push(id);
     else active[id] = rec;
   }

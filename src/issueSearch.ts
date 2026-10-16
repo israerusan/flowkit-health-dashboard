@@ -12,6 +12,8 @@ import { requestUrl } from "obsidian";
 // a minute, which is plenty for a button somebody presses and useless as
 // something run automatically per scan.
 
+import { isRepoSlug } from "./repoActivity";
+
 export interface KnownIssue {
   title: string;
   url: string;
@@ -32,10 +34,96 @@ const REDACTED = "…";
 /** Characters that can appear in a name. Unicode, not `\w` — see below. */
 const NAME_CHARS = "[\\p{L}\\p{N}\\p{M}_.\\-()']";
 
-/** Regex metacharacters, escaped so a note called `C++ (2024)` matches literally. */
+/**
+ * Regex metacharacters, escaped so a note called `C++ (2024)` matches literally.
+ *
+ * A hyphen is escaped as `\x2d` rather than `\-`, and that is not a style
+ * choice. These patterns carry the `u` flag — they have to, for `\p{L}` to mean
+ * anything — and under `u` the only legal identity escapes are the syntax
+ * characters. `\-` is not one of them, so `new RegExp("my\\-note", "u")` is a
+ * SyntaxError, and this function was producing exactly that.
+ *
+ * The consequence was total rather than partial. `buildRedactor` compiles every
+ * vault name up front, so ONE hyphenated file or folder anywhere in the vault
+ * threw before a single pattern was built — and a hyphen is the commonest
+ * character in a note filename there is (`2026-10-16.md` is what Obsidian's own
+ * daily-note plugin produces by default). Both callers construct the redactor
+ * as their first act, so "Is this a known issue?" stuck on "Looking…" forever
+ * and "Copy bug report" did nothing at all, silently, on very nearly every real
+ * vault. Neither leaked anything — the throw happens before any text is
+ * assembled — but the two features were dead.
+ *
+ * `\x2d` is legal under `u`, means the literal hyphen, and stays safe if this
+ * ever ends up inside a character class.
+ */
 function escapeLiteral(value: string): string {
-  return value.replace(/[-.*+?^${}()|[\]\\]/g, "\\$&");
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/-/g, "\\x2d");
 }
+
+/**
+ * How many names go into one compiled alternation.
+ *
+ * The names were compiled one regex per name and applied with one `replace`
+ * per name, so redacting a single string cost a full pass over it for every
+ * file in the vault. Measured on a 30,000-name vault and one 1.9 KB stack
+ * trace: 67 ms per string, where this scan is 21 ms. `copyBugReport` redacts up
+ * to ten strings, so the button froze Obsidian for the better part of a second
+ * on a vault that size — longer on a bigger one, since the old cost was
+ * names × text.
+ *
+ * Chunked rather than one giant pattern only so that a pathological vault
+ * cannot hit an engine limit on pattern size; the size itself makes almost no
+ * difference to the time.
+ */
+const REDACT_CHUNK = 1024;
+
+/**
+ * …and the most characters, which is the limit that actually binds.
+ *
+ * A count alone is not a bound on pattern size: 1,024 names averaging 40
+ * characters is a 40 KB pattern, and 1,024 deep paths in a vault with long
+ * folder names is several times that. No engine limit was reached in testing
+ * and none may exist in practice — but this function compiles the patterns up
+ * front, so a throw here does not degrade the feature, it kills it, exactly as
+ * the hyphen escape did. A byte budget costs one extra chunk and removes the
+ * question. Chunk size makes almost no difference to the time.
+ */
+const REDACT_CHUNK_CHARS = 32_000;
+
+/**
+ * Cut a length-sorted name list into chunks small enough to compile, by both
+ * count and total characters. A single name longer than the budget still gets
+ * its own chunk rather than being dropped — nothing here may silently stop
+ * redacting something.
+ */
+function chunkNames(names: readonly string[]): string[][] {
+  const chunks: string[][] = [];
+  let current: string[] = [];
+  let chars = 0;
+  for (const name of names) {
+    // +1 for the `|` that will join it.
+    const cost = name.length + 1;
+    if (current.length && (current.length >= REDACT_CHUNK || chars + cost > REDACT_CHUNK_CHARS)) {
+      chunks.push(current);
+      current = [];
+      chars = 0;
+    }
+    current.push(name);
+    chars += cost;
+  }
+  if (current.length) chunks.push(current);
+  return chunks;
+}
+
+/**
+ * Shortest name redacted on sight, anywhere it appears.
+ *
+ * Below this a name is only redacted inside quotes — see `buildRedactor`.
+ */
+const SAFE_NAME_LENGTH = 4;
+
+/** The quote characters an error message puts around a note's name. */
+const QUOTE = `["'\`“”‘’]`;
 
 /**
  * Redact by KNOWING the vault, not by guessing what a path looks like.
@@ -69,19 +157,94 @@ function escapeLiteral(value: string): string {
 export function buildRedactor(
   names: Iterable<string>
 ): (text: string) => string {
-  const patterns = [...new Set(names)]
-    .map((name) => name.trim())
-    // A single short token is too collision-prone to redact on sight — a note
-    // called "and" would gut every message in the vault. Names containing a
-    // space are inherently specific, so they are matched at any length.
-    .filter((name) => name.length >= 4 || /\s/.test(name))
-    .sort((a, b) => b.length - a.length)
-    .map((name) => new RegExp(escapeLiteral(name), "giu"));
+  const trimmed = [...new Set(names)].map((name) => name.trim()).filter(Boolean);
+  // A single short token is too collision-prone to redact on sight — a note
+  // called "and", or a folder called "lib", would gut every message in the
+  // vault and take `markdown-it/lib/token` with it. Names containing a space
+  // are inherently specific, so they are matched at any length.
+  const wanted = trimmed
+    .filter((name) => name.length >= SAFE_NAME_LENGTH || /\s/.test(name))
+    .sort((a, b) => b.length - a.length);
+
+  // …but a short name is unambiguous when it is QUOTED, and that is exactly how
+  // an error message names a note: `Failed to open note "HIV"`. A vault with
+  // `HIV.md` in it supplies "HIV.md" and the path, both long enough to match —
+  // and "HIV", which the filter above drops, so the one spelling that actually
+  // appeared in the message was the one published. In a note-taking app a
+  // three-letter title can be the most sensitive string in the vault.
+  //
+  // Quoted-only is what keeps this from undoing the filter: a path segment or a
+  // bare word in prose is left alone, so module paths and ordinary error text
+  // survive as before, and the cost is occasionally blanking a quoted
+  // three-letter property name that happens to share a note's title. Blanking
+  // `reading 'src'` is a far smaller harm than publishing a diagnosis.
+  const shortNames = trimmed
+    .filter((name) => name.length >= 2 && name.length < SAFE_NAME_LENGTH && !/\s/.test(name))
+    .sort((a, b) => b.length - a.length);
+
+  // Each chunk becomes one alternation inside a LOOKAHEAD, which is what makes
+  // this both fast and no weaker than the per-name version it replaces.
+  //
+  // A plain alternation would be fast and subtly weaker. `(?:short|longer)`
+  // consumes what it matches, so once a short name matches at position 8 the
+  // scan resumes past it — and a longer name starting at position 16, inside
+  // what the short one swallowed, is never looked for. With a vault containing
+  // the folder "Project Alice" and the note "Alice Nguyen HIV results", the
+  // message "Failed: Project Alice Nguyen HIV results" came out as
+  // "Failed: … Nguyen HIV results": the folder redacted, the note published.
+  // The per-name loop got that right by accident of running the longest name
+  // first over the whole string.
+  //
+  // A zero-width lookahead consumes nothing, so the scan asks every position
+  // "what is the longest name starting HERE?" and collects the answers. The
+  // overlaps are then resolved explicitly below, longest wins — which is the
+  // rule the old loop implemented by construction, now stated rather than
+  // emergent.
+  const patterns: RegExp[] = [];
+  for (const chunk of chunkNames(wanted)) {
+    patterns.push(new RegExp(`(?=(${chunk.map(escapeLiteral).join("|")}))`, "giu"));
+  }
+  // The short names, each required to sit between a pair of quotes. The
+  // capture is the name alone, so the quotes survive and `"HIV"` becomes `"…"`.
+  for (const chunk of chunkNames(shortNames)) {
+    patterns.push(
+      new RegExp(`(?<=${QUOTE})(?=(${chunk.map(escapeLiteral).join("|")})${QUOTE})`, "giu")
+    );
+  }
 
   return (text: string): string => {
-    let out = text;
-    for (const pattern of patterns) out = out.replace(pattern, REDACTED);
-    return redactMachinePaths(out);
+    /** [start, end) of one name found in the text. */
+    const found: Array<[number, number]> = [];
+    for (const pattern of patterns) {
+      pattern.lastIndex = 0;
+      for (const match of text.matchAll(pattern)) {
+        const hit = match[1];
+        if (match.index == null || !hit) continue;
+        found.push([match.index, match.index + hit.length]);
+      }
+    }
+    if (!found.length) return redactMachinePaths(text);
+
+    // Longest first, leftmost to break ties; keep a span only if nothing
+    // already kept overlaps it. The list is short — it is the number of names
+    // appearing in one error message, not the number in the vault — so the
+    // quadratic check costs nothing worth avoiding.
+    const length = ([start, end]: [number, number]): number => end - start;
+    found.sort((a, b) => length(b) - length(a) || a[0] - b[0]);
+    const kept: Array<[number, number]> = [];
+    for (const span of found) {
+      if (kept.some(([start, end]) => span[0] < end && start < span[1])) continue;
+      kept.push(span);
+    }
+    kept.sort((a, b) => a[0] - b[0]);
+
+    let out = "";
+    let at = 0;
+    for (const [start, end] of kept) {
+      out += text.slice(at, start) + REDACTED;
+      at = end;
+    }
+    return redactMachinePaths(out + text.slice(at));
   };
 }
 
@@ -186,7 +349,7 @@ export async function findKnownIssues(
   message: string,
   redact: (text: string) => string = redactUserContent
 ): Promise<IssueSearchOutcome> {
-  if (!repo || !/^[\w.-]+\/[\w.-]+$/.test(repo)) return { ok: false, reason: "no-repo" };
+  if (!isRepoSlug(repo)) return { ok: false, reason: "no-repo" };
   const terms = searchTerms(message, redact);
   // Distinct from "searched and found none". Returning an empty success made
   // the UI say "Nothing matching in their tracker" about a search that was

@@ -190,14 +190,43 @@ export function buildInsights(
   const unmaintained = live.filter(IS_UNMAINTAINED);
   if (unmaintained.length) {
     claim(unmaintained);
+    // "No recorded update in 18+ months" was asserted for the whole cohort, and
+    // it is not what `unmaintained` means. An archived or deleted repository
+    // earns that status on its own, whatever the release history says — so a
+    // plugin released last month whose author archived the repo was listed
+    // under a sentence claiming it had not been updated in a year and a half.
+    // The card is allowed to say less; it is not allowed to be wrong.
+    // Built from the reasons actually present, rather than picked from a short
+    // list of combinations. The combination list had a gap of exactly the kind
+    // it was written to close: the mixed branch said "an archived repository"
+    // and nothing else, so a recently-released plugin whose repository had been
+    // DELETED was presented as archived — true of neither its release history
+    // nor its repository.
+    const archived = unmaintained.filter((r) => r.repoActivity?.archived === true);
+    const missing = unmaintained.filter(
+      (r) => r.repoActivity?.archived !== true && r.repoActivity?.failed === "missing"
+    );
+    const abandoned = [...archived, ...missing];
+    const stale = unmaintained.length - abandoned.length;
+    const reasons: string[] = [];
+    if (stale > 0) reasons.push("no recorded update in 18+ months");
+    if (archived.length) reasons.push("an archived repository");
+    if (missing.length) reasons.push("a repository that no longer exists");
+    const joined = reasons.length ? reasons.join(", or ") : "no recent release";
+    const reason = joined.charAt(0).toUpperCase() + joined.slice(1);
     insights.push({
       id: "unmaintained",
       tone: "bad",
       icon: "clock-alert",
-      title: `${unmaintained.length} plugin${unmaintained.length > 1 ? "s have" : " has"} no recent release`,
+      // Likewise: the title claimed "no recent release", which an archived
+      // repository does not establish either.
+      title:
+        abandoned.length && !stale
+          ? `${unmaintained.length} plugin${unmaintained.length > 1 ? "s are" : " is"} no longer being worked on`
+          : `${unmaintained.length} plugin${unmaintained.length > 1 ? "s look" : " looks"} unmaintained`,
       // Deliberately an observation, not a verdict. Release age alone cannot
       // establish abandonment — plenty of good plugins are simply finished.
-      detail: `No recorded update in 18+ months: ${names(unmaintained)}. Worth checking whether they still work for you.`,
+      detail: `${reason}: ${names(unmaintained)}. Worth checking whether they still work for you.`,
       ids: unmaintained.map((r) => r.id),
       match: IS_UNMAINTAINED,
       action: "disable-unmaintained",

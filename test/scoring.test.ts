@@ -42,7 +42,12 @@ import {
 import { findConflicts, printChord, type CommandRow } from "../src/conflicts";
 import { buildMute, describeMute, migrateMutes, sweepMutes } from "../src/mutes";
 import { rankSafeDisable } from "../src/triage";
-import { isStale, selectForLookup, type RepoActivityMap } from "../src/repoActivity";
+import {
+  isRepoSlug,
+  isStale,
+  selectForLookup,
+  type RepoActivityMap,
+} from "../src/repoActivity";
 import { repoVerdict } from "../src/scoring";
 import {
   beginBisect,
@@ -597,6 +602,121 @@ function ph(overrides: Partial<PluginHealth>): PluginHealth {
   check("insight unmaintained present", um != null);
   eq("insight unmaintained action", um?.action, "disable-unmaintained");
   eq("insight unmaintained id captured", um?.ids[0], "old");
+  check(
+    "and with no repository reading it says the release-age reason",
+    um?.detail.includes("No recorded update in 18+ months") === true,
+    um?.detail
+  );
+
+  // An ARCHIVED repository earns "unmaintained" on its own, whatever the
+  // release history says — so the card must not assert a release age it has not
+  // checked. A plugin released last month whose author archived the repo was
+  // being listed under "No recorded update in 18+ months".
+  {
+    const archived = buildInsights([
+      ph({
+        id: "shut",
+        maintenanceStatus: "unmaintained",
+        repoActivity: { at: NOW, archived: true, pushedAt: NOW - 20 * DAY },
+      }),
+    ]).find((i) => i.id === "unmaintained");
+    check(
+      "an archived repo is not described as having no recent release",
+      archived != null &&
+        !archived.detail.includes("18+ months") &&
+        !archived.title.includes("no recent release"),
+      `${archived?.title} / ${archived?.detail}`
+    );
+    check(
+      "and is described as what it is",
+      archived?.detail.includes("archived") === true,
+      archived?.detail
+    );
+
+    // A deleted repository, likewise.
+    const gone = buildInsights([
+      ph({
+        id: "gone",
+        maintenanceStatus: "unmaintained",
+        repoActivity: { at: NOW, failed: "missing" },
+      }),
+    ]).find((i) => i.id === "unmaintained");
+    check(
+      "a deleted repo is not described as having no recent release",
+      gone != null && !gone.detail.includes("18+ months"),
+      gone?.detail
+    );
+
+    // Mixed cohorts have to cover both without claiming either of the whole.
+    const mixed = buildInsights([
+      ph({ id: "stale", maintenanceStatus: "unmaintained" }),
+      ph({
+        id: "shut2",
+        maintenanceStatus: "unmaintained",
+        repoActivity: { at: NOW, archived: true },
+      }),
+    ]).find((i) => i.id === "unmaintained");
+    check(
+      "a mixed cohort names both reasons",
+      mixed?.detail.includes("18+ months") === true &&
+        mixed?.detail.includes("archived") === true,
+      mixed?.detail
+    );
+
+    // A DELETED repository is not an archived one, and the mixed branch used to
+    // say only "an archived repository" — so a plugin released last month whose
+    // repo had been deleted was described as archived. Three facts, three
+    // clauses, each one only present when it is true.
+    const threeWays = buildInsights([
+      ph({ id: "stale3", maintenanceStatus: "unmaintained" }),
+      ph({
+        id: "arch3",
+        maintenanceStatus: "unmaintained",
+        repoActivity: { at: NOW, archived: true },
+      }),
+      ph({
+        id: "gone3",
+        maintenanceStatus: "unmaintained",
+        repoActivity: { at: NOW, failed: "missing" },
+      }),
+    ]).find((i) => i.id === "unmaintained");
+    check(
+      "a deleted repo is named as deleted, not as archived",
+      threeWays?.detail.includes("no longer exists") === true,
+      threeWays?.detail
+    );
+    check(
+      "…alongside the archived one and the stale one",
+      threeWays?.detail.includes("archived repository") === true &&
+        threeWays?.detail.includes("18+ months") === true,
+      threeWays?.detail
+    );
+    // And a reason absent from the cohort is absent from the sentence.
+    check(
+      "an all-archived cohort does not mention deleted repositories",
+      buildInsights([
+        ph({
+          id: "arch4",
+          maintenanceStatus: "unmaintained",
+          repoActivity: { at: NOW, archived: true },
+        }),
+      ])
+        .find((i) => i.id === "unmaintained")
+        ?.detail.includes("no longer exists") === false
+    );
+    check(
+      "and does not mention release age either",
+      buildInsights([
+        ph({
+          id: "arch5",
+          maintenanceStatus: "unmaintained",
+          repoActivity: { at: NOW, archived: true },
+        }),
+      ])
+        .find((i) => i.id === "unmaintained")
+        ?.detail.includes("18+ months") === false
+    );
+  }
 
   // Muted plugins are ignored entirely.
   eq(
@@ -657,6 +777,32 @@ eq("v-prefix ignored", compareVersion("v1.2.3", "1.2.3"), 0);
 eq("prerelease sorts below its release", compareVersion("1.0.0-beta", "1.0.0"), -1);
 eq("release sorts above its prerelease", compareVersion("1.0.0", "1.0.0-beta"), 1);
 eq("prerelease vs prerelease", compareVersion("1.0.0-alpha", "1.0.0-beta"), -1);
+// Semver prerelease ordering, identifier by identifier — NOT string order.
+// `pa.pre < pb.pre` put `insider.10` below `insider.9`, and every numeric
+// suffix from ten onwards came out backwards. That reached a user the moment
+// the mute sweep started asking "is Obsidian NEWER than the pinned version":
+// a genuine forward update from insider.9 to insider.10 answered no, so a
+// mute written to lapse on an update survived it, and went on surviving.
+eq("numeric prerelease identifiers compare numerically", compareVersion("1.8.0-insider.10", "1.8.0-insider.9"), 1);
+eq("…and the other way round", compareVersion("1.8.0-insider.9", "1.8.0-insider.10"), -1);
+eq("double digits do not sort under single", compareVersion("1.0.0-rc.2", "1.0.0-rc.11"), -1);
+// A numeric identifier ranks below an alphanumeric one, per semver.
+eq("numeric ranks below alphanumeric", compareVersion("1.0.0-1", "1.0.0-alpha"), -1);
+// A shorter prerelease with an equal prefix ranks lower.
+eq("a shorter prerelease ranks lower", compareVersion("1.0.0-beta", "1.0.0-beta.1"), -1);
+eq("and is not merely equal", compareVersion("1.0.0-beta.1", "1.0.0-beta"), 1);
+eq("identical prereleases are equal", compareVersion("1.0.0-beta.2", "1.0.0-beta.2"), 0);
+// The release still outranks every prerelease of itself.
+eq("a release beats its own prerelease", compareVersion("1.8.0", "1.8.0-insider.10"), 1);
+// Build metadata is not a prerelease. Splitting on `[-+]` together read
+// `1.0.0+build` as the prerelease "build", so it sorted BELOW plain `1.0.0` —
+// and an installed `1.2.3+abc` wore an Update badge pointing at the `1.2.3` it
+// already was.
+eq("build metadata is ignored", compareVersion("1.0.0+build", "1.0.0"), 0);
+eq("…in both directions", compareVersion("1.0.0", "1.0.0+build"), 0);
+eq("two different builds of one release are equal", compareVersion("1.0.0+a", "1.0.0+b"), 0);
+eq("and it does not swallow a real prerelease", compareVersion("1.0.0-alpha+build", "1.0.0-alpha"), 0);
+eq("which still sorts below the release", compareVersion("1.0.0-alpha+build", "1.0.0"), -1);
 {
   // A vault pinned to the stable release must not be told an update is waiting
   // just because a beta of the same version exists.
@@ -857,10 +1003,168 @@ eq("prerelease vs prerelease", compareVersion("1.0.0-alpha", "1.0.0-beta"), -1);
 
   const day = 86_400_000;
   const rec = { uncaught: 10, logged: 99, firstAt: 0, lastAt: day, signatures: [] };
-  eq("rate is per day", Math.round(errorRatePerDay(rec, 2 * day)), 5);
+  // `now` passed explicitly: the window is now bounded per plugin, so leaving
+  // it to default to the wall clock made this assertion pass for a reason that
+  // had nothing to do with what it was testing.
+  eq("rate is per day", Math.round(errorRatePerDay(rec, 2 * day, 2 * day)), 5);
   // The console count must not move the score, or plugins that report their
   // failures honestly would rank below ones that swallow them.
-  eq("console errors are excluded from the rate", errorRatePerDay({ ...rec, uncaught: 0 }, day), 0);
+  eq(
+    "console errors are excluded from the rate",
+    errorRatePerDay({ ...rec, uncaught: 0 }, day, day),
+    0
+  );
+
+  // --- the window is this plugin's, not the whole watching period ----------
+  //
+  // Dividing every plugin's error count by how long FlowKit has been watching
+  // the VAULT is the bug: a plugin installed yesterday was measured against six
+  // months of silence it had no part in, so twenty errors today came out as a
+  // rate of 0.11 a day and a Reliability of 95 — printed directly beside the
+  // cell saying "20 unhandled errors · last seen in the last hour".
+  {
+    const sixMonths = 180 * day;
+    const yesterday = {
+      uncaught: 20,
+      logged: 0,
+      firstAt: NOW - day,
+      lastAt: NOW,
+      signatures: [],
+    };
+    eq(
+      "a plugin's first error bounds the window",
+      Math.round(errorRatePerDay(yesterday, sixMonths, NOW)),
+      20
+    );
+    const fresh = computeHealth(
+      input({ observedMs: sixMonths, errors: yesterday }),
+      NOW
+    );
+    check(
+      "so twenty errors yesterday is not a Reliability in the nineties",
+      (fresh.metrics.reliability.value ?? 100) < 40,
+      `got ${fresh.metrics.reliability.value}`
+    );
+
+    // A long-standing record still uses the full watching period: the bound is
+    // a minimum of the two, so this must not have changed.
+    const longStanding = {
+      uncaught: 20,
+      logged: 0,
+      firstAt: NOW - sixMonths,
+      lastAt: NOW,
+      signatures: [],
+    };
+    check(
+      "twenty errors over six months stays a mild dent",
+      (computeHealth(input({ observedMs: sixMonths, errors: longStanding }), NOW).metrics
+        .reliability.value ?? 0) > 85,
+      `got ${computeHealth(input({ observedMs: sixMonths, errors: longStanding }), NOW).metrics.reliability.value}`
+    );
+
+    // …and a single error two minutes ago is not divided by two minutes. The
+    // floor is MIN_OBSERVATION_MS, the same threshold that decides when silence
+    // starts to mean something.
+    const justNow = {
+      uncaught: 1,
+      logged: 0,
+      firstAt: NOW - 120_000,
+      lastAt: NOW,
+      signatures: [],
+    };
+    eq(
+      "a brand-new error is floored, not divided by nothing",
+      Math.round(errorRatePerDay(justNow, sixMonths, NOW)),
+      Math.round(1 / (MIN_OBSERVATION_MS / day))
+    );
+    check(
+      "so one fresh error is a warning, not a catastrophe",
+      (computeHealth(input({ observedMs: sixMonths, errors: justNow }), NOW).metrics
+        .reliability.value ?? 0) > 35,
+      `got ${computeHealth(input({ observedMs: sixMonths, errors: justNow }), NOW).metrics.reliability.value}`
+    );
+
+    // The sentence has to match the window it came from. "about 80 a day" off
+    // twenty errors seen this morning invents seventy-nine of them.
+    const burst = {
+      uncaught: 20,
+      logged: 0,
+      firstAt: NOW - 20 * 60_000,
+      lastAt: NOW,
+      signatures: [],
+    };
+    const detail = computeHealth(input({ observedMs: sixMonths, errors: burst }), NOW)
+      .metrics.reliability.detail;
+    check(
+      "a short window reports what it counted, not a projected daily rate",
+      !detail.includes("a day") && detail.includes("20 unhandled errors"),
+      detail
+    );
+    // …and over the span that actually elapsed, not the six-hour floor the
+    // SCORE divides by. Quoting the floor back would assert a watching period
+    // that never happened.
+    check(
+      "and names the real elapsed span, not the scoring floor",
+      detail.includes("in the last 20 minutes"),
+      detail
+    );
+    // A `firstAt` ahead of `now` — a synced data.json from a machine whose
+    // clock disagrees — must not produce a negative or absurd span.
+    const skewed = computeHealth(
+      input({
+        observedMs: sixMonths,
+        errors: { uncaught: 3, logged: 0, firstAt: NOW + 5 * day, lastAt: NOW, signatures: [] },
+      }),
+      NOW
+    ).metrics.reliability;
+    check(
+      "a future firstAt degrades rather than breaking",
+      skewed.value != null &&
+        skewed.value >= 0 &&
+        skewed.value <= 100 &&
+        !skewed.detail.includes("-") &&
+        !skewed.detail.includes("NaN"),
+      `${skewed.value} / ${skewed.detail}`
+    );
+    // Specifically: it must NOT invent a six-hour window out of a clamped
+    // negative elapsed time. Clamping to zero and then raising to the floor
+    // turned three errors timestamped tomorrow into a rate of twelve a day and
+    // dropped Reliability from the nineties to the forties on nothing but a
+    // wrong clock on another machine. An unusable timestamp is not evidence, so
+    // the window falls back to the whole watching period.
+    eq(
+      "a future firstAt falls back to the full watching window",
+      Math.round(
+        errorRatePerDay(
+          { uncaught: 3, logged: 0, firstAt: NOW + 5 * day, lastAt: NOW, signatures: [] },
+          sixMonths,
+          NOW
+        ) * 1000
+      ),
+      Math.round((3 / 180) * 1000)
+    );
+    check(
+      "so the score stays where the old code had it",
+      (skewed.value ?? 0) > 90,
+      `got ${skewed.value}`
+    );
+    // …and the sentence must not describe a future error as recent.
+    check(
+      "and the detail does not claim it happened moments ago",
+      !skewed.detail.includes("in the last few minutes"),
+      skewed.detail
+    );
+    check(
+      "and a long one still projects",
+      computeHealth(
+        input({
+          observedMs: sixMonths,
+          errors: { ...longStanding, uncaught: 400 },
+        }),
+        NOW
+      ).metrics.reliability.detail.includes("a day")
+    );
+  }
 
   // Until we've watched long enough, silence proves nothing.
   const fresh = computeHealth(input({ observedMs: 60_000 }), NOW);
@@ -1351,6 +1655,181 @@ eq("prerelease vs prerelease", compareVersion("1.0.0-alpha", "1.0.0-beta"), -1);
   );
 }
 
+// --- redaction: the ordinary vault -------------------------------------------
+//
+// The corpus above is all dramatic names — HIV results, divorce settlements —
+// and every single one of them is hyphen-free, which is the only reason the
+// suite ever passed. `escapeLiteral` emitted `\-`, which is an illegal identity
+// escape under the `u` flag these patterns need for `\p{L}`, so `buildRedactor`
+// threw a SyntaxError while compiling and before matching anything. One
+// hyphenated file or folder anywhere in the vault was enough — and a hyphen is
+// what Obsidian's own daily-note plugin puts in every filename it creates.
+//
+// So this block is deliberately boring: the names a real vault actually has.
+{
+  const vault = [
+    // What the core Daily notes plugin produces, out of the box.
+    "2026-10-16",
+    "2026-10-16.md",
+    "Daily Notes/2026-10-16.md",
+    // Kebab-case, the other half of every real vault.
+    "my-project-plan",
+    "my-project-plan.md",
+    "Pasted image 20261016-1.png",
+    // Regex metacharacters that are NOT hyphens, so the escape of the rest
+    // stays covered too.
+    "Notes (2026) [draft].md",
+    "C++ notes.md",
+    "a.b*c?.md",
+    "100% done.md",
+    "why$.md",
+  ];
+  let redact: (text: string) => string;
+  try {
+    redact = buildRedactor(vault);
+    check("buildRedactor survives an ordinary hyphenated vault", true);
+  } catch (err) {
+    check(
+      "buildRedactor survives an ordinary hyphenated vault",
+      false,
+      `threw ${String(err)}`
+    );
+    redact = (t) => t;
+  }
+
+  // …and still redacts them, which is the point of surviving.
+  for (const [message, forbidden] of [
+    ["ENOENT: no such file or directory, open 'Daily Notes/2026-10-16.md'", "2026-10-16"],
+    ["Cannot read properties of undefined reading 'x' at my-project-plan.md", "my-project-plan"],
+    ["failed to embed Pasted image 20261016-1.png", "20261016-1"],
+    ["Could not open Notes (2026) [draft].md", "draft"],
+    ["parse error in a.b*c?.md", "a.b*c"],
+    ["write failed: 100% done.md", "100% done"],
+  ] as const) {
+    check(
+      `an ordinary name is still redacted: ${forbidden}`,
+      !redact(message).includes(forbidden),
+      `got ${redact(message)}`
+    );
+  }
+
+  // Over-redaction stays a failure here too: a hyphen in a module path is not
+  // a hyphen in a note title.
+  eq(
+    "a hyphenated module path survives",
+    redact("Cannot find module markdown-it/lib/token"),
+    "Cannot find module markdown-it/lib/token"
+  );
+
+  // The chunked alternation has to behave identically across a chunk boundary,
+  // longest-first, or the shortest name could win and leave the longer one's
+  // tail published. 1024 is the chunk size; go well past two of them.
+  const many = ["Alice Nguyen HIV results-2026.md", "results-2026.md"];
+  for (let i = 0; i < 3000; i++) many.push(`filler-note-${i}.md`);
+  const bulk = buildRedactor(many);
+  const out = bulk("open failed: Alice Nguyen HIV results-2026.md");
+  check(
+    "longest-first holds across chunk boundaries",
+    !out.includes("Alice") && !out.includes("Nguyen"),
+    `got ${out}`
+  );
+  check(
+    "and a name in a later chunk still matches",
+    !bulk("open failed: filler-note-2999.md").includes("filler-note-2999"),
+    `got ${bulk("open failed: filler-note-2999.md")}`
+  );
+
+  // A vault of very long names has to chunk by CHARACTERS as well as by count,
+  // or one chunk is a 100 KB pattern. Compilation happens up front, so a throw
+  // here would not degrade the feature — it would kill it, which is exactly
+  // what the hyphen escape did.
+  const longNames = [];
+  for (let i = 0; i < 2000; i++) {
+    longNames.push(`Archive/Projects/${"deep-folder-name/".repeat(12)}note-${i}.md`);
+  }
+  longNames.push("Alice Nguyen HIV results.md");
+  let huge: ((text: string) => string) | null = null;
+  try {
+    huge = buildRedactor(longNames);
+    check("a vault of very long names still compiles", true);
+  } catch (err) {
+    check("a vault of very long names still compiles", false, String(err));
+  }
+  if (huge) {
+    check(
+      "and still redacts across the chunking",
+      !huge("open failed: Alice Nguyen HIV results.md").includes("Nguyen") &&
+        !huge(`open failed: Archive/Projects/${"deep-folder-name/".repeat(12)}note-1999.md`).includes(
+          "note-1999"
+        )
+    );
+  }
+
+  // OVERLAP. A shorter name starting EARLIER must not swallow the start of a
+  // longer one and publish its tail. This is the case a plain consuming
+  // alternation gets wrong — it matches the folder at the first position that
+  // works and resumes past it, so the note title that begins inside it is
+  // never looked for. Here, redacting the folder and publishing the note is
+  // the exact inverse of the point.
+  const overlap = buildRedactor(["Project Alice", "Alice Nguyen HIV results"]);
+  const overlapped = overlap("Failed: Project Alice Nguyen HIV results");
+  check(
+    "a longer name starting inside a shorter one still wins",
+    !overlapped.includes("Nguyen") && !overlapped.includes("HIV"),
+    `got ${overlapped}`
+  );
+
+  // The same shape in miniature, so the rule is pinned rather than inferred
+  // from one realistic example: "BCDE" beats "AB" even though "AB" is leftmost.
+  eq(
+    "longest wins over leftmost",
+    buildRedactor(["ABxy", "BxyCDE"])("q ABxyCDE q"),
+    "q A… q"
+  );
+
+  // SHORT names. Under four characters a name is too collision-prone to redact
+  // on sight — a folder called "lib" would take `markdown-it/lib/token` with
+  // it. But a three-letter note title can be the most sensitive string in the
+  // vault, and the way an error message names a note is in QUOTES: the vault
+  // supplied "HIV.md" and the path (both long enough), and "HIV" — the one
+  // spelling that actually appeared in the message — was dropped and published.
+  const tiny = buildRedactor(["HIV", "HIV.md", "SSN", "lib", "Notes/HIV.md"]);
+  for (const message of [
+    `Failed to index note "HIV" for the patient`,
+    `Could not resolve 'SSN'`,
+    "Failed to open note `HIV`",
+    "could not read “HIV”",
+  ]) {
+    const out = tiny(message);
+    check(
+      `a quoted short name is redacted: ${message}`,
+      !out.includes("HIV") && !out.includes("SSN"),
+      `got ${out}`
+    );
+  }
+  // The quotes themselves survive, so the sentence still reads.
+  eq(
+    "and only the name inside them goes",
+    tiny(`Failed to index note "HIV"`),
+    `Failed to index note "…"`
+  );
+
+  // …and the filter it is carved out of still holds: a short name as a bare
+  // word or a path segment is left alone, which is what keeps the diagnosis
+  // intact. "lib" is a vault folder here and must still not eat the module
+  // path — that is the whole reason short names are not matched on sight.
+  eq(
+    "an unquoted short name is left alone",
+    tiny("Cannot find module markdown-it/lib/token"),
+    "Cannot find module markdown-it/lib/token"
+  );
+  eq(
+    "including as a bare word",
+    tiny("the lib directory is missing"),
+    "the lib directory is missing"
+  );
+}
+
 // --- conflicts ---------------------------------------------------------------
 {
   const installed = new Set(["alpha", "beta"]);
@@ -1524,6 +2003,60 @@ eq("prerelease vs prerelease", compareVersion("1.0.0-alpha", "1.0.0-beta"), -1);
   const updated = sweepMutes(mutes, NOW + 1000, "1.6.0");
   eq("an Obsidian update lapses the version-pinned mute", updated.expired.join(), "pinned");
 
+  // The synced-vault case, which is what "different" got wrong and "newer"
+  // gets right. `data.json` is shared; the devices' Obsidian versions are not.
+  // A phone two releases behind must not declare the desktop's mute lapsed and
+  // delete it from the file — nothing has updated.
+  const older = sweepMutes(mutes, NOW + 1000, "1.4.9");
+  eq("an OLDER Obsidian lapses nothing", older.expired.length, 0);
+  check("and the pinned mute is still in force", "pinned" in older.active);
+
+  // A patch release is still an update, and a same-version device still isn't.
+  eq(
+    "a patch release past the pin lapses it",
+    sweepMutes(mutes, NOW + 1000, "1.5.1").expired.join(),
+    "pinned"
+  );
+  eq(
+    "the pinned version itself does not",
+    sweepMutes(mutes, NOW + 1000, "1.5.0").expired.length,
+    0
+  );
+  // Obsidian insider builds carry a prerelease tag, and a prerelease of the
+  // pinned release is not past it.
+  eq(
+    "a prerelease of the pinned version does not lapse it",
+    sweepMutes(mutes, NOW + 1000, "1.5.0-insider").expired.length,
+    0
+  );
+
+  // …but moving FORWARD between insider builds is an update, and must lapse it.
+  // String comparison of the prerelease tag said insider.10 was older than
+  // insider.9, so the mute survived every update from ten onwards.
+  {
+    const pinned = { foo: buildMute("until-update", NOW, "1.8.0-insider.9") };
+    eq(
+      "a forward insider update lapses the mute",
+      sweepMutes(pinned, NOW + 1000, "1.8.0-insider.10").expired.join(),
+      "foo"
+    );
+    eq(
+      "the same insider build does not",
+      sweepMutes(pinned, NOW + 1000, "1.8.0-insider.9").expired.length,
+      0
+    );
+    eq(
+      "and neither does an earlier one",
+      sweepMutes(pinned, NOW + 1000, "1.8.0-insider.8").expired.length,
+      0
+    );
+    eq(
+      "the stable release past it does lapse it",
+      sweepMutes(pinned, NOW + 1000, "1.8.0").expired.join(),
+      "foo"
+    );
+  }
+
   check(
     "a live mute describes itself",
     describeMute(mutes.timed, NOW).includes("lapses in"),
@@ -1590,6 +2123,20 @@ eq("prerelease vs prerelease", compareVersion("1.0.0-alpha", "1.0.0-beta"), -1);
 
 // --- repository activity -----------------------------------------------------
 {
+  // `owner/name` and nothing that normalises to a different URL. `[\w.-]+`
+  // matches `..`, and `https://api.github.com/repos/../user` is rewritten to
+  // `https://api.github.com/user` before it is sent — a different endpoint than
+  // the one the caller believes it is asking.
+  check("an ordinary slug is accepted", isRepoSlug("blacksmithgu/obsidian-dataview"));
+  check("dots inside a name are fine", isRepoSlug("owner/some.plugin-v2"));
+  check("a parent-directory owner is rejected", !isRepoSlug("../user"));
+  check("a parent-directory name is rejected", !isRepoSlug("owner/.."));
+  check("a single dot is rejected", !isRepoSlug("./x"));
+  check("both halves dots is rejected", !isRepoSlug("../.."));
+  check("a third segment is rejected", !isRepoSlug("a/b/c"));
+  check("no slash is rejected", !isRepoSlug("owner"));
+  check("undefined is rejected", !isRepoSlug(undefined));
+
   eq("an archived repo is decisive", repoVerdict({ at: NOW, archived: true }, NOW), "archived");
   eq(
     "a deleted repo is decisive",
@@ -2007,7 +2554,33 @@ eq("prerelease vs prerelease", compareVersion("1.0.0-alpha", "1.0.0-beta"), -1);
     (slowTick.value ?? 100) < 30,
     `got ${slowTick.value}`
   );
-  check("and says why", slowTick.detail.includes("blocks the interface"), slowTick.detail);
+  check("and says why", slowTick.detail.includes("blocked the interface"), slowTick.detail);
+  // Phrased as the worst observed run, which is what `maxTickMs` is. Claiming
+  // it happens "each time that timer fires" was a statement about the typical
+  // tick that this number cannot support.
+  check(
+    "as the SLOWEST run, not the typical one",
+    slowTick.detail.includes("slowest timer callback") &&
+      !slowTick.detail.includes("each time"),
+    slowTick.detail
+  );
+  check(
+    "and names how many runs it was drawn from, when that is known",
+    readFootprint(
+      50_000,
+      { minIntervalMs: 30_000, maxTickMs: 200, ticks: 40 },
+      "1.0.0"
+    ).detail.includes("worst of 40 runs"),
+    readFootprint(50_000, { minIntervalMs: 30_000, maxTickMs: 200, ticks: 40 }, "1.0.0").detail
+  );
+  check(
+    "and does not say 'worst of 1 runs'",
+    !readFootprint(
+      50_000,
+      { minIntervalMs: 30_000, maxTickMs: 200, ticks: 1 },
+      "1.0.0"
+    ).detail.includes("worst of")
+  );
 
   // A 30 s timer is not free — it sits inside the one-minute idle threshold —
   // so the idle case is checked at a period the curve really does ignore.

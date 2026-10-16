@@ -203,8 +203,17 @@ export function readFootprint(
   if (tick != null && Number.isFinite(tick) && tick > TICK_FREE_MS) {
     sawRuntime = true;
     scores.push(tickScore(tick));
+    // "each time that timer fires" was an overstatement, and the kind this
+    // product is least entitled to: `maxTickMs` is the WORST single run
+    // observed, not the typical one, so a plugin that does one expensive pass
+    // on its first tick and nothing afterwards was described as freezing the
+    // interface on every tick forever. Say which number it is, and say what it
+    // was drawn from so the reader can weigh it.
+    const runs = profile?.ticks;
     parts.push(
-      `blocks the interface for ${Math.round(tick)} ms of work each time that timer fires`
+      `its slowest timer callback blocked the interface for ${Math.round(tick)} ms${
+        runs != null && runs > 1 ? ` (worst of ${runs} runs)` : ""
+      }`
     );
   }
 

@@ -180,8 +180,13 @@ async function timerTests(): Promise<void> {
   });
 
   const beforeSet = window.setInterval;
+  const beforeClear = window.clearInterval;
+  // Watched only so a `clearTimeout` on an interval handle is not missed — see
+  // `originalClearTimeout`. It must be given back like the others.
+  const beforeClearTimeout = window.clearTimeout;
   watcher.start();
   check("start() replaces setInterval", window.setInterval !== beforeSet);
+  check("start() replaces clearTimeout too", window.clearTimeout !== beforeClearTimeout);
 
   // A timer created from inside plugin code is attributed to that plugin.
   //
@@ -239,11 +244,49 @@ async function timerTests(): Promise<void> {
     }, 10)
   );
   await sleep(80);
-  window.clearInterval(slow);
+  // Snapshotted while the timer is still LIVE. The reading is a present-tense
+  // claim about a cost the vault is paying, so that is the only state in which
+  // it is true — see below.
   snapshot = watcher.snapshot();
   const tick = snapshot.beta?.maxTickMs ?? 0;
   check("a slow callback is timed", tick >= 25, `got ${tick}ms`);
   check("and the runs are counted", (snapshot.beta?.ticks ?? 0) >= 1);
+
+  // …and stops being claimed once the timer is gone.
+  //
+  // The reading used to outlive the timer it described, for the life of the
+  // session: a plugin that did one expensive pass on its first tick and then
+  // cleared the interval was permanently reported as "its slowest timer
+  // callback blocked the interface for 180 ms" and permanently scored as the
+  // heaviest thing in the vault, with no way out short of restarting Obsidian.
+  window.clearInterval(slow);
+  snapshot = watcher.snapshot();
+  eq("a cleared timer's cost stops being reported", snapshot.beta?.maxTickMs, undefined);
+  eq("and so does its run count", snapshot.beta?.ticks, undefined);
+
+  // The same, via `clearTimeout` — which clears an interval handle perfectly
+  // well and never reaches our `clearInterval` hook, so `snapshot` has to be
+  // the thing that decides, not the unhook.
+  const viaTimeout = asPlugin("beta", () =>
+    window.setInterval(() => {
+      const until = performance.now() + 30;
+      while (performance.now() < until) {
+        /* blocking again */
+      }
+    }, 10)
+  );
+  await sleep(80);
+  check(
+    "a fresh timer is timed again",
+    (watcher.snapshot().beta?.maxTickMs ?? 0) >= 25,
+    `got ${watcher.snapshot().beta?.maxTickMs}ms`
+  );
+  window.clearTimeout(viaTimeout);
+  eq(
+    "clearTimeout on an interval also drops the claim",
+    watcher.snapshot().beta?.maxTickMs,
+    undefined
+  );
 
   // A plugin's own exception must pass straight through the timing wrapper:
   // swallowing it would both break the plugin and hide it from the error watcher.
@@ -278,6 +321,78 @@ async function timerTests(): Promise<void> {
 
   watcher.stop();
   eq("stop() restores setInterval", window.setInterval, beforeSet);
+  eq("stop() restores clearInterval", window.clearInterval, beforeClear);
+  eq("stop() restores clearTimeout", window.clearTimeout, beforeClearTimeout);
+
+  // A SECOND start() must do nothing at all. Without a guard it read
+  // `window.setInterval` — by then OUR wrapper — and saved it as the
+  // "original", so the following stop() put a FlowKit closure back into a
+  // global every other plugin uses, permanently and unremovably.
+  {
+    const nativeSet = window.setInterval;
+    const nativeClear = window.clearInterval;
+    const nativeClearTimeout = window.clearTimeout;
+    const twice = new RuntimeWatcher(app as never, {
+      installedIds: () => new Set(Object.keys(app.manifests)),
+      store: () => store,
+      versionOf: (id) => app.manifests[id]?.version,
+      onChange: () => undefined,
+    });
+    twice.start();
+    const afterFirst = window.setInterval;
+    twice.start();
+    eq("a second start() installs nothing further", window.setInterval, afterFirst);
+    twice.stop();
+    eq("so stop() gives back the native setInterval", window.setInterval, nativeSet);
+    eq("…and clearInterval", window.clearInterval, nativeClear);
+    eq("…and clearTimeout", window.clearTimeout, nativeClearTimeout);
+
+    // And it is still usable afterwards: the guard must not strand the watcher
+    // in a state where start() refuses forever.
+    twice.start();
+    check("a stopped watcher can start again", window.setInterval !== nativeSet);
+    twice.stop();
+    eq("and still restore", window.setInterval, nativeSet);
+
+    // STOP, THEN START, with somebody else's wrapper in between — the ordering
+    // the identity-based restore exists to support, and the one that broke.
+    //
+    // Our wrapper cannot be pulled out from under theirs, so it survives
+    // `stop()` inert. An instance-wide `stopped = false` in `start()` brought
+    // it back, and the chain then held TWO live generations of ours: one
+    // `setInterval` traversed both and the timer was attributed twice.
+    const store3: RuntimeProfiles = {};
+    const resurrect = new RuntimeWatcher(app as never, {
+      installedIds: () => new Set(Object.keys(app.manifests)),
+      store: () => store3,
+      versionOf: (id) => app.manifests[id]?.version,
+      onChange: () => undefined,
+    });
+    resurrect.start();
+    const ourFirst = window.setInterval;
+    // Another plugin wraps on top of ours.
+    const theirs = ((handler: TimerHandler, timeout?: number, ...rest: unknown[]): number =>
+      (ourFirst as (h: TimerHandler, t?: number, ...r: unknown[]) => number)(
+        handler,
+        timeout,
+        ...rest
+      )) as typeof window.setInterval;
+    window.setInterval = theirs;
+    resurrect.stop();
+    eq("a later wrapper is not clobbered on stop", window.setInterval, theirs);
+    resurrect.start();
+
+    const timer = asPlugin("alpha", () =>
+      asPlugin("flowkit-health-dashboard", () => window.setInterval(() => undefined, 777))
+    );
+    const snap = resurrect.snapshot();
+    eq("a timer is counted once, not once per surviving generation", snap.alpha?.timers, 1);
+    window.clearInterval(timer);
+    resurrect.stop();
+    // Ours is still under theirs, so it cannot be removed — put the global back
+    // by hand so the rest of the suite sees a clean window.
+    window.setInterval = nativeSet;
+  }
 
   // If somebody else wrapped setInterval after us, restoring ours would undo
   // theirs. Leaving ours in place is the lesser harm, and it is what happens.
@@ -864,9 +979,24 @@ async function errorWatcherTests(): Promise<void> {
 
   const log: Record<string, PluginErrorRecord> = {};
   let changes = 0;
-  // A minimal stand-in for Obsidian's Plugin: only `registerDomEvent` is used,
-  // and nothing in these assertions goes through the window listeners.
-  const fakePlugin = { registerDomEvent: () => undefined } as unknown as Plugin;
+  // A minimal stand-in for Obsidian's Plugin. It KEEPS every handler it is
+  // given rather than discarding them, which is the only way to test the thing
+  // that actually matters about them: `registerDomEvent` ties a listener to the
+  // PLUGIN's lifetime, so `stop()` cannot take it off the window, and a stub
+  // that threw the handlers away could not have caught either the double
+  // registration or the resurrection of a surviving one.
+  const domHandlers: Array<{ event: string; handler: (evt: unknown) => void }> = [];
+  const fakePlugin = {
+    registerDomEvent: (_target: unknown, event: string, handler: (evt: unknown) => void) => {
+      domHandlers.push({ event, handler });
+    },
+  } as unknown as Plugin;
+  /** Fire one window event at every listener still attached, as the DOM would. */
+  const fireWindow = (event: string, evt: unknown): void => {
+    for (const entry of domHandlers) {
+      if (entry.event === event) entry.handler(evt);
+    }
+  };
   const watcher = new ErrorWatcher(fakePlugin, {
     installedIds: () => new Set(Object.keys(app.manifests)),
     log: () => log,
@@ -929,6 +1059,74 @@ async function errorWatcherTests(): Promise<void> {
     cycle.stop();
   }
   eq("enable/disable cycles give back exactly what they took", console.error, before);
+
+  // A SECOND start() must do nothing. Without a guard it was worse here than
+  // in the sibling class: `registerDomEvent` would add a second `error` and a
+  // second `unhandledrejection` listener, so every uncaught error in the vault
+  // would be recorded TWICE — and Reliability, the one metric drawn from
+  // watching a plugin actually run, would read double. The console wrapper
+  // would also save OUR wrapper as the original and make the restore
+  // impossible.
+  const native = console.error;
+  const twice = new ErrorWatcher(fakePlugin, {
+    installedIds: () => new Set(Object.keys(app.manifests)),
+    log: () => log,
+    onChange: () => undefined,
+  });
+  const registeredBefore = domHandlers.length;
+  twice.start(true);
+  const afterFirst = domHandlers.length;
+  twice.start(true);
+  eq("a second start() registers no further listeners", domHandlers.length, afterFirst);
+  check("and the first one did register some", afterFirst > registeredBefore);
+
+  const doubleBefore = log.alpha?.logged ?? 0;
+  asPlugin("alpha", () =>
+    asPlugin("flowkit-health-dashboard", () => console.error("counted once"))
+  );
+  eq("so an error is counted once, not twice", (log.alpha?.logged ?? 0) - doubleBefore, 1);
+
+  twice.stop();
+  eq("and stop() still gives back the native function", console.error, native);
+
+  // STOP, THEN START. The guard above only covers a repeated `start()` with no
+  // `stop()` in between, and the harder case is the other one: `stop()` cannot
+  // unregister the window listeners — `registerDomEvent` ties them to the
+  // plugin, not to this class — so they stay attached, inert. An instance-wide
+  // `stopped = false` in `start()` brought every one of them back to life and
+  // then added another pair, so one uncaught error reached both generations and
+  // was recorded twice. Reliability is the one metric drawn from watching a
+  // plugin actually run, and it read double.
+  {
+    const cycled = new ErrorWatcher(fakePlugin, {
+      installedIds: () => new Set(Object.keys(app.manifests)),
+      log: () => log,
+      onChange: () => undefined,
+    });
+    cycled.start(false);
+    cycled.stop();
+    cycled.start(false);
+    check(
+      "stop() leaves its listeners attached (which is why this matters)",
+      domHandlers.length >= afterFirst + 4,
+      `${domHandlers.length} handlers`
+    );
+
+    const before = log.alpha?.uncaught ?? 0;
+    const thrown = asPlugin("alpha", () => new Error("boom"));
+    fireWindow("error", { message: "boom", error: thrown });
+    eq(
+      "an uncaught error is recorded once across both listener generations",
+      (log.alpha?.uncaught ?? 0) - before,
+      1
+    );
+
+    // …and once stopped for good, neither generation records anything.
+    cycled.stop();
+    const after = log.alpha?.uncaught ?? 0;
+    fireWindow("error", { message: "boom", error: asPlugin("alpha", () => new Error("boom")) });
+    eq("and nothing at all once stopped", log.alpha?.uncaught ?? 0, after);
+  }
   console.error = pristine;
 }
 

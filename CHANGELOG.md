@@ -5,12 +5,251 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-- Added before/after health experiments with per-plugin deltas.
-- Added conservative compatibility forecasts for the next Obsidian minor
-  release.
-- Added persisted last-known-good restore and safe-mode sessions.
-- Added numeric regression detection and richer since-last-look timelines that
-  include install, update, and removal events.
+## [1.8.0] - 2026-10-16
+
+The remediation features that had been sitting unreleased, plus a fourth
+adversarial review: two completed rounds with two outside models, the second of
+which existed only to break the first round's fixes, and a third pass done here
+against the result of both.
+
+The headline finding is the worst kind. `escapeLiteral` arrived with the 1.7.1
+redaction rewrite, and it meant two features were completely dead on essentially
+every real vault from the moment that version shipped — and dead so quietly that
+nothing anywhere said so. 1.7.1's own release notes are three paragraphs about
+getting the redaction right.
+
+### New
+
+- **Before/after health experiments.** Save a baseline, change a plugin set,
+  compare aggregate and per-plugin deltas.
+- **Conservative next-release compatibility forecasts** for plugins that declare
+  a minimum Obsidian version.
+- **Last-known-good restore and safe mode**, both persisted, so a vault that is
+  deliberately minimal survives a restart knowing how to get back.
+- **Numeric regression detection**, and a since-you-last-looked timeline that
+  includes installs, updates and removals rather than only health transitions.
+
+### "Is this a known issue?" and "Copy bug report" were dead, silently
+
+Both build a redactor from every file and folder name in the vault before they do
+anything else. `escapeLiteral` emitted `\-` for a hyphen — and `\-` is an illegal
+identity escape under the `u` flag those patterns need for `\p{L}`. So compiling
+the names threw a `SyntaxError`, and **one hyphenated file or folder anywhere in
+the vault was enough**. A hyphen is the commonest character in a note filename
+there is: `2026-10-16.md` is what the core Daily notes plugin produces by
+default.
+
+Nothing leaked — the throw happens before any text is assembled — but the two
+features did nothing at all. "Copy bug report" showed no message, wrote no
+clipboard, and logged nothing, because the rejection escaped into the one
+listener FlowKit tells to ignore its own frames. "Is this a known issue?" left
+its button reading "Looking…", disabled, for the life of the view.
+
+- **Fixed the escape** (`\x2d`, which is legal under `u`), and added the test
+  corpus that would have caught it. The existing corpus was all dramatic names —
+  HIV results, divorce settlements — and every one of them was hyphen-free. The
+  new block is deliberately boring: daily notes, kebab-case, `Pasted image
+  20261016-1.png`.
+- **Both buttons now report their own failure** instead of failing into silence,
+  and a failed search puts its button back.
+
+### Redaction: a real gap closed, and no longer linear in the vault
+
+- **A short name is now redacted when it is quoted.** Under four characters a
+  name was dropped entirely, because a folder called `lib` matched everywhere
+  would blank every module path in the report. But `Failed to open note "HIV"` is
+  exactly how an error message names a note, and a three-letter title can be the
+  most sensitive string in a vault. Quoted occurrences now go; bare words and
+  path segments still do not, so `markdown-it/lib/token` survives verbatim.
+- **The remaining limit is now disclosed** where it matters — in the copy
+  confirmation and in the README — instead of the previous absolute claim that
+  file names "are redacted".
+- **Redaction is no longer linear in the size of the vault per string.** It
+  compiled one regex per name and ran one pass per name over the text: 67 ms for
+  a single 1.9 KB stack trace against a 30,000-name vault, and the bug report
+  redacts up to ten strings. It now scans with chunked alternations and resolves
+  overlaps explicitly, longest match wins — 21 ms for the same input.
+
+### Two recorders wrote down a vault FlowKit itself had taken apart
+
+`recordingSuspended()` exists so that nothing is recorded while FlowKit has
+plugins switched off for a search, a profiling run, or safe mode. Three recorders
+ask it. Two did not.
+
+- **`updateLastKnownGood` now asks.** This is the worst place in the product to
+  be wrong about whose vault it is looking at, because what it writes down is the
+  way back. Mid-search, `isLastKnownGood` only sees the plugins still running —
+  so round one of a search over forty healthy plugins looked like a flawless
+  twenty-plugin vault and **overwrote "Last known good" with a bisect round**.
+  The view rescans after every transition, so it happened on each one.
+- **`recordHealthReading` now asks.** It stores each plugin's enabled flag, and
+  regression detection needs it on both sides — so a scan taken mid-search wrote
+  `enabled: false` and destroyed the baseline it documents itself as preserving.
+  After the search put everything back, the next real regression for every plugin
+  it had touched read as a first observation and went unreported.
+
+### Reliability stopped flattering plugins installed yesterday
+
+- **The error rate is divided by this plugin's own observation window**, not by
+  how long FlowKit has been watching the vault. A plugin installed yesterday that
+  threw twenty unhandled errors was divided by six months: a rate of 0.11 a day,
+  **Reliability 95**, printed beside the cell reading "20 unhandled errors · last
+  seen in the last hour". The window is now the shorter of the two, floored at
+  the six-hour threshold so one fresh error is not divided by two minutes.
+- **And the sentence beside it stopped projecting** from a window too short to
+  project from. Twenty errors inside that floor is a rate of eighty a day, and
+  "about 80 a day" about twenty errors seen this morning invents seventy-nine of
+  them. Under two days it now reports what was counted and over what span
+  actually elapsed; past that it still gives a daily rate.
+
+### A mute saying "until Obsidian updates" was deleted by a device that had not
+
+- **It lapses only when Obsidian is NEWER than the version pinned.** It lapsed
+  whenever the version merely *differed*, and the sweep writes its survivors back
+  over the shared `data.json` — so a phone on 1.6.7 syncing a desktop's 1.7.2
+  mute declared it expired, announced the lapse, and **deleted it from the file**.
+  The desktop read back a vault with the mute gone and nothing updated, and the
+  older device did it again on every scan, so it could not be re-set either.
+
+### Runtime measurement stopped claiming a timer that no longer exists
+
+- **A cleared timer's cost is no longer reported.** `maxTickMs` is phrased and
+  scored in the present tense, and the record outlived the timer for the whole
+  session: a plugin that did one expensive pass on its first tick and then cleared
+  the interval was permanently described as the heaviest thing in the vault, with
+  no way out short of restarting Obsidian.
+- **`window.clearTimeout` is watched too**, and disclosed in the README. Browsers
+  let it cancel an interval handle, and plenty of code clears every handle it owns
+  the same way — a path that never reached the `clearInterval` hook, so the timer
+  stayed live in FlowKit's map and its count, its period and its callback cost
+  were all reported as current.
+- **"Blocks the interface for 180 ms each time that timer fires" is gone.**
+  `maxTickMs` is the worst single run observed, not the typical one. It now says
+  so, and says how many runs it was drawn from.
+- **Both watchers have an idempotent `start()`.** Neither is called twice today,
+  so this is a guard against the next caller rather than a symptom — but the
+  second call was destructive, not redundant. `RuntimeWatcher` would read our own
+  wrapper, save it as "the original", and leave a FlowKit closure in a global
+  every other plugin uses that no later `stop()` could remove. `ErrorWatcher` was
+  worse: a second `registerDomEvent` pair means **every uncaught error in the
+  vault counted twice**, and Reliability reading double.
+
+### Smaller, and every one of them something the product said that was not so
+
+- **"No recorded update in 18+ months" is no longer asserted for an archived
+  repository.** An archived or deleted repo earns "unmaintained" on its own
+  whatever the release history says, so a plugin released last month whose author
+  archived the repo was listed under a sentence claiming a year and a half of
+  silence. The card now names the reason it actually has.
+- **`healthReadings` is pruned.** It was the one per-plugin store `pruneStores`
+  never reached, and the largest — each entry carries a copy of the whole vault
+  reading beside the single plugin it is about. A vault that had churned through a
+  hundred plugins carried a hundred of them in every write, forever.
+- **Profiling refuses over a vault that could not be restored.** The guard read
+  `bisect && !bisect.done` directly rather than asking `bisectOwnsPage()`, so it
+  opened the instant a search finished — including the path that finishes *unable
+  to switch plugins back on* and deliberately leaves the session on disk. It also
+  now refuses during safe mode, where every plugin it "restores" it restores to
+  off.
+- **`isRepoSlug` rejects a dot-only path segment.** `[\w.-]+` matched `..`, and
+  `api.github.com/repos/../user` is normalised to a different endpoint before it
+  is sent. The comment at that call site has always claimed the value is not
+  interpolated unchecked; now it is not.
+- **Mute, Watch and the bulk fixes report their own failures.** All three end in a
+  settings write, and on a read-only or sync-locked vault a bare `void` meant the
+  button said nothing whatsoever.
+- **The pre-release network probe passes again.** One of its sixteen checks
+  still expected "nothing searchable" to come back as an empty *success* — the
+  shape 1.7.1 deliberately replaced, because an empty success made the UI report
+  "Nothing matching in their tracker" about a search it had never run. The probe
+  was never updated, so it has failed on every run since, and a pre-release check
+  that always reports one failure is one nobody reads.
+- **Removed `previousSnapshot`.** Nothing called it — the trend chart takes its
+  baseline from the points it actually drew — and what it did was return the
+  newest reading from *any* device, which is a trap sitting next to a feature
+  whose whole 1.7.0 release was about not mixing devices.
+
+### What the second round found in the first round's fixes
+
+Most of these are defects in one of the fixes above rather than in 1.7.1, which
+is the reason for going round again at all. Two of them are older than this
+release and were only found because that round was reading the code closely:
+the prerelease ordering, and the build-metadata parsing beside it.
+
+- **A stopped watcher stays stopped.** Both watchers made a surviving wrapper
+  inert with one flag on the instance, and `start()` cleared it — which
+  *reactivated* every hook and listener a previous run had left behind, then
+  installed another set. `stop()` cannot unregister the window listeners
+  (`registerDomEvent` ties them to the plugin, not to the watcher) and cannot
+  unhook a `console.error` somebody else has since wrapped, so both generations
+  were then live: one uncaught error reached both and **was recorded twice**,
+  and Reliability read double. Liveness is now a per-run token captured by each
+  wrapper and listener, so a stopped run cannot be revived by a later one.
+- **Prerelease versions are ordered by semver, not alphabetically.** The
+  comparison was a string compare, so `insider.10` sorted *below* `insider.9`
+  and every numeric suffix from ten onwards came out backwards. That reached a
+  user through the mute change above: asked "is Obsidian newer than the version
+  this mute was pinned to", a genuine update from insider.9 to insider.10
+  answered no, and the mute survived the very event it was written to lapse on.
+  Identifiers now compare one at a time, numerically where they are numeric —
+  and the result was checked against the reference `semver` implementation over
+  every ordered pair of a 6,400-pair corpus, which it now matches exactly.
+- **Build metadata is no longer read as a prerelease tag.** `1.0.0+build` parsed
+  as the prerelease "build" and sorted below plain `1.0.0`, so an installed
+  `1.2.3+abc` wore an Update badge pointing at the `1.2.3` it already was.
+- **A clock-skewed error record no longer fabricates a six-hour history.** The
+  new per-plugin window clamped a negative elapsed time to zero and then raised
+  it to the six-hour floor — so a `firstAt` written by a synced machine with a
+  wrong clock turned one error into a rate of four a day and dropped Reliability
+  from 98 to 55, with a sentence beside it calling a future error recent. A
+  timestamp that cannot be true is not evidence: the window falls back to the
+  whole watching period, and the sentence falls back with it, from the same
+  helper so the two cannot disagree.
+- **The redactor's longest-match rule is enforced, not assumed.** The first
+  rewrite used a plain alternation, which consumes what it matches — so a
+  shorter name matching earlier hid a longer one starting inside it. With the
+  folder "Project Alice" and the note "Alice Nguyen HIV results", the folder was
+  redacted and **the note published**. The scan is a zero-width lookahead for
+  that reason, with overlaps resolved explicitly.
+- **Redactor patterns are chunked by characters as well as by count**, so a
+  vault of long nested paths cannot build a pattern large enough to risk a
+  compile failure — the failure mode that killed the feature in the first place.
+- **A load measurement is dropped if the watcher stopped mid-load.** The plugin
+  loader wrapper is the one hook here with a real suspension point in it, and it
+  recorded on the far side of the `await` without re-checking.
+- **The unmaintained card distinguishes a deleted repository from an archived
+  one.** The mixed-cohort wording said "an archived repository" and nothing
+  else, so a recently-released plugin whose repository had been *deleted* was
+  described as archived — true of neither its releases nor its repository. The
+  sentence is now built from the reasons the cohort actually has.
+
+### Still to do, and carried forward deliberately
+
+1.7.1 named the central charge against this project: each release fixes instances
+rather than classes. Nine fields in the synced `data.json` describe a *machine*
+rather than the vault, and 1.7.0 made two of them device-aware. This release
+makes one more of them — `mutes[].untilAppVersion` — stop *destroying* data
+across devices, and that is the symptom, not the class. The honest accounting:
+
+- **Fixed the harm, not the shape.** An older device can no longer delete a mute
+  the newer one set, because the comparison is now directional. But the record
+  still has no idea which machine made the claim, so "it's fine on 1.7.2" is
+  still a sentence with no author.
+- **Still not device-aware:** `errorLog`, `watchingSince`, `runtimeProfiles`,
+  `lastApiVersion`/`appVersionChange`, `events`, and `bisect`. The consequences
+  are unchanged and real: Reliability and Footprint are 40% of every score and
+  both are computed partly from other machines' measurements, and a search
+  running on a desktop will still offer a phone the chance to apply the
+  desktop's disabled list to its own plugins.
+- **The reliability window makes one of those slightly worse, not better.** It
+  now bounds a plugin's error rate by its own `firstAt` — which is a timestamp
+  written by whichever machine saw the error first. That is more honest than
+  dividing by the whole watching period and it is still not this machine's
+  observation of this plugin.
+
+That remains one enumerable question — *which fields describe a machine rather
+than a vault* — and it still deserves to be answered once, in one container,
+with tests, rather than one more field per release. It is the next release.
 
 ## [1.7.1] - 2026-08-03
 

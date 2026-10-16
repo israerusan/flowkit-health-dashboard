@@ -430,12 +430,35 @@ switched off or simply not used:
 |---|---|---|
 | Community plugin list + download stats | On open/refresh, cached a day. Off with **Online enrichment**. | Nothing — plain public file downloads |
 | `api.github.com/repos/{owner}/{repo}` | Only with **Check repository activity** on (off by default), a few per scan, cached a week | A repository name that is already public |
-| `api.github.com/search/issues` | Only when you press **"Is this a known issue?"** on a recorded error | That repository name and the error message text |
+| `api.github.com/search/issues` | Only when you press **"Is this a known issue?"** on a recorded error | That repository name and the error message text, redacted (below) |
 
 No accounts, no analytics, no identifiers, and nothing about your notes or vault
 is ever transmitted. Error messages and stack traces stay on your machine — the
 issue search sends only the message text of the error you explicitly asked it to
 look up, and only when you press the button.
+
+### What redaction actually does, and what it can't
+
+Two things carry error text off this machine: the issue search above, and **Copy
+bug report**, which exists to be pasted into somebody else's tracker. In a
+note-taking app the file name *is* the content — `Patients/Alice Nguyen HIV
+results.md` is not incidental detail — and error messages quote the file being
+touched.
+
+So both run the text through a redactor built from your vault's own file and
+folder names, rather than from a guess about what a path looks like. Your names
+are matched literally and replaced with `…`; absolute paths, URLs, wiki links
+and email addresses go too. Ordinary diagnostic text is deliberately left
+intact, because a report with the diagnosis stripped out is no use to the author
+you are sending it to: `Cannot find module markdown-it/lib/token` goes as
+written.
+
+One honest limit. A name shorter than four characters is only redacted when it
+appears **in quotes** — the way an error message names a note, as in `Failed to
+open note "HIV"`. Matched everywhere, a folder called `lib` or a note called
+`and` would blank every module path and half of every sentence in the report.
+So a very short name used as an ordinary word can survive, and the copy
+confirmation says so. **Read the report before you post it.**
 - **Check repository activity** — ask GitHub whether a plugin's repository is
   archived or still being pushed to, so *finished* and *abandoned* stop looking
   identical. **Off by default**: it is the only thing here that talks to an API
@@ -447,11 +470,17 @@ look up, and only when you press the button.
   big it is. Only measurements FlowKit witnesses are used; a plugin it couldn't
   observe is never penalised for it.
 
-  To do this it wraps `window.setInterval` and Obsidian's plugin loader while
-  it runs, so it can see which plugin created a timer and how long each load
-  and each callback takes. Both wrappers pass straight through to the originals,
-  record nothing but timings, and are removed when FlowKit unloads. Turn this
-  off and none of it happens. Nothing measured here leaves your machine.
+  To do this it wraps four things while it runs — `window.setInterval`,
+  `window.clearInterval`, `window.clearTimeout` and Obsidian's plugin loader —
+  so it can see which plugin created a timer, when that timer goes away again,
+  and how long each load and each callback takes. (`clearTimeout` is watched
+  only to notice a timer being cancelled: browsers let it cancel an interval,
+  and without it FlowKit would go on reporting a timer that no longer exists.)
+  Every wrapper passes straight through to the original, records nothing but
+  timings, and is taken back out when FlowKit unloads — or, if another plugin
+  has wrapped on top of it by then, is left in place and made permanently inert,
+  because pulling ours out from under theirs would break theirs. Turn this off
+  and none of it happens. Nothing measured here leaves your machine.
 - **Show disabled plugins** — include installed-but-disabled plugins.
 - **Re-download community data on open** — off by default; the cached scan is
   reused for a day, and Refresh always refetches.

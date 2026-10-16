@@ -143,6 +143,59 @@ export function recordError(
 export const MIN_OBSERVATION_MS = 6 * 60 * 60 * 1000;
 
 /**
+ * How long THIS plugin's errors should be measured against.
+ *
+ * `observedMs` is how long FlowKit has been watching the vault, and dividing
+ * every plugin's error count by it was wrong in one direction and badly so. A
+ * plugin installed yesterday that threw twenty unhandled errors was divided by
+ * six months of watching: a rate of 0.11 a day, a Reliability of 95, and a row
+ * that read "20 unhandled errors · last seen in the last hour" beside it. The
+ * score said the plugin was fine and the cell next to it said it was on fire —
+ * the same self-contradiction `scoreReliability` was rewritten twice to remove,
+ * in the one input neither rewrite touched.
+ *
+ * The honest window is the shorter of: how long FlowKit has been watching, and
+ * how long this plugin has been throwing. `firstAt` gives the second, floored
+ * at `MIN_OBSERVATION_MS` — the same threshold that decides when silence starts
+ * to mean something, used here so that a single error two minutes ago is not
+ * divided by two minutes and read as a catastrophe.
+ */
+export function observationWindowMs(
+  record: PluginErrorRecord | undefined,
+  observedMs: number,
+  now: number
+): number {
+  const since = elapsedSinceFirstError(record, now);
+  // No usable `firstAt` means no per-plugin bound, so fall back to the whole
+  // watching period — the behaviour this function narrowed. See
+  // `elapsedSinceFirstError` for why that matters.
+  if (since == null) return Math.max(0, observedMs);
+  return Math.min(observedMs, Math.max(since, MIN_OBSERVATION_MS));
+}
+
+/**
+ * How long ago this plugin's first recorded error was, or `null` when the
+ * record cannot say.
+ *
+ * `null` specifically covers a `firstAt` in the FUTURE, and that case has to be
+ * refused rather than clamped. `data.json` is synced, and a machine with a
+ * wrong clock writes timestamps ahead of this one's — at which point clamping
+ * the elapsed time to zero and then raising it to the six-hour floor invents a
+ * six-hour observation history for a plugin whose first error has not happened
+ * yet. One error became a rate of four a day and dropped Reliability from 98 to
+ * 55 on nothing but clock skew, with a sentence beside it describing the error
+ * as recent. A bad clock is not evidence about a plugin.
+ */
+export function elapsedSinceFirstError(
+  record: PluginErrorRecord | undefined,
+  now: number
+): number | null {
+  if (!record || !Number.isFinite(record.firstAt)) return null;
+  if (record.firstAt > now) return null;
+  return now - record.firstAt;
+}
+
+/**
  * Errors per day, from the uncaught count only.
  *
  * `console.error` is deliberately excluded from the score. Plenty of
@@ -153,10 +206,11 @@ export const MIN_OBSERVATION_MS = 6 * 60 * 60 * 1000;
  */
 export function errorRatePerDay(
   record: PluginErrorRecord | undefined,
-  observedMs: number
+  observedMs: number,
+  now = Date.now()
 ): number {
   if (!record || observedMs <= 0) return 0;
-  const days = Math.max(1 / 24, observedMs / 86_400_000);
+  const days = Math.max(1 / 24, observationWindowMs(record, observedMs, now) / 86_400_000);
   return record.uncaught / days;
 }
 

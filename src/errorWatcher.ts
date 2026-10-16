@@ -53,18 +53,32 @@ export class ErrorWatcher {
   /** Guards against an error thrown *by* our handler re-entering it. */
   private handling = false;
   /**
-   * Set once `stop()` has run.
+   * The current run's liveness token, or `null` once stopped.
    *
-   * `RuntimeWatcher` learned this in 1.6.0 and this class did not, which is the
-   * whole of the bug: a `console.error` wrapper that somebody else has since
-   * wrapped cannot be removed, so it survives unload holding this watcher and,
-   * through the host, the unloaded plugin's settings. Every logged error in the
-   * vault then went on being attributed, written into a dead instance's error
-   * log, and flushed through `onChange()` — which saves `data.json` and asks
-   * for a rescan. A disabled plugin quietly kept rewriting its own settings
-   * file. The wrapper can't be unhooked, so it is made inert instead.
+   * Every hook and every listener this class installs closes over the token
+   * that was current when it was installed, and checks THAT rather than a field
+   * on the instance. The difference is the whole of a lifecycle bug.
+   *
+   * Why anything has to be made inert at all: a `console.error` wrapper that
+   * somebody else has since wrapped cannot be removed, so it survives `stop()`
+   * holding this watcher and, through the host, the unloaded plugin's settings.
+   * Every logged error in the vault then went on being attributed, written into
+   * a dead instance's error log, and flushed through `onChange()` — which saves
+   * `data.json` and asks for a rescan. A disabled plugin quietly kept rewriting
+   * its own settings file. `RuntimeWatcher` learned that in 1.6.0 and this
+   * class did not; it was fixed here with an instance-wide `stopped` flag.
+   *
+   * Why the flag was not enough: `stop()` cannot unregister the window
+   * listeners either — `registerDomEvent` ties them to the plugin's own
+   * lifetime, not to this class's — so they also survive, inert. A later
+   * `start()` set `stopped = false`, which REACTIVATED every one of them, and
+   * then registered a second pair. One uncaught error afterwards reached both
+   * generations and was recorded twice, and Reliability — the one metric drawn
+   * from watching a plugin actually run — read double. Per-generation tokens
+   * make a stopped run stay stopped: the old listeners see a dead token and
+   * return, whatever happens afterwards.
    */
-  private stopped = false;
+  private run: { live: boolean } | null = null;
   /** Errors seen since the last flush, so a loop doesn't mean a write per iteration. */
   private dirty = false;
   private flushTimer: number | null = null;
@@ -74,10 +88,29 @@ export class ErrorWatcher {
     private host: ErrorWatcherHost
   ) {}
 
-  /** Attach the listeners. Safe to call once, from onload. */
+  /**
+   * Whether the listeners are currently attached.
+   *
+   * "Safe to call once" was a comment, not a guarantee, and here the second
+   * call is worse than in the sibling class. `registerDomEvent` adds a
+   * listener; calling `start()` twice adds a second `error` and a second
+   * `unhandledrejection` listener, and `observe` is reached once per listener
+   * — so every uncaught error in the vault would be counted TWICE, and the
+   * Reliability metric, which is the one signal here drawn from watching a
+   * plugin actually run, would read double. The console wrapper would likewise
+   * save our own wrapper as `originalConsoleError` and make the restore
+   * impossible, exactly as in `RuntimeWatcher`.
+   */
+  private started = false;
+
+  /** Attach the listeners. Idempotent; call it from onload. */
   start(captureConsole: boolean): void {
-    this.stopped = false;
+    if (this.started) return;
+    this.started = true;
+    const run = { live: true };
+    this.run = run;
     this.plugin.registerDomEvent(window, "error", (evt: ErrorEvent) => {
+      if (!run.live) return;
       this.observe({
         kind: "uncaught",
         message: evt.message || String(evt.error ?? "Unknown error"),
@@ -89,6 +122,7 @@ export class ErrorWatcher {
       window,
       "unhandledrejection",
       (evt: PromiseRejectionEvent) => {
+        if (!run.live) return;
         const reason: unknown = evt.reason;
         this.observe({
           kind: "rejection",
@@ -98,7 +132,7 @@ export class ErrorWatcher {
       }
     );
 
-    if (captureConsole) this.wrapConsole();
+    if (captureConsole) this.wrapConsole(run);
   }
 
   /**
@@ -107,7 +141,7 @@ export class ErrorWatcher {
    * "this stopped working" with nothing in the UI to show for it. Capturing
    * that is most of the value, so it is worth the monkey-patch.
    */
-  private wrapConsole(): void {
+  private wrapConsole(run: { live: boolean }): void {
     // Keep the RAW reference for restoring and a bound copy for calling. This
     // stored the bound copy and restored *that*, so every disable/enable cycle
     // laminated another `.bind` onto a global other plugins also use — the same
@@ -120,8 +154,10 @@ export class ErrorWatcher {
       // Always pass through first: whatever we do next must not swallow the
       // user's own console output or the devtools experience.
       original(...args);
-      // Once stopped this is a pass-through and nothing more — see `stopped`.
-      if (this.stopped) return;
+      // Once this run is over the wrapper is a pass-through and nothing more —
+      // see `run`. Keyed on the token it was installed with, so a later
+      // `start()` cannot bring it back to life.
+      if (!run.live) return;
       const err = args.find((a): a is Error => a instanceof Error);
       const message = err
         ? err.message
@@ -143,9 +179,13 @@ export class ErrorWatcher {
 
   /** Restore console.error, but only if nobody has wrapped it since we did. */
   stop(): void {
-    // Set FIRST, and before anything is unwrapped: a wrapper that survives this
-    // call must already be inert by the time it can next be entered.
-    this.stopped = true;
+    // Killed FIRST, and before anything is unwrapped: a wrapper or listener
+    // that survives this call must already be inert by the time it can next be
+    // entered.
+    const run = this.run;
+    if (run) run.live = false;
+    this.run = null;
+    this.started = false;
     if (this.flushTimer != null) {
       window.clearTimeout(this.flushTimer);
       this.flushTimer = null;
@@ -161,17 +201,20 @@ export class ErrorWatcher {
       console.error = this.originalConsoleError;
     }
     // If another plugin wrapped console.error after us, restoring would undo
-    // their wrapper too. Leaving ours in place is the lesser harm — and
-    // `stopped` is what makes that true: the survivor now only calls through.
+    // their wrapper too. Leaving ours in place is the lesser harm — and the
+    // dead token is what makes that true: the survivor now only calls through,
+    // and no later `start()` can revive it.
     this.originalConsoleError = null;
     this.myWrapper = null;
   }
 
   private observe(partial: Omit<ObservedError, "pluginId" | "at">): void {
-    // The window listeners go through `registerDomEvent` and are removed for
-    // us, but a surviving console wrapper does not — so this is the choke point
-    // that has to refuse.
-    if (this.stopped || this.handling) return;
+    // The choke point for everything that survives `stop()`, which is more
+    // than it used to say here: `registerDomEvent` ties the window listeners to
+    // the PLUGIN's lifetime, not to this class's, so a `stop()` without an
+    // unload leaves them attached exactly as it leaves an over-wrapped
+    // `console.error` attached. Both are refused the same way.
+    if (!this.run?.live || this.handling) return;
     this.handling = true;
     try {
       const installed = this.host.installedIds();
@@ -207,10 +250,11 @@ export class ErrorWatcher {
     // Belt and braces: nothing should reach here after `stop()`, and arming a
     // timeout that calls into an unloaded host is the outcome worth ruling out
     // twice.
-    if (this.stopped || this.flushTimer != null) return;
+    if (!this.run?.live || this.flushTimer != null) return;
+    const run = this.run;
     this.flushTimer = window.setTimeout(() => {
       this.flushTimer = null;
-      if (this.stopped || !this.dirty) return;
+      if (!run.live || !this.dirty) return;
       this.dirty = false;
       this.host.onChange();
     }, 5000);

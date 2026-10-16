@@ -2115,8 +2115,30 @@ export class HealthDashboardView extends ItemView {
     // search's state, not the user's — so it doesn't destroy the record, but it
     // does churn a vault that is deliberately half off and make the round's
     // question meaningless while it runs.
-    if (this.plugin.bisect && !this.plugin.bisect.done) {
-      new Notice("Finish or stop the plugin search first — profiling would restart the plugins it has switched off.", 8000);
+    // Via the helper, not a hand-rolled `!done`. `bisectOwnsPage()` exists for
+    // exactly this question, and the hand-rolled version misses the case it was
+    // introduced for: a search that reached `done` but could NOT put the
+    // plugins back is deliberately left on disk, and this guard opened the
+    // moment `done` was set — so profiling would cheerfully restart forty
+    // plugins on top of a vault FlowKit had just recorded it was unable to
+    // restore, and then "restore each to the state it found it in", which is
+    // the broken state. The status bar was fixed for this in 1.6.1; this was
+    // the other site reading the flag directly.
+    if (this.plugin.bisectOwnsPage()) {
+      new Notice(
+        "Finish or stop the plugin search first — profiling would restart the plugins it has switched off.",
+        8000
+      );
+      return;
+    }
+    // Safe mode is the same situation by a different route: the vault is
+    // deliberately minimal, so every plugin profiling "restores" it restores to
+    // off, and the run measures a vault nobody is using.
+    if (this.plugin.settings.safeMode) {
+      new Notice(
+        "Leave safe mode first — profiling would only measure the plugins safe mode has left running.",
+        8000
+      );
       return;
     }
     if (!this.plugin.isPro) {
@@ -2423,7 +2445,14 @@ export class HealthDashboardView extends ItemView {
       confirmLabel: disabling
         ? `Disable ${rows.length}`
         : `Mute ${rows.length}`,
-      onConfirm: () => void this.applyBulk(action, rows.map((r) => r.id)),
+      // Through `act`, like every other action a user asked for: `applyBulk`
+      // ends in a settings write, and on a read-only or sync-locked vault a
+      // bare `void` meant the button reported nothing at all — see `act`.
+      onConfirm: () =>
+        this.act(
+          this.applyBulk(action, rows.map((r) => r.id)),
+          disabling ? "Couldn't disable those plugins" : "Couldn't mute those plugins"
+        ),
     }).open();
   }
 
@@ -2466,7 +2495,11 @@ export class HealthDashboardView extends ItemView {
       if (r.repo) {
         const lookup = item.createDiv({ cls: "flowkit-error-lookup" });
         const ask = lookup.createEl("button", { text: "Is this a known issue?" });
-        ask.onclick = () => void this.lookUpIssue(r, sig.message, lookup, ask);
+        ask.onclick = () =>
+          this.act(
+            this.lookUpIssue(r, sig.message, lookup, ask),
+            "Couldn't search that issue tracker"
+          );
       }
 
       if (!sig.stack) continue;
@@ -2525,7 +2558,19 @@ export class HealthDashboardView extends ItemView {
   ): Promise<void> {
     trigger.disabled = true;
     trigger.setText("Looking…");
-    const result = await findKnownIssues(r.repo, message, this.redactor());
+    // The button is already in its pending state, so anything that throws from
+    // here on has to put it back or the row keeps a dead "Looking…" control for
+    // the life of the view. Building the redactor is inside the try for exactly
+    // that reason — it reads the whole vault and is the one step here that can
+    // fail before any request is made.
+    let result: Awaited<ReturnType<typeof findKnownIssues>>;
+    try {
+      result = await findKnownIssues(r.repo, message, this.redactor());
+    } catch (err) {
+      trigger.disabled = false;
+      trigger.setText("Is this a known issue?");
+      throw err;
+    }
     trigger.remove();
 
     if (!result.ok) {
@@ -2627,9 +2672,18 @@ export class HealthDashboardView extends ItemView {
       await navigator.clipboard.writeText(lines.join("\n"));
       // Says what was included, because the user is about to publish it, and
       // "paste it into an issue" was the whole of the previous disclosure.
+      //
+      // And says what is NOT covered, because "file names and paths are
+      // redacted" was an absolute claim the redactor does not make: a name
+      // under four characters is only matched inside quotes, deliberately, so
+      // that a folder called "lib" cannot blank every module path in the
+      // report. That is a defensible trade-off and an indefensible thing to
+      // leave unsaid one keystroke before the text is posted in public.
       new Notice(
-        "Bug report copied. File names and paths are redacted — check it before you post it.",
-        8000
+        "Bug report copied. Your file and folder names are redacted — except a very short " +
+          "name used as an ordinary word, which FlowKit can't tell apart from one. Read it " +
+          "before you post it.",
+        10_000
       );
     } catch (err) {
       console.error("FlowKit: clipboard write failed", err);
@@ -3141,19 +3195,24 @@ export class HealthDashboardView extends ItemView {
     }
     if (r.errors?.signatures.length) {
       const report = actions.createEl("button", { cls: "mod-cta", text: "Copy bug report" });
-      report.onclick = () => void this.copyBugReport(r);
+      // Through `act`, not a bare `void`. Assembling the report builds a
+      // redactor over every name in the vault, and when that threw the button
+      // did nothing at all — no clipboard, no message, no console line, because
+      // the rejection escaped into the one listener that is told to ignore
+      // FlowKit's own frames. Silence is the worst available failure here.
+      report.onclick = () => this.act(this.copyBugReport(r), "Couldn't build the bug report");
     }
     const watch = actions.createEl("button", {
       text: r.watched ? "Stop watching" : "Watch this",
     });
     watch.onclick = () => {
-      void this.toggleWatch(r);
+      this.act(this.toggleWatch(r), `Couldn't change whether ${r.name} is watched`);
     };
     const mute = actions.createEl("button", {
       text: r.muted ? "Unmute" : "Mute from counts…",
     });
     mute.onclick = () => {
-      void this.toggleMute(r);
+      this.act(this.toggleMute(r), `Couldn't change the mute on ${r.name}`);
     };
   }
 
@@ -3412,7 +3471,7 @@ export class HealthDashboardView extends ItemView {
         item
           .setTitle("Copy bug report")
           .setIcon("clipboard-list")
-          .onClick(() => void this.copyBugReport(r))
+          .onClick(() => this.act(this.copyBugReport(r), "Couldn't build the bug report"))
       );
     }
 
@@ -3430,13 +3489,15 @@ export class HealthDashboardView extends ItemView {
       item
         .setTitle(r.watched ? "Stop watching" : "Watch this plugin")
         .setIcon(r.watched ? "star-off" : "star")
-        .onClick(() => void this.toggleWatch(r))
+        .onClick(() =>
+          this.act(this.toggleWatch(r), `Couldn't change whether ${r.name} is watched`)
+        )
     );
     menu.addItem((item) =>
       item
         .setTitle(r.muted ? "Unmute plugin" : "Mute from counts…")
         .setIcon(r.muted ? "bell" : "bell-off")
-        .onClick(() => void this.toggleMute(r))
+        .onClick(() => this.act(this.toggleMute(r), `Couldn't change the mute on ${r.name}`))
     );
 
     menu.showAtMouseEvent(evt);

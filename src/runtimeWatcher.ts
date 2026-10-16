@@ -108,6 +108,24 @@ interface TickRecord {
 export class RuntimeWatcher {
   private originalSetInterval: SetIntervalFn | null = null;
   private originalClearInterval: ClearIntervalFn | null = null;
+  /**
+   * `clearTimeout` is watched too, and only to forget timers.
+   *
+   * Browsers share one id space between the timeout and interval families, and
+   * `clearTimeout(intervalId)` cancels an interval perfectly well — the spec
+   * says so and plenty of code does it, usually by holding every handle it owns
+   * in one list and clearing them all the same way on unload. That path never
+   * reached the `clearInterval` hook, so the timer stayed in the live map for
+   * the rest of the session and FlowKit went on reporting a plugin's timer
+   * count, its polling period and its slowest callback — all in the present
+   * tense, about a timer that had been cancelled.
+   *
+   * Nothing is measured here and no timeout is attributed: `setTimeout` is
+   * deliberately left alone, because a one-shot timer is not a standing cost
+   * and wrapping the busiest scheduling function in the process to learn
+   * nothing would be a performance tool that costs performance.
+   */
+  private originalClearTimeout: ClearIntervalFn | null = null;
   private originalEnablePlugin: ((id: string) => Promise<unknown>) | null = null;
   /**
    * The exact functions this watcher installed.
@@ -121,22 +139,32 @@ export class RuntimeWatcher {
    */
   private myTimerWrapper: unknown = null;
   private myClearWrapper: unknown = null;
+  private myClearTimeoutWrapper: unknown = null;
   private myLoadWrapper: unknown = null;
   /**
-   * Set once `stop()` has run.
+   * The current run's liveness token, or `null` once stopped.
    *
-   * FlowKit deliberately declines to restore a global that somebody else has
-   * since wrapped, because pulling ours out would take theirs with it — so its
-   * wrapper can legitimately remain in the chain after unload, holding this
-   * watcher, its host, and through the host the unloaded plugin's settings.
-   * Left as it was, that wrapper went on attributing timers, filling maps,
-   * arming a flush timeout, and calling `host.onChange()` — which saves
-   * settings and rescans — inside an instance Obsidian has already torn down.
+   * Every wrapper this class installs closes over the token that was current
+   * when it was installed, and checks THAT rather than a field on the instance.
    *
-   * The wrapper cannot be removed, so it is made inert instead: after `stop()`
-   * every hook does nothing but call through to what it wrapped.
+   * Why anything is made inert at all: FlowKit deliberately declines to restore
+   * a global that somebody else has since wrapped, because pulling ours out
+   * would take theirs with it — so its wrapper can legitimately remain in the
+   * chain after unload, holding this watcher, its host, and through the host
+   * the unloaded plugin's settings. Left live, that wrapper went on attributing
+   * timers, filling maps, arming a flush timeout, and calling `host.onChange()`
+   * — which saves settings and rescans — inside an instance Obsidian has
+   * already torn down. The wrapper cannot be removed, so after `stop()` every
+   * hook does nothing but call through to what it wrapped.
+   *
+   * Why that had to become per-run rather than per-instance: an instance-wide
+   * `stopped = false` in `start()` REACTIVATED any wrapper a previous run had
+   * left behind. `start(); …someone wraps on top…; stop(); start();` then had
+   * two live generations of our wrapper in one chain, and a single
+   * `setInterval` call traversed both — attributed twice, flushed twice. A
+   * stopped run now stays stopped whatever happens next.
    */
-  private stopped = false;
+  private run: { live: boolean } | null = null;
   /** Repeating timers currently outstanding, keyed by timer id. */
   private live = new Map<number, LiveTimer>();
   /** How long each plugin's timer callbacks actually take to run. */
@@ -164,18 +192,44 @@ export class RuntimeWatcher {
     this.flushDelayMs = flushDelayMs;
   }
 
+  /**
+   * Whether the wrappers are currently installed.
+   *
+   * `start()` had no guard, and the second call was quietly destructive rather
+   * than merely redundant: it read `window.setInterval` — by then OUR wrapper —
+   * and saved it as `originalSetInterval`. `stop()` then dutifully restored
+   * that, so the global was left holding a FlowKit closure which no later
+   * `stop()` could ever remove, permanently interposed on a function every
+   * other plugin in the vault uses. Each further `start()` laminated another
+   * generation on.
+   *
+   * Nothing in the shipped UI calls `start()` twice today — the runtime toggle
+   * asks for a reload — so this is a guard against the next caller rather than
+   * a report of a symptom. It belongs here anyway: the identity-based restore
+   * in `unwrapTimers` is the whole basis on which this class is allowed to
+   * touch a shared global, and that argument collapses if the saved "original"
+   * can be one of ours.
+   */
+  private started = false;
+
   start(): void {
-    this.stopped = false;
-    this.wrapTimers();
-    this.wrapPluginLoad();
+    if (this.started) return;
+    this.started = true;
+    const run = { live: true };
+    this.run = run;
+    this.wrapTimers(run);
+    this.wrapPluginLoad(run);
   }
 
   stop(): void {
-    // Set FIRST, and before anything is unwrapped: a wrapper that survives this
-    // call must already be inert by the time it can next be entered, and a
-    // flush that fires between the unwrap and the flag would call back into a
+    // Killed FIRST, and before anything is unwrapped: a wrapper that survives
+    // this call must already be inert by the time it can next be entered, and a
+    // flush that fires between the unwrap and this line would call back into a
     // host that is being torn down.
-    this.stopped = true;
+    const run = this.run;
+    if (run) run.live = false;
+    this.run = null;
+    this.started = false;
     if (this.flushTimer != null) {
       window.clearTimeout(this.flushTimer);
       this.flushTimer = null;
@@ -197,7 +251,7 @@ export class RuntimeWatcher {
    * it is why a plugin with no observed timer is never scored as idle — the
    * penalty only ever applies to a timer we watched being created.
    */
-  private wrapTimers(): void {
+  private wrapTimers(run: { live: boolean }): void {
     // Keep the ORIGINAL references for restoring, and bound copies for calling.
     // Storing the bound copy and restoring that instead put a fresh `.bind()`
     // layer on `window.setInterval` every time FlowKit was disabled and
@@ -205,17 +259,20 @@ export class RuntimeWatcher {
     // added another wrapper to a global other plugins also use.
     const rawSet = window.setInterval;
     const rawClear = window.clearInterval;
+    const rawClearTimeout = window.clearTimeout;
     this.originalSetInterval = rawSet;
     this.originalClearInterval = rawClear;
+    this.originalClearTimeout = rawClearTimeout;
     const originalSet = rawSet.bind(window) as SetIntervalFn;
     const originalClear = rawClear.bind(window) as ClearIntervalFn;
+    const originalClearTimeout = rawClearTimeout.bind(window) as ClearIntervalFn;
 
     const set = ((handler: TimerHandler, timeout?: number, ...args: unknown[]): number => {
       // Once stopped, this is a pass-through and nothing more. The wrapper can
       // outlive the plugin whenever someone else wrapped on top of it, and
       // measuring a vault on behalf of an instance Obsidian has unloaded is
       // both a leak and a write to settings nobody owns any more.
-      if (this.stopped) return originalSet(handler, timeout, ...args);
+      if (!run.live) return originalSet(handler, timeout, ...args);
       // Attribute first, so the wrapped callback knows whose time it is
       // spending. A string handler goes through untouched — it runs in global
       // scope via the engine, and there is nothing here to wrap.
@@ -225,7 +282,7 @@ export class RuntimeWatcher {
           : null;
       const wrappedHandler =
         owner && typeof handler === "function"
-          ? this.timeCallback(owner, handler as (...a: unknown[]) => unknown)
+          ? this.timeCallback(run, owner, handler as (...a: unknown[]) => unknown)
           : handler;
       const id = originalSet(wrappedHandler, timeout, ...args);
       this.noteTimer(id, timeout, owner);
@@ -233,24 +290,39 @@ export class RuntimeWatcher {
     }) as SetIntervalFn & { [WRAPPED]?: true };
     set[WRAPPED] = true;
 
-    const clear = ((id?: number): void => {
-      originalClear(id);
-      if (this.stopped || id == null) return;
-      // A timer going away changes the snapshot exactly as much as one being
-      // created, and only the creation side said so — so a plugin that stopped
-      // polling went on being shown as a poller until something unrelated
-      // happened to trigger a re-score.
-      if (this.live.delete(id)) {
-        this.dirty = true;
-        this.scheduleFlush();
-      }
-    }) as ClearIntervalFn & { [WRAPPED]?: true };
+    // One body for both families, because the only thing either of them does
+    // here is forget a timer, and browsers let `clearTimeout` cancel an
+    // interval handle — see `originalClearTimeout`.
+    const forget = (original: ClearIntervalFn) =>
+      ((id?: number): void => {
+        original(id);
+        if (!run.live || id == null) return;
+        // A timer going away changes the snapshot exactly as much as one being
+        // created, and only the creation side said so — so a plugin that
+        // stopped polling went on being shown as a poller until something
+        // unrelated happened to trigger a re-score.
+        const gone = this.live.get(id);
+        if (this.live.delete(id)) {
+          // The timing record goes with the last of that plugin's timers. It
+          // outlived them, and `maxTickMs` is the one reading here that makes
+          // a claim in the present tense about something still running.
+          if (gone && !this.hasLiveTimer(gone.pluginId)) this.ticks.delete(gone.pluginId);
+          this.dirty = true;
+          this.scheduleFlush();
+        }
+      }) as ClearIntervalFn & { [WRAPPED]?: true };
+
+    const clear = forget(originalClear);
     clear[WRAPPED] = true;
+    const clearTimer = forget(originalClearTimeout);
+    clearTimer[WRAPPED] = true;
 
     this.myTimerWrapper = set;
     this.myClearWrapper = clear;
+    this.myClearTimeoutWrapper = clearTimer;
     window.setInterval = set as unknown as typeof window.setInterval;
     window.clearInterval = clear as unknown as typeof window.clearInterval;
+    window.clearTimeout = clearTimer as unknown as typeof window.clearTimeout;
   }
 
   private unwrapTimers(): void {
@@ -264,13 +336,19 @@ export class RuntimeWatcher {
     if (this.originalClearInterval && window.clearInterval === this.myClearWrapper) {
       window.clearInterval = this.originalClearInterval as unknown as typeof window.clearInterval;
     }
+    if (this.originalClearTimeout && window.clearTimeout === this.myClearTimeoutWrapper) {
+      window.clearTimeout = this.originalClearTimeout as unknown as typeof window.clearTimeout;
+    }
     // If somebody wrapped these after us, ours stays in the chain — pulling it
-    // out would take theirs with it. `stopped` is what makes that safe: the
-    // survivor is a pass-through holding no state and calling nothing.
+    // out would take theirs with it. The dead token is what makes that safe:
+    // the survivor is a pass-through holding no state and calling nothing, and
+    // no later `start()` can revive it.
     this.originalSetInterval = null;
     this.originalClearInterval = null;
+    this.originalClearTimeout = null;
     this.myTimerWrapper = null;
     this.myClearWrapper = null;
+    this.myClearTimeoutWrapper = null;
   }
 
   /**
@@ -302,6 +380,7 @@ export class RuntimeWatcher {
    * would break it *and* hide it from the error watcher.
    */
   private timeCallback(
+    run: { live: boolean },
     pluginId: string,
     handler: (...args: unknown[]) => unknown
   ): (...args: unknown[]) => unknown {
@@ -309,7 +388,7 @@ export class RuntimeWatcher {
       // Timers created before unload keep firing through this wrapper for as
       // long as their owner holds them, so it has to stop recording too — or a
       // stopped watcher's `ticks` map refills behind it.
-      if (this.stopped) return handler(...args);
+      if (!run.live) return handler(...args);
       const started = performance.now();
       try {
         return handler(...args);
@@ -324,6 +403,14 @@ export class RuntimeWatcher {
         }
       }
     };
+  }
+
+  /** Whether this plugin still holds any repeating timer we are watching. */
+  private hasLiveTimer(pluginId: string): boolean {
+    for (const timer of this.live.values()) {
+      if (timer.pluginId === pluginId) return true;
+    }
+    return false;
   }
 
   private noteTimer(id: number, timeout: number | undefined, owner: string | null): void {
@@ -346,11 +433,12 @@ export class RuntimeWatcher {
     // Belt and braces: nothing should reach here after `stop()`, and if
     // anything does, arming a timeout that calls into an unloaded host is the
     // one outcome worth ruling out twice.
-    if (this.stopped || this.flushTimer != null) return;
+    const run = this.run;
+    if (!run?.live || this.flushTimer != null) return;
     // The original, so our own bookkeeping timer never enters the wrapper.
     const timeout = window.setTimeout(() => {
       this.flushTimer = null;
-      if (this.stopped || !this.dirty) return;
+      if (!run.live || !this.dirty) return;
       this.dirty = false;
       this.host.onChange();
     }, this.flushDelayMs);
@@ -367,7 +455,7 @@ export class RuntimeWatcher {
    * here or from Obsidian's own settings, so coverage fills in with use, and
    * the row menu offers an explicit re-measure for the rest.
    */
-  private wrapPluginLoad(): void {
+  private wrapPluginLoad(run: { live: boolean }): void {
     const api = (this.app as unknown as AppInternals).plugins;
     if (!api || typeof api.enablePlugin !== "function") return;
     // As with the timers: keep the raw reference to restore, bind a copy to call.
@@ -378,9 +466,15 @@ export class RuntimeWatcher {
       // As with the timers: a wrapper somebody else has since wrapped survives
       // unload, and timing loads into a dead instance's settings is worse than
       // not timing them.
-      if (this.stopped) return original(id);
+      if (!run.live) return original(id);
       const started = performance.now();
       const result = await original(id);
+      // Re-checked AFTER the await. A plugin load is the one thing here with a
+      // real suspension point in it, so `stop()` can land in the middle of one
+      // — and then this would write a measurement into the store of an instance
+      // Obsidian has already torn down, which is precisely what the token
+      // exists to prevent everywhere else.
+      if (!run.live) return result;
       // Recorded only on success. This was in a `finally`, which meant a plugin
       // whose load threw immediately was recorded as having loaded in ~0 ms —
       // a failed load written down as the fastest one in the vault.
@@ -530,6 +624,19 @@ export class RuntimeWatcher {
     for (const [pluginId, record] of this.ticks) {
       const profile = out[pluginId];
       if (!profile) continue;
+      // Only while the plugin still holds a timer. `maxTickMs` is phrased and
+      // scored as a present-tense cost — "its slowest timer callback blocked
+      // the interface for 180 ms" — and a callback that can no longer run is
+      // not a cost the vault is paying. A plugin that polled hard during its
+      // own startup and then cleared the timer was permanently marked as the
+      // heaviest thing in the vault, and the only way out was restarting
+      // Obsidian.
+      //
+      // Asked here rather than relying solely on the `clearInterval` hook
+      // because `clearTimeout` clears an interval handle just as well, and
+      // that path never reaches our wrapper. `timers` is set just above from
+      // the live map, so this is self-correcting whichever way the timer died.
+      if (profile.timers == null) continue;
       profile.maxTickMs = record.maxMs;
       profile.ticks = record.ticks;
     }

@@ -36,6 +36,26 @@ export type RepoActivityMap = Record<string, RepoActivity>;
 export const REPO_TTL_MS = 7 * 86_400_000;
 
 /**
+ * Whether a value is a GitHub `owner/name` slug that is safe to put in a URL
+ * path.
+ *
+ * The character-class test on its own was not. `[\w.-]+` matches `.` and `..`,
+ * so `../user` passed it — and `https://api.github.com/repos/../user` is
+ * normalised to `https://api.github.com/user` before it leaves the machine,
+ * which is a different endpoint than the one this code believes it is calling.
+ * The value comes from a downloaded file; the comment at the call site has
+ * always said it is not to be interpolated unchecked, and this is what makes
+ * that true. Neither half may be a run of dots.
+ *
+ * One definition, exported, used by both places that build a GitHub URL from
+ * this field.
+ */
+export function isRepoSlug(value: string | undefined): value is string {
+  if (!value || !/^[\w.-]+\/[\w.-]+$/.test(value)) return false;
+  return value.split("/").every((part) => !/^\.+$/.test(part));
+}
+
+/**
  * How many repositories one scan may look up. GitHub allows 60 unauthenticated
  * requests an hour per IP for the whole machine, not per plugin, so this stays
  * deliberately small: the lookups that matter are for the handful of plugins
@@ -104,9 +124,10 @@ export async function fetchRepoActivity(
   repo: string,
   now: number
 ): Promise<RepoActivity> {
-  // `owner/name`, nothing else. The value comes from a downloaded community
-  // file, so it is not to be interpolated into a URL unchecked.
-  if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) return { at: now, failed: "missing" };
+  // `owner/name`, nothing else — see `isRepoSlug`. The value comes from a
+  // downloaded community file, so it is not to be interpolated into a URL
+  // unchecked.
+  if (!isRepoSlug(repo)) return { at: now, failed: "missing" };
   const url = `https://api.github.com/repos/${repo}`;
   let res: Awaited<ReturnType<typeof requestUrl>> | null;
   try {

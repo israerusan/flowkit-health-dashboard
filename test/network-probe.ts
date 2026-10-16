@@ -110,8 +110,21 @@ console.log("\nIssue search — 'is this a known issue?'");
   const noRepo = await findKnownIssues(undefined, "anything");
   ok("a plugin with no repository is handled", !noRepo.ok && noRepo.reason === "no-repo");
 
+  // "Nothing left to search" is NOT an empty success, and this assertion was
+  // never updated when 1.7.1 changed that. Returning `{ok: true, issues: []}`
+  // made the UI say "Nothing matching in their tracker" about a search that had
+  // never been run — a statement about somebody's issue tracker that FlowKit
+  // had no basis for — so it became an explicit `nothing-searchable` outcome.
+  //
+  // The probe went on expecting the old shape and has therefore failed on every
+  // run since, which is worse than a probe that does not exist: a pre-release
+  // check that always reports one failure is one nobody reads.
   const empty = await findKnownIssues("blacksmithgu/obsidian-dataview", "   ");
-  ok("an empty message searches for nothing", empty.ok && empty.issues.length === 0);
+  ok(
+    "a message with nothing searchable in it says so, rather than searching",
+    !empty.ok && empty.reason === "nothing-searchable",
+    empty.ok ? "got an empty success" : empty.reason
+  );
 }
 
 console.log(

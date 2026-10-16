@@ -69,6 +69,7 @@ import {
   isLastKnownGood,
   type ExperimentComparison,
   type HealthExperiment,
+  type HealthReadingMap,
   type PluginRegression,
 } from "./experiments";
 import { LicenseManager } from "./license/LicenseManager";
@@ -1461,6 +1462,24 @@ export default class FlowKitHealthPlugin extends Plugin {
         dirty = true;
       }
     }
+    // The per-plugin health baselines, which were never pruned either — and are
+    // the largest of these stores by some distance, because each entry carries
+    // a copy of the whole vault reading (`at`, `avg`, `atRisk`, `updates`,
+    // `count`, `confidence`) beside the one plugin it is about. A vault that
+    // has churned through a hundred plugins over a year was carrying a hundred
+    // of those in every `saveData` call, forever, for plugins it no longer has.
+    //
+    // Scoped to the same known-to-any-device set as everything else above, so a
+    // phone cannot delete the desktop's baselines and re-arm every regression
+    // as a first observation.
+    const readings = this.settings.healthReadings;
+    const liveReadings = Object.keys(readings).filter((id) => installed.has(id));
+    if (liveReadings.length !== Object.keys(readings).length) {
+      const next: HealthReadingMap = {};
+      for (const id of liveReadings) next[id] = readings[id];
+      this.settings.healthReadings = next;
+      dirty = true;
+    }
     // `notified` was never pruned at all. It is now carried forward for plugins
     // this scan couldn't see — which is what stops another device's trouble
     // state being forgotten and then re-announced — so it needs the same
@@ -1947,7 +1966,26 @@ export default class FlowKitHealthPlugin extends Plugin {
 
   /** Save a known-good set after a healthy scan, without overwriting user profiles. */
   async updateLastKnownGood(results: PluginHealth[]): Promise<boolean> {
-    if (this.settings.safeMode || !isLastKnownGood(results) || !this.canPersist) return false;
+    // `recordingSuspended()`, not just safe mode. This is the worst place in
+    // the product to be wrong about whether the vault is the user's own,
+    // because what it writes down is the way back.
+    //
+    // Mid-bisect, half the plugins are off and `isLastKnownGood` is handed only
+    // the ones still running — so round one of a search over forty healthy
+    // plugins looks like a flawless twenty-plugin vault, passes every test here
+    // (average above 70, nothing incompatible, nothing delisted, no errors),
+    // and overwrites "Last known good" with a bisect round. The user's recorded
+    // recovery set then silently loses twenty plugins, and the surface that is
+    // supposed to rescue a vault becomes the thing that breaks it. The view
+    // rescans after every bisect transition, so this was reached on each round.
+    //
+    // Profiling gets there too, from the other direction: the runtime watcher's
+    // flush fires ~5s into a run, asks for a rescan, and that scan sees a vault
+    // mid-restart. `recordSnapshot` and `diffChanges` were both taught to
+    // refuse exactly this; these two were missed.
+    if (this.recordingSuspended() || !isLastKnownGood(results) || !this.canPersist) {
+      return false;
+    }
     const enabled = [...(this.pluginsApi().enabledPlugins ?? new Set<string>())];
     const existing = this.settings.profiles.find((p) => p.name === LAST_KNOWN_GOOD);
     if (existing && existing.ids.slice().sort().join("|") === enabled.slice().sort().join("|")) {
@@ -2055,7 +2093,17 @@ export default class FlowKitHealthPlugin extends Plugin {
 
   /** Record per-plugin readings and return only newly detected numeric regressions. */
   async recordHealthReading(results: PluginHealth[], at = Date.now()): Promise<PluginRegression[]> {
-    if (this.settings.safeMode) return [];
+    // Same guard as every other recorder — see `recordingSuspended`.
+    //
+    // Safe mode alone was not enough. `captureHealthReading` stores each
+    // plugin's `enabled` flag, and `detectRegressions` requires it on BOTH
+    // sides of the comparison; so a scan taken while a bisect has a plugin
+    // switched off stores `enabled: false` for it and destroys the baseline the
+    // doc comment below promises to preserve. After the search puts everything
+    // back, that plugin's next real regression reads as a first observation and
+    // goes unreported — the one feature a Pro user bought this for, silently
+    // disarmed for every plugin a search touched.
+    if (this.recordingSuspended()) return [];
     const reading = captureHealthReading(results, at);
     const fresh = detectRegressions(
       this.settings.healthReadings,
@@ -2509,18 +2557,12 @@ export default class FlowKitHealthPlugin extends Plugin {
 
   // --- Pro: health-trend history ------------------------------------------
 
-  /**
-   * The most recent snapshot recorded before `at`, for delta display. Sorted
-   * rather than trusting insertion order — history survives in data.json across
-   * syncs and hand edits, and an out-of-order entry would silently pick the
-   * wrong baseline for every delta the user sees.
-   */
-  previousSnapshot(at: number): HealthSnapshot | null {
-    const prior = this.settings.history
-      .filter((s) => s.at < at)
-      .sort((a, b) => a.at - b.at);
-    return prior.length ? prior[prior.length - 1] : null;
-  }
+  // `previousSnapshot(at)` used to live here and is gone. Nothing called it —
+  // the trend chart takes its baseline from the points it actually drew, which
+  // is the only correct source and says so at the call site — and what it did
+  // was pick the newest reading before `at` from ANY device. Keeping a
+  // device-blind "previous reading" helper next to a feature whose entire 1.7.0
+  // release was about not mixing devices is a trap, not dead weight.
 
   /**
    * Record a vault-health snapshot for the trend tracker. To keep the history
