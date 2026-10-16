@@ -3,9 +3,9 @@
   "name": "FlowKit Health Dashboard",
   "version": "1.8.0",
   "minAppVersion": "1.4.0",
-  "description": "Find which add-on is breaking your vault, and score every one installed on compatibility, reliability, maintenance and footprint.",
+  "description": "Find which add-on is breaking or slowing your vault, then score everything installed on compatibility, reliability, maintenance and footprint.",
   "author": "Israel Avila",
   "authorUrl": "https://github.com/israerusan",
-  "fundingUrl": "https://buymeacoffee.com/vaultspotlight",
+  "fundingUrl": "https://buymeacoffee.com/vaultspotlight/e/560206",
   "isDesktopOnly": false
 }
