@@ -5,6 +5,15 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.8.1] - 2026-10-16
+
+### Changed
+
+- Support link now points at this add-on's own checkout instead of the shared
+  account page, so the Support button reaches the right place.
+- Author name and description brought in line with the rest of the portfolio;
+  the description is shorter and leads with what the add-on finds for you.
+
 ## [1.8.0] - 2026-10-16
 
 The remediation features that had been sitting unreleased, plus a fourth
