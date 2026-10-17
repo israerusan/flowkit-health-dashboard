@@ -788,6 +788,10 @@ export default class FlowKitHealthPlugin extends Plugin {
     return (
       this.bisectInProgress() || this.vaultUnrestored() || this.vaultMutationDepth > 0
       || this.settings.safeMode != null
+      // An unreadable search record is shown as "your vault may be half
+      // switched off". Recording that vault as the user's — as last known
+      // good, as events, as recoveries — is exactly what the banner warns of.
+      || this.bisectSalvage != null
     );
   }
 
@@ -1621,9 +1625,27 @@ export default class FlowKitHealthPlugin extends Plugin {
   /** Time one plugin's load by restarting it. Explicit, never automatic. */
   async measureLoad(id: string): Promise<number | null> {
     if (!this.runtimeWatcher) return null;
+    // Restarting FlowKit to time it would unload this call and load a second
+    // instance; see setPluginEnabled.
+    if (id === this.manifest.id) return null;
+    if (this.profilingRun) {
+      throw new Error("A profiling run is in progress. Wait for it to finish.");
+    }
     const ms = await this.runtimeWatcher.measureLoad(id);
-    if (ms != null) await this.saveSettings();
+    // The plugin is back in its original state by now. A failed save loses
+    // only the persisted reading, and must not be reported as a plugin left off.
+    if (ms != null) await this.saveSettings().catch((err) => {
+      console.error("FlowKit: could not save the load time", err);
+    });
     return ms;
+  }
+
+  /** Set while profileAll is restarting plugins one by one. */
+  private profilingRun = false;
+
+  /** Whether a profiling run is in progress. */
+  get profiling(): boolean {
+    return this.profilingRun;
   }
 
   /** Every installed plugin's manifest, for the states that have no scan yet. */
@@ -1910,7 +1932,7 @@ export default class FlowKitHealthPlugin extends Plugin {
 
   /** Capture the current enabled set under a name. Returns whether it stuck. */
   async saveCurrentProfile(name: string): Promise<boolean> {
-    if (!this.canPersist) return false;
+    if (!this.canPersist || this.bisectOwnsPage()) return false;
     const enabled = [...(this.pluginsApi().enabledPlugins ?? new Set<string>())];
     this.settings.profiles = saveProfile(this.settings.profiles, name, enabled, Date.now());
     await this.saveSettings();
@@ -2002,8 +2024,13 @@ export default class FlowKitHealthPlugin extends Plugin {
   }
 
   /** Capture the current plugin set before entering a deliberately minimal mode. */
-  async startSafeMode(keepEnabled: string[]): Promise<LifecycleResult | null> {
-    if (!this.canPersist || this.settings.safeMode) return null;
+  /**
+   * What safe mode would do right now: which plugins stay on (FlowKit and the
+   * watched ones that are enabled) and which go off. Read from the live
+   * registry, not from a scan, so the confirmation dialog and the action can't
+   * disagree. A scan can be missing or a moment old; the registry is the vault.
+   */
+  planSafeMode(keepEnabled: string[]): { session: SafeModeSession; disable: string[] } {
     const api = this.pluginsApi();
     const originalEnabled = [...(api.enabledPlugins ?? new Set<string>())];
     const keep = [
@@ -2015,11 +2042,20 @@ export default class FlowKitHealthPlugin extends Plugin {
       keepEnabled: keep,
       startedAt: Date.now(),
     };
+    const target = safeModeTarget(session, new Set(Object.keys(api.manifests ?? {})));
+    return { session, disable: target.disable.filter((id) => id !== this.manifest.id) };
+  }
+
+  async startSafeMode(keepEnabled: string[]): Promise<LifecycleResult | null> {
+    if (!this.canPersist || this.settings.safeMode) return null;
+    // Mid-search the "original set" would be the search's half-off round, and
+    // restoring safe mode would later put that round back over a vault the
+    // search had already restored.
+    if (this.bisectOwnsPage()) return null;
+    const { session, disable } = this.planSafeMode(keepEnabled);
     this.settings.safeMode = session;
     await this.saveSettings();
-    const target = safeModeTarget(session, new Set(Object.keys(api.manifests ?? {})));
-    target.disable = target.disable.filter((id) => id !== this.manifest.id);
-    const result = await this.withVaultMutation(async () => this.disableMany(target.disable));
+    const result = await this.withVaultMutation(async () => this.disableMany(disable));
     if (result.failed.length) {
       this.settings.safeMode = { ...session, restoreFailed: result.failed.map((f) => f.id) };
       await this.saveSettings();
@@ -2062,7 +2098,7 @@ export default class FlowKitHealthPlugin extends Plugin {
 
   /** Begin a before/after health experiment from the latest scan. */
   async startHealthExperiment(name: string, results: PluginHealth[]): Promise<HealthExperiment | null> {
-    if (!this.canPersist || this.settings.healthExperiment) return null;
+    if (!this.canPersist || this.settings.healthExperiment || this.bisectOwnsPage()) return null;
     const trimmed = name.trim() || "Health experiment";
     const baseline = captureHealthReading(results, Date.now());
     const experiment: HealthExperiment = {
@@ -2244,8 +2280,23 @@ export default class FlowKitHealthPlugin extends Plugin {
     // and we could not time our own load anyway, since we would not be
     // running to observe it.
     const safe = searchableCandidates(ids, this.manifest.id);
-    const result = await this.withVaultMutation(() => watcher.profileAll(safe, onProgress));
-    await this.saveSettings();
+    // Two runs interleave their disable/enable calls, and each captures
+    // "was this plugin on?" from a state the other one created, so a plugin
+    // can be put back the wrong way with nothing reported. withVaultMutation is
+    // a depth counter, not a lock.
+    if (this.profilingRun) {
+      throw new Error("A profiling run is already in progress.");
+    }
+    this.profilingRun = true;
+    let result: ProfileRunResult;
+    try {
+      result = await this.withVaultMutation(() => watcher.profileAll(safe, onProgress));
+    } finally {
+      this.profilingRun = false;
+    }
+    await this.saveSettings().catch((err) => {
+      console.error("FlowKit: could not save the profiling results", err);
+    });
     return result;
   }
 
@@ -2381,6 +2432,15 @@ export default class FlowKitHealthPlugin extends Plugin {
    * moved, which is the only thing bisect's next question is valid against.
    */
   async setPluginEnabled(id: string, enabled: boolean): Promise<void> {
+    // Switching FlowKit off from inside FlowKit unloads the code that is
+    // running this call. Whatever the caller does next (refresh, save, switch
+    // something back on) then runs in a dead instance, writing data.json
+    // behind the back of the next one. Obsidian's own settings can do it safely.
+    if (!enabled && id === this.manifest.id) {
+      throw new Error(
+        "FlowKit can't switch itself off from here. Use Settings → Community plugins."
+      );
+    }
     const api = this.pluginsApi();
     const fn = enabled ? api.enablePluginAndSave : api.disablePluginAndSave;
     if (typeof fn !== "function") {
@@ -2427,6 +2487,10 @@ export default class FlowKitHealthPlugin extends Plugin {
     const failed: LifecycleFailure[] = [];
     for (const id of ids) {
       if (this.isEnabled(id) === enabled) continue;
+      // A bulk fix, a saved set or safe mode can name FlowKit (a set saved
+      // without it, FlowKit itself flagged). Leave it on rather than fail the
+      // row: it is the tool doing the switching.
+      if (!enabled && id === this.manifest.id) continue;
       try {
         await this.setPluginEnabled(id, enabled);
         changed.push(id);

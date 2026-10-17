@@ -198,10 +198,9 @@ function svgEl<K extends keyof SVGElementTagNameMap>(
   tag: K,
   attrs: Record<string, string | number>
 ): SVGElementTagNameMap[K] {
-  const el = document.createElementNS("http://www.w3.org/2000/svg", tag);
-  for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, String(v));
-  parent.appendChild(el);
-  return el;
+  // Created by the parent, so a dashboard in a popout window builds its chart
+  // in that window's document rather than the main one.
+  return parent.createSvg(tag, { attr: attrs });
 }
 
 interface SummaryStats {
@@ -269,6 +268,10 @@ export class HealthDashboardView extends ItemView {
    */
   private pendingForce = false;
   private pendingAllowFetch = false;
+  /** Callers waiting on the queued scan, told whether it produced fresh results. */
+  private pendingWaiters: Array<(fresh: boolean) => void> = [];
+  /** A failed history write is said once per session, not on every scan. */
+  private historyWarned = false;
   /** The results region, rebuilt on its own when search/filter/sort change. */
   private rowsEl: HTMLElement | null = null;
   /** Live "N of M" readout in the toolbar. */
@@ -410,7 +413,7 @@ export class HealthDashboardView extends ItemView {
    *   plugin could otherwise trigger a multi-megabyte download behind a
    *   full-page spinner, which made the paid bulk flow the slowest thing here.
    */
-  async refresh(force = false, allowFetch = true): Promise<void> {
+  async refresh(force = false, allowFetch = true): Promise<boolean> {
     // A second concurrent scan would race `this.results` and double-write the
     // same snapshot. Queue it rather than dropping it: an action taken during
     // an in-flight scan (disable a plugin while Refresh is running) would
@@ -419,13 +422,15 @@ export class HealthDashboardView extends ItemView {
       this.pendingRefresh = true;
       this.pendingForce ||= force;
       this.pendingAllowFetch ||= allowFetch;
-      return;
+      // Resolved once the queued scan has run. Resolving straight away let a
+      // caller that needs the rescan ("Compare after changes") read the
+      // previous one and record it as the result.
+      return new Promise((resolve) => this.pendingWaiters.push(resolve));
     }
     this.refreshing = true;
 
     const firstRun = this.results.length === 0;
-    let scrollTop = 0;
-    let focusedId: string | null = null;
+    let fresh = false;
 
     try {
       this.scanError = null;
@@ -438,8 +443,6 @@ export class HealthDashboardView extends ItemView {
       } else {
         this.contentEl.addClass("is-busy");
       }
-      scrollTop = this.contentEl.scrollTop;
-      focusedId = this.focusedRowId();
 
       const { results, coverage } = await this.plugin.computeAll({
         force,
@@ -458,30 +461,48 @@ export class HealthDashboardView extends ItemView {
       const lapsed = this.plugin.takeLapsedMutes();
       if (lapsed.length) this.lapsedMutes = lapsed;
       const s = this.summaryStats();
-      await this.plugin.recordHealthReading(this.results);
-      await this.plugin.updateLastKnownGood(this.results);
-      await this.plugin.recordSnapshot({
-        at: Date.now(),
-        avg: s.avg,
-        count: s.count,
-        atRisk: s.atRisk,
-        unmaintained: s.unmaintained,
-        updates: s.updates,
-        online: coverage.stats,
-        confidence: s.confidence,
-        model: SCORING_MODEL,
-      });
-      // Record what moved since the last scan, so reopening the dashboard can
-      // lead with it rather than rendering an identical screen.
-      // The whole result set, including muted plugins: their state is preserved
-      // so unmuting later doesn't re-announce old trouble as new.
-      await this.plugin.diffChanges(this.results, coverage);
       // Otherwise the status bar keeps quoting the last background pass — so
       // acting on a bulk fix left it reading "5 to fix" for hours afterwards.
+      // Before the bookkeeping below, which can fail on its own.
       this.plugin.updateStatusBar(
         s.avg,
         this.results.filter((r) => !r.muted)
       );
+      fresh = true;
+      // The scan is done; what follows only records it. A rejected write here
+      // (read-only or sync-locked vault) used to land in the scan's own catch,
+      // so a current report was shown under "that refresh didn't finish", and
+      // the steps after the failed one were skipped on every scan.
+      try {
+        await this.plugin.recordHealthReading(this.results);
+        await this.plugin.updateLastKnownGood(this.results);
+        await this.plugin.recordSnapshot({
+          at: Date.now(),
+          avg: s.avg,
+          count: s.count,
+          atRisk: s.atRisk,
+          unmaintained: s.unmaintained,
+          updates: s.updates,
+          online: coverage.stats,
+          confidence: s.confidence,
+          model: SCORING_MODEL,
+        });
+        // Record what moved since the last scan, so reopening the dashboard can
+        // lead with it rather than rendering an identical screen.
+        // The whole result set, including muted plugins: their state is preserved
+        // so unmuting later doesn't re-announce old trouble as new.
+        await this.plugin.diffChanges(this.results, coverage);
+      } catch (err) {
+        console.error("FlowKit: the scan finished, but its history couldn't be saved", err);
+        if (!this.historyWarned) {
+          this.historyWarned = true;
+          new Notice(
+            "FlowKit scanned your plugins but couldn't save the result to its history. " +
+              "The report is current; trends and change tracking resume once the settings file can be written.",
+            10_000
+          );
+        }
+      }
     } catch (err) {
       // A rejected saveData (read-only disk, sync conflict) used to escape here
       // and leave the view stuck on the spinner with Refresh disabled, needing
@@ -498,9 +519,20 @@ export class HealthDashboardView extends ItemView {
       // named no longer exists, so the chip can't assert a count the table
       // below it contradicts.
       if (this.scopeInsight) {
-        const id = this.scopeInsight.id;
-        this.scopeInsight = this.insights().find((i) => i.id === id) ?? null;
+        const scope = this.scopeInsight;
+        // A single-plugin scope ("Disable these first") is not a finding, so it
+        // can't be re-resolved from the findings; it holds while its plugin does.
+        this.scopeInsight = scope.id.startsWith("plugin:")
+          ? this.results.some((r) => scope.ids.includes(r.id))
+            ? scope
+            : null
+          : (this.insights().find((i) => i.id === scope.id) ?? null);
       }
+      // Read now, not before the scan. The user may have scrolled or moved to
+      // another row while it ran, and putting them back where they were when
+      // it started pulls them away from where they are.
+      const scrollTop = this.contentEl.scrollTop;
+      const focusedId = this.focusedRowId();
       this.render();
       // Put the user back exactly where they were.
       if (!firstRun) {
@@ -515,9 +547,12 @@ export class HealthDashboardView extends ItemView {
         const queuedFetch = this.pendingAllowFetch;
         this.pendingForce = false;
         this.pendingAllowFetch = false;
-        await this.refresh(queuedForce, queuedFetch);
+        const waiters = this.pendingWaiters.splice(0);
+        const next = await this.refresh(queuedForce, queuedFetch);
+        for (const resolve of waiters) resolve(next);
       }
     }
+    return fresh;
   }
 
   /**
@@ -568,6 +603,26 @@ export class HealthDashboardView extends ItemView {
     this.render();
     this.contentEl.scrollTop = scrollTop;
     this.restoreFocus(focusedId);
+  }
+
+  /**
+   * Whether this row is FlowKit itself. Its row offers nothing that switches
+   * it off: doing that unloads the code running the action, which then
+   * carries on in a dead instance (see main.setPluginEnabled).
+   */
+  private isSelf(r: PluginHealth): boolean {
+    return r.id === this.plugin.manifest.id;
+  }
+
+  /**
+   * Refuse an action that reads or changes the plugin set while a search has
+   * it half switched off. Whatever it recorded or restored would be the
+   * search's set, not the user's.
+   */
+  private refuseDuringSearch(why: string): boolean {
+    if (!this.plugin.bisectOwnsPage()) return false;
+    new Notice(`Finish or stop the plugin search first — ${why}.`, 8000);
+    return true;
   }
 
   /** The plugin id of the row currently holding focus, if any. */
@@ -803,7 +858,47 @@ export class HealthDashboardView extends ItemView {
 
   // --- rendering ------------------------------------------------------------
 
+  /**
+   * Rebuild the page.
+   *
+   * Background rescans call this every few seconds while a watcher is busy,
+   * and a rebuild replaces the search box. So the box's state is carried
+   * across: text typed but not yet applied is applied rather than dropped,
+   * and a focused box gets its focus and caret back. Element refs are cleared
+   * first, so a branch that doesn't build the table (loading, bisect) can't
+   * leave them pointing at detached nodes.
+   */
   private render(): void {
+    const caret = this.captureSearchInput();
+    this.rowsEl = null;
+    this.countEl = null;
+    this.toolbarEl = null;
+    this.filterSelect = null;
+    this.searchInput = null;
+    this.scopeChipEl = null;
+    this.renderPage();
+    const input = this.searchInput as HTMLInputElement | null;
+    if (caret && input) {
+      input.focus();
+      const end = input.value.length;
+      input.setSelectionRange(Math.min(caret.start ?? end, end), Math.min(caret.end ?? end, end));
+    }
+  }
+
+  /** The search box's caret, if it has focus, after adopting any text not yet applied. */
+  private captureSearchInput(): { start: number | null; end: number | null } | null {
+    const input = this.searchInput;
+    if (!input || !input.isConnected) return null;
+    if (this.searchTimer != null) {
+      this.cancelSearchFlush();
+      this.search = input.value;
+      this.scopeInsight = null;
+    }
+    if (input.ownerDocument.activeElement !== input) return null;
+    return { start: input.selectionStart, end: input.selectionEnd };
+  }
+
+  private renderPage(): void {
     const root = this.contentEl;
     root.empty();
     root.addClass("flowkit-health");
@@ -1141,7 +1236,10 @@ export class HealthDashboardView extends ItemView {
     // thing here nothing else in the ecosystem does — and it used to sit in the
     // same flat grey as Refresh, which is a row of four equal buttons and no
     // answer to "where do I start".
-    if (!this.loading && this.results.length > 0) {
+    // Not while a search owns the page: everything in it either changes which
+    // plugins are on or records the current set, and right now that set is
+    // the search's, not the user's.
+    if (!this.loading && this.results.length > 0 && !this.plugin.bisectOwnsPage()) {
       const tools = actions.createEl("button", {
         cls: "flowkit-health-btn flowkit-tools-btn mod-cta",
       });
@@ -1833,7 +1931,16 @@ export class HealthDashboardView extends ItemView {
         const finish = row.createEl("button", { text: "Compare after changes" });
         finish.onclick = () => {
           this.act(
-            this.refresh(false, false).then(() => this.plugin.finishHealthExperiment(this.results).then(() => this.render())),
+            this.refresh(false, false).then(async (fresh) => {
+              // A failed scan leaves the previous results in place, and those
+              // are the "before". Comparing them would record no change at all.
+              if (!fresh) {
+                new Notice("FlowKit couldn't rescan, so nothing was compared. Try again in a moment.", 8000);
+                return;
+              }
+              await this.plugin.finishHealthExperiment(this.results);
+              this.render();
+            }),
             "Couldn't complete the health experiment"
           );
         };
@@ -2050,7 +2157,7 @@ export class HealthDashboardView extends ItemView {
     // then restarted all 38, including the 26 it had just said it would leave
     // alone.
     const unprofiled = this.unprofiledIds();
-    if (this.plugin.runtimeTracking && unprofiled.length > 0) {
+    if (this.plugin.runtimeTracking && !this.plugin.profiling && unprofiled.length > 0) {
       const profile = bar.createEl("button", {
         text: `Profile the other ${unprofiled.length}`,
       });
@@ -2110,6 +2217,10 @@ export class HealthDashboardView extends ItemView {
   }
 
   private startProfileAll(ids: string[]): void {
+    if (this.plugin.profiling) {
+      new Notice("Profiling is already running — wait for it to finish.");
+      return;
+    }
     // Same guard, milder consequence: profiling restarts every plugin in turn
     // and restores each to the state it found it in — which mid-search is the
     // search's state, not the user's — so it doesn't destroy the record, but it
@@ -3176,15 +3287,17 @@ export class HealthDashboardView extends ItemView {
     }
 
     const actions = panel.createDiv({ cls: "flowkit-detail-actions" });
-    const toggle = actions.createEl("button", {
-      text: r.enabled ? "Disable" : "Enable",
-    });
-    toggle.onclick = () => {
-      this.act(
-        this.plugin.setPluginEnabled(r.id, !r.enabled).then(() => this.refresh(false, false)),
-        `Couldn't ${r.enabled ? "disable" : "enable"} ${r.name}`
-      );
-    };
+    if (!this.isSelf(r)) {
+      const toggle = actions.createEl("button", {
+        text: r.enabled ? "Disable" : "Enable",
+      });
+      toggle.onclick = () => {
+        this.act(
+          this.plugin.setPluginEnabled(r.id, !r.enabled).then(() => this.refresh(false, false)),
+          `Couldn't ${r.enabled ? "disable" : "enable"} ${r.name}`
+        );
+      };
+    }
     if (r.enabled) {
       const settings = actions.createEl("button", { text: "Open its settings" });
       settings.onclick = () => this.plugin.openPluginSettings(r.id);
@@ -3431,22 +3544,24 @@ export class HealthDashboardView extends ItemView {
   private openRowMenu(evt: MouseEvent, r: PluginHealth): void {
     const menu = new Menu();
 
-    menu.addItem((item) =>
-      item
-        .setTitle(r.enabled ? "Disable plugin" : "Enable plugin")
-        .setIcon(r.enabled ? "power-off" : "power")
-        // Not an `async` menu callback: Obsidian's menu does not promise to
-        // handle a rejected one, so a plugin that refuses to switch produced
-        // nothing — no change, no message, no console line.
-        .onClick(() =>
-          this.act(
-            this.plugin
-              .setPluginEnabled(r.id, !r.enabled)
-              .then(() => this.refresh(false, false)),
-            `Couldn't ${r.enabled ? "disable" : "enable"} ${r.name}`
+    if (!this.isSelf(r)) {
+      menu.addItem((item) =>
+        item
+          .setTitle(r.enabled ? "Disable plugin" : "Enable plugin")
+          .setIcon(r.enabled ? "power-off" : "power")
+          // Not an `async` menu callback: Obsidian's menu does not promise to
+          // handle a rejected one, so a plugin that refuses to switch produced
+          // nothing — no change, no message, no console line.
+          .onClick(() =>
+            this.act(
+              this.plugin
+                .setPluginEnabled(r.id, !r.enabled)
+                .then(() => this.refresh(false, false)),
+              `Couldn't ${r.enabled ? "disable" : "enable"} ${r.name}`
+            )
           )
-        )
-    );
+      );
+    }
 
     if (r.enabled) {
       menu.addItem((item) =>
@@ -3475,7 +3590,9 @@ export class HealthDashboardView extends ItemView {
       );
     }
 
-    if (r.enabled && this.plugin.runtimeTracking) {
+    // Never on FlowKit's own row: measuring restarts the plugin, and
+    // restarting FlowKit from FlowKit loads a second instance of it.
+    if (r.enabled && this.plugin.runtimeTracking && !this.isSelf(r)) {
       menu.addItem((item) =>
         item
           .setTitle("Measure load time")
@@ -3511,6 +3628,10 @@ export class HealthDashboardView extends ItemView {
    * That is the price of a real number instead of a file size.
    */
   private async measureLoad(r: PluginHealth): Promise<void> {
+    if (this.plugin.profiling) {
+      new Notice("Profiling is running — wait for it to finish before measuring one plugin.");
+      return;
+    }
     new BulkConfirmModal(this.app, {
       title: `Measure ${r.name}?`,
       intro:
@@ -3592,6 +3713,7 @@ export class HealthDashboardView extends ItemView {
   }
 
   private startExperiment(): void {
+    if (this.refuseDuringSearch("the baseline would be measured on the plugins it has switched off")) return;
     if (this.plugin.settings.healthExperiment) {
       new Notice("A health experiment is already active — compare it after changing your setup.");
       return;
@@ -3610,6 +3732,9 @@ export class HealthDashboardView extends ItemView {
   }
 
   private startSafeMode(): void {
+    // Checked before the Pro gate, like a running search in startBisect: the
+    // answer to "a search is running" is not a checkout page.
+    if (this.refuseDuringSearch("safe mode would save the search's half-off set as your original one")) return;
     if (!this.plugin.isPro) {
       this.openUpgrade("profiles");
       return;
@@ -3618,25 +3743,52 @@ export class HealthDashboardView extends ItemView {
       new Notice("Safe mode is already active — restore the original set first.");
       return;
     }
+    // Safe mode keeps the watched plugins on, and until a scan has landed
+    // FlowKit doesn't know which those are. Confirming then switched off
+    // everything but FlowKit, under a dialog that said "the other 0".
+    if (this.refreshing || this.results.length === 0) {
+      new Notice("Wait for the scan to finish — safe mode keeps your watched plugins on, and FlowKit doesn't know which those are yet.");
+      return;
+    }
     const keep = this.results
       .filter((r) => r.enabled && r.watched)
       .map((r) => r.id);
-    const count = this.results.filter((r) => r.enabled).length;
-    const watchedCount = keep.length;
+    // The dialog states the plan main will carry out, from the live plugin
+    // registry. Counting the scan instead assumed FlowKit was a watched row
+    // and was off by one (or by everything, before the first scan).
+    const plan = this.plugin.planSafeMode(keep);
+    const kept = plan.session.keepEnabled.filter((id) => id !== this.plugin.manifest.id);
+    if (plan.disable.length === 0) {
+      new Notice("Nothing to switch off — only FlowKit and your watched plugins are on.");
+      return;
+    }
+    const nameOf = (id: string): string => this.results.find((r) => r.id === id)?.name ?? id;
+    const rows = [
+      {
+        name: "Nothing is uninstalled",
+        detail: "Safe mode only changes enabled state. Restore the original set when you are done testing.",
+      },
+    ];
+    if (kept.length) rows.push({ name: "Stays on", detail: kept.map(nameOf).join(", ") });
     new BulkConfirmModal(this.app, {
       title: "Start safe mode?",
-      intro: `FlowKit will keep FlowKit${watchedCount > 1 ? ` and ${watchedCount - 1} watched plugin${watchedCount === 2 ? "" : "s"}` : ""} on, and switch off the other ${Math.max(0, count - watchedCount)} enabled plugins. Your original set is saved and can be restored.`,
-      rows: [
-        {
-          name: "Nothing is uninstalled",
-          detail: "Safe mode only changes enabled state. Restore the original set when you are done testing.",
-        },
-      ],
+      intro: `FlowKit will keep ${
+        kept.length ? `itself and ${kept.length} watched plugin${kept.length === 1 ? "" : "s"}` : "only itself"
+      } on, and switch off the other ${plan.disable.length} enabled plugin${
+        plan.disable.length === 1 ? "" : "s"
+      }. Your original set is saved and can be restored.`,
+      rows,
       confirmLabel: "Start safe mode",
       onConfirm: () => {
         this.act(
           this.plugin.startSafeMode(keep).then((result) => {
-            if (!result) return;
+            if (!result) {
+              new Notice("Safe mode didn't start — FlowKit can't save its settings right now, or a search is running.", 8000);
+              return;
+            }
+            // An Undo from before safe mode would be reversed by "Restore
+            // original set" without a word; it no longer describes this vault.
+            this.lastBulk = null;
             new Notice(
               result.failed.length
                 ? `Safe mode started with failures: ${describeFailed(result.failed)}`
@@ -3710,12 +3862,14 @@ export class HealthDashboardView extends ItemView {
       onConfirm: (symptom) => {
         void this.runBisectAction(async () => {
           await this.plugin.startBisect(candidates, symptom || undefined);
+          this.lastBulk = null;
         });
       },
     }).open();
   }
 
   private saveProfile(): void {
+    if (this.refuseDuringSearch("the set saved would be the search's, not yours")) return;
     if (!this.plugin.isPro) {
       this.openUpgrade("profiles");
       return;
@@ -3748,10 +3902,10 @@ export class HealthDashboardView extends ItemView {
     // Switching sets mid-search would silently replace the round's plugin set
     // with a different one, and the next answer would then be about a vault the
     // search never asked a question about.
-    if (this.plugin.bisect && !this.plugin.bisect.done) {
-      new Notice("Finish or stop the plugin search first — switching sets would change the plugins it is testing.", 8000);
-      return;
-    }
+    // `bisectOwnsPage`, not `!done`: a search that finished but couldn't put
+    // the plugins back is still on disk, and switching sets over it would
+    // record and undo against a vault FlowKit has said it couldn't restore.
+    if (this.refuseDuringSearch("switching sets would change the plugins it is testing")) return;
     if (!this.plugin.isPro) {
       this.openUpgrade("profiles");
       return;
@@ -3920,8 +4074,21 @@ export class HealthDashboardView extends ItemView {
       headline,
       activate: async (key) => {
         this.plugin.settings.licenseKey = key;
-        await this.plugin.saveSettings();
+        // Verified before it is saved. Saving first meant a failed write (a
+        // read-only or sync-locked vault) skipped verification, and a valid key
+        // stayed inactive for the rest of the session.
         const flipped = this.plugin.refreshLicense();
+        try {
+          await this.plugin.saveSettings();
+        } catch (err) {
+          console.error("FlowKit: could not save the licence key", err);
+          if (this.plugin.isPro) {
+            new Notice(
+              "Pro is active for this session, but FlowKit couldn't save the key. Paste it again after a restart.",
+              10_000
+            );
+          }
+        }
         if (flipped && this.plugin.isPro) {
           await this.refresh(false, false);
           return true;
@@ -4019,7 +4186,11 @@ export class HealthDashboardView extends ItemView {
     const when = new Date().toLocaleString();
     const cell = (v: number | null) => (v == null ? "—" : String(v));
     // Plugin names legitimately contain pipes; unescaped they split the table.
-    const md = (v: string) => v.replace(/\|/g, "\\|");
+    // Everything else that can turn a manifest field into markup is escaped
+    // too: a sideloaded plugin named `![](https://…)` would otherwise embed a
+    // remote image in a note FlowKit opens straight away, which is a beacon.
+    // Same attacker-controlled-manifest threat model as the CSV below.
+    const md = (v: string) => v.replace(/[\r\n]+/g, " ").replace(/[\\`*_[\]<>!|~]/g, "\\$&");
     const s = this.summaryStats();
     const grade = this.gradeNow(s);
     const lines: string[] = [];
@@ -4040,10 +4211,10 @@ export class HealthDashboardView extends ItemView {
     lines.push("");
     lines.push(
       `Built from ${Math.round(s.confidence * 100)}% of the available signals.` +
-        (this.filter !== "all" || this.search
-          ? ` Filtered view: ${FILTERS.find((f) => f.key === this.filter)?.label ?? this.filter}${
-              this.search ? `, matching “${this.search}”` : ""
-            }.`
+        (this.scopeLabel() || this.search
+          ? ` Filtered view: ${[this.scopeLabel(), this.search ? `matching “${md(this.search)}”` : ""]
+              .filter(Boolean)
+              .join(", ")}.`
           : "")
     );
     lines.push("");
@@ -4162,6 +4333,13 @@ export class HealthDashboardView extends ItemView {
       );
     }
     return lines.join("\n");
+  }
+
+  /** What the table is scoped to (a finding, or a filter), or "" for everything. */
+  private scopeLabel(): string {
+    if (this.scopeInsight) return this.scopeInsight.title;
+    if (this.filter !== "all") return FILTERS.find((f) => f.key === this.filter)?.label ?? this.filter;
+    return "";
   }
 
   private flagText(r: PluginHealth): string {

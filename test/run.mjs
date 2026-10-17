@@ -42,5 +42,26 @@ await esbuild.build({
 
 await import(pathToFileURL(integrationOut).href);
 
+// The guards in main.ts that stop FlowKit rearranging a vault it shouldn't,
+// run against a fake plugin registry. main.ts pulls in the view and settings
+// tab, so it gets a stub that also names Obsidian's classes.
+const guardsOut = path.join(root, "test", ".build", "guards.test.mjs");
+await esbuild.build({
+  entryPoints: [path.join(root, "test", "guards.test.ts")],
+  bundle: true,
+  outfile: guardsOut,
+  format: "esm",
+  // tweetnacl (the licence verifier) does a CommonJS require("crypto").
+  banner: { js: 'import { createRequire } from "module"; const require = createRequire(import.meta.url);' },
+  platform: "node",
+  target: "node18",
+  logLevel: "warning",
+  alias: {
+    obsidian: path.join(root, "test", "obsidian-app-stub.ts"),
+  },
+});
+
+await import(pathToFileURL(guardsOut).href);
+
 // Plain-Node contract tests (no `obsidian` import, so no bundling needed).
 await import(pathToFileURL(path.join(root, "test", "manifest-contract.test.mjs")).href);
