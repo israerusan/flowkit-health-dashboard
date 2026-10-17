@@ -5,6 +5,51 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.8.2] - 2026-10-17
+
+A safety release. A review of the dashboard found actions that could leave
+your plugins in a state you didn't choose. All of them are fixed.
+
+### Fixed
+
+- **FlowKit can no longer switch itself off.** "Measure load time" was offered
+  on FlowKit's own row; running it unloaded FlowKit mid-measurement and loaded a
+  second copy, while the first kept writing to its settings file. Its row also
+  offered "Disable" with no confirmation. Both are gone from FlowKit's row, and
+  bulk fixes, saved sets and safe mode leave FlowKit on.
+- **Nothing reshapes your plugins mid-search.** Starting safe mode while "Find
+  what's breaking my vault" was running saved the search's half-off set as your
+  original one, and ending safe mode later put that set back. Safe mode, saving
+  a plugin set and starting an experiment are now refused during a search, and
+  the Diagnose menu is hidden until it finishes.
+- **The safe-mode prompt tells the truth.** It now lists exactly which plugins
+  stay on and how many go off. Before the first scan finished it could say
+  "switch off the other 0" and then switch off everything except FlowKit,
+  including plugins you watch; it now waits for the scan.
+- Only one profiling run can happen at a time, and measuring a single plugin
+  waits for it.
+- Nothing is recorded to history while FlowKit is showing its "an unfinished
+  search couldn't be read" banner.
+- "Compare after changes" now waits for a real rescan, and says so if the scan
+  fails, instead of recording the old numbers as the result.
+- If FlowKit can't save its history, the scan is still shown as current (with a
+  one-time notice), rather than as "that refresh didn't finish".
+- The search box keeps what you typed, and your cursor, when the page refreshes
+  in the background; after a rescan you stay where you were.
+- The Markdown report escapes plugin names and other text that came from a
+  plugin's manifest, so a plugin can't make the report embed a remote image.
+  The report header also names the finding it was filtered to.
+- A licence key is checked before it is saved, so a settings file that can't
+  be written no longer leaves a valid key inactive. A failed save after
+  measuring a plugin is no longer reported as "couldn't switch it back on".
+- "Disable these first" keeps the table scoped to that plugin across a rescan.
+- The trend chart is drawn correctly when the dashboard is in a pop-out window.
+
+### Changed
+
+- The dashboard's code is split into smaller modules, with new tests for the
+  safety checks above and for the reports. No visible change.
+
 ## [1.8.1] - 2026-10-16
 
 ### Changed
