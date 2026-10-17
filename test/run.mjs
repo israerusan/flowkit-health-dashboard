@@ -63,5 +63,22 @@ await esbuild.build({
 
 await import(pathToFileURL(guardsOut).href);
 
+// The dashboard's pure modules: wording, derived counts, and the reports.
+const dashboardOut = path.join(root, "test", ".build", "dashboard.test.mjs");
+await esbuild.build({
+  entryPoints: [path.join(root, "test", "dashboard.test.ts")],
+  bundle: true,
+  outfile: dashboardOut,
+  format: "esm",
+  platform: "node",
+  target: "node18",
+  logLevel: "warning",
+  alias: {
+    obsidian: path.join(root, "test", "obsidian-app-stub.ts"),
+  },
+});
+
+await import(pathToFileURL(dashboardOut).href);
+
 // Plain-Node contract tests (no `obsidian` import, so no bundling needed).
 await import(pathToFileURL(path.join(root, "test", "manifest-contract.test.mjs")).href);
